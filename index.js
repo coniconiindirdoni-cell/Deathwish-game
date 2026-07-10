@@ -2210,84 +2210,115 @@ client.on('interactionCreate', async interaction => {
       if (activeBlackjack.has(bkey)) return interaction.reply({ ephemeral: true, content: '⛔ Zaten aktif bir blackjack elin var.' });
       const bal = getBalance(gid, uid);
       if (bal.balance < bet) return interaction.reply({ ephemeral: true, content: `⛔ Yetersiz coin! Bakiye: **${bal.balance}**` });
-      addBalance(gid, uid, -bet);
 
-      const drawCard = () => pick([2, 3, 4, 5, 6, 7, 8, 9, 10, 10, 10, 10, 11]);
-      const handValue = (cards) => { let sum = cards.reduce((a, b) => a + b, 0); let aces = cards.filter(c => c === 11).length; while (sum > 21 && aces > 0) { sum -= 10; aces--; } return sum; };
-      const cardsStr = (cards) => cards.join(' + ');
+      let betCharged = false;
+      try {
+        addBalance(gid, uid, -bet);
+        betCharged = true;
 
-      const player = [drawCard(), drawCard()];
-      const dealer = [drawCard(), drawCard()];
-      activeBlackjack.set(bkey, { player, dealer, bet });
+        const drawCard = () => pick([2, 3, 4, 5, 6, 7, 8, 9, 10, 10, 10, 10, 11]);
+        const handValue = (cards) => { let sum = cards.reduce((a, b) => a + b, 0); let aces = cards.filter(c => c === 11).length; while (sum > 21 && aces > 0) { sum -= 10; aces--; } return sum; };
+        const cardsStr = (cards) => cards.join(' + ');
 
-      const buildEmbed = (reveal = false, desc) => {
-        const e = new EmbedBuilder()
-          .setTitle('🃏 Blackjack (21)')
-          .setColor(0x2ECC71)
-          .addFields(
-            { name: `${interaction.user.username} (${handValue(player)})`, value: cardsStr(player), inline: true },
-            { name: `Bot (${reveal ? handValue(dealer) : '?'})`, value: reveal ? cardsStr(dealer) : `${dealer[0]} + ?`, inline: true },
-          )
-          .setFooter({ text: `Bahis: ${bet} coin` });
-        if (desc) e.setDescription(desc);
-        return e;
-      };
+        const player = [drawCard(), drawCard()];
+        const dealer = [drawCard(), drawCard()];
+        activeBlackjack.set(bkey, { player, dealer, bet });
 
-      if (handValue(player) === 21) {
-        activeBlackjack.delete(bkey);
-        const win = resolveWinAmount(bet);
-        addBalance(gid, uid, win);
-        return interaction.reply({ embeds: [buildEmbed(true, `🎉 **BLACKJACK!** Kazandın: **+${win} coin**`)] });
-      }
+        const buildEmbed = (reveal = false, desc) => {
+          const e = new EmbedBuilder()
+            .setTitle('🃏 Blackjack (21)')
+            .setColor(0x2ECC71)
+            .addFields(
+              { name: `${interaction.user.username} (${handValue(player)})`, value: cardsStr(player), inline: true },
+              { name: `Bot (${reveal ? handValue(dealer) : '?'})`, value: reveal ? cardsStr(dealer) : `${dealer[0]} + ?`, inline: true },
+            )
+            .setFooter({ text: `Bahis: ${bet} coin` });
+          if (desc) e.setDescription(desc);
+          return e;
+        };
 
-      const hitId = `bj_hit_${uid}_${Date.now()}`;
-      const standId = `bj_stand_${uid}_${Date.now()}`;
-      const row = new ActionRowBuilder().addComponents(
-        new ButtonBuilder().setCustomId(hitId).setLabel('Çek (Hit)').setStyle(ButtonStyle.Primary).setEmoji('🂠'),
-        new ButtonBuilder().setCustomId(standId).setLabel('Dur (Stand)').setStyle(ButtonStyle.Secondary).setEmoji('✋'),
-      );
-      await interaction.reply({ embeds: [buildEmbed(false)], components: [row] });
-      const m2 = await interaction.fetchReply();
-
-      const finish = async (i, resultText, won) => {
-        activeBlackjack.delete(bkey);
-        await i.update({ embeds: [buildEmbed(true, resultText).setColor(won ? 0x2ECC71 : 0xED4245)], components: [] });
-      };
-
-      const coll = m2.createMessageComponentCollector({ componentType: ComponentType.Button, time: 60000, filter: i => i.user.id === uid && (i.customId === hitId || i.customId === standId) });
-      coll.on('collect', async i => {
-        if (i.customId === hitId) {
-          player.push(drawCard());
-          if (handValue(player) > 21) {
-            coll.stop();
-            return finish(i, `💥 **Battın!** ${handValue(player)} puan. **-${bet} coin** kaybettin.`, false);
-          }
-          return i.update({ embeds: [buildEmbed(false)], components: [row] });
-        }
-        if (i.customId === standId) {
-          coll.stop();
-          while (handValue(dealer) < 17) dealer.push(drawCard());
-          const pv = handValue(player), dv = handValue(dealer);
-          if (dv > 21 || pv > dv) {
-            const win = resolveWinAmount(bet);
-            addBalance(gid, uid, win);
-            return finish(i, `🎉 **Kazandın!** ${pv} vs ${dv}. **+${win} coin**`, true);
-          } else if (pv === dv) {
-            addBalance(gid, uid, bet);
-            return finish(i, `🤝 **Berabere.** ${pv} vs ${dv}. Bahsin iade edildi.`, true);
-          } else {
-            return finish(i, `😿 **Kaybettin.** ${pv} vs ${dv}. **-${bet} coin**`, false);
-          }
-        }
-      });
-      coll.on('end', (_, reason) => {
-        if (reason === 'time' && activeBlackjack.has(bkey)) {
+        if (handValue(player) === 21) {
           activeBlackjack.delete(bkey);
-          addBalance(gid, uid, bet);
-          m2.edit({ content: '⏰ Süre doldu, bahis iade edildi.', components: [] }).catch(() => {});
+          const win = resolveWinAmount(bet);
+          addBalance(gid, uid, win);
+          return await interaction.reply({ embeds: [buildEmbed(true, `🎉 **BLACKJACK!** Kazandın: **+${win} coin**`)] });
         }
-      });
-      return;
+
+        const hitId = `bj_hit_${uid}_${Date.now()}`;
+        const standId = `bj_stand_${uid}_${Date.now()}`;
+        const cancelId = `bj_cancel_${uid}_${Date.now()}`;
+        const row = new ActionRowBuilder().addComponents(
+          new ButtonBuilder().setCustomId(hitId).setLabel('Çek (Hit)').setStyle(ButtonStyle.Primary).setEmoji('🂠'),
+          new ButtonBuilder().setCustomId(standId).setLabel('Dur (Stand)').setStyle(ButtonStyle.Secondary).setEmoji('✋'),
+          new ButtonBuilder().setCustomId(cancelId).setLabel('Vazgeç (İptal)').setStyle(ButtonStyle.Danger).setEmoji('🚫'),
+        );
+        await interaction.reply({ embeds: [buildEmbed(false)], components: [row] });
+        const m2 = await interaction.fetchReply();
+
+        const finish = async (i, resultText, won) => {
+          activeBlackjack.delete(bkey);
+          await i.update({ embeds: [buildEmbed(true, resultText).setColor(won ? 0x2ECC71 : 0xED4245)], components: [] });
+        };
+
+        const coll = m2.createMessageComponentCollector({ componentType: ComponentType.Button, time: 60000, filter: i => i.user.id === uid && (i.customId === hitId || i.customId === standId || i.customId === cancelId) });
+        coll.on('collect', async i => {
+          try {
+            if (i.customId === hitId) {
+              player.push(drawCard());
+              if (handValue(player) > 21) {
+                coll.stop();
+                return await finish(i, `💥 **Battın!** ${handValue(player)} puan. **-${bet} coin** kaybettin.`, false);
+              }
+              return await i.update({ embeds: [buildEmbed(false)], components: [row] });
+            }
+            if (i.customId === standId) {
+              coll.stop();
+              while (handValue(dealer) < 17) dealer.push(drawCard());
+              const pv = handValue(player), dv = handValue(dealer);
+              if (dv > 21 || pv > dv) {
+                const win = resolveWinAmount(bet);
+                addBalance(gid, uid, win);
+                return await finish(i, `🎉 **Kazandın!** ${pv} vs ${dv}. **+${win} coin**`, true);
+              } else if (pv === dv) {
+                addBalance(gid, uid, bet);
+                return await finish(i, `🤝 **Berabere.** ${pv} vs ${dv}. Bahsin iade edildi.`, true);
+              } else {
+                return await finish(i, `😿 **Kaybettin.** ${pv} vs ${dv}. **-${bet} coin**`, false);
+              }
+            }
+            if (i.customId === cancelId) {
+              coll.stop();
+              addBalance(gid, uid, bet);
+              return await finish(i, `🚫 **Vazgeçtin.** El iptal edildi, **${bet} coin** bahsin iade edildi.`, true);
+            }
+          } catch (err) {
+            activeBlackjack.delete(bkey);
+            addBalance(gid, uid, bet);
+            sendErrorLog(gid, '/yirmibir (collect)', err);
+            m2.edit({ content: '⛔ Bir hata oluştu, el iptal edildi ve bahsin iade edildi.', components: [] }).catch(() => {});
+          }
+        });
+        coll.on('end', (_, reason) => {
+          if (reason === 'time' && activeBlackjack.has(bkey)) {
+            activeBlackjack.delete(bkey);
+            addBalance(gid, uid, bet);
+            m2.edit({ content: '⏰ Süre doldu, bahis iade edildi.', components: [] }).catch(() => {});
+          }
+        });
+        return;
+      } catch (err) {
+        activeBlackjack.delete(bkey);
+        if (betCharged) addBalance(gid, uid, bet);
+        sendErrorLog(gid, '/yirmibir', err);
+        try {
+          if (!interaction.replied && !interaction.deferred) {
+            await interaction.reply({ ephemeral: true, content: '⛔ Bir hata oluştu, bahsin iade edildi.' });
+          } else {
+            await interaction.followUp({ ephemeral: true, content: '⛔ Bir hata oluştu, bahsin iade edildi.' });
+          }
+        } catch {}
+        return;
+      }
     }
 
     // ─────────────────────────────────────────────────────────
