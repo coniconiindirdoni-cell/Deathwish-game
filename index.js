@@ -62,8 +62,14 @@ app.listen(PORT, () => console.log(`🌐 Web sunucusu: ${PORT}`));
 const DB_PATH = path.join(__dirname, 'deathwish-game.db');
 let db;
 
-function initDatabase() {
-  db = new Database(DB_PATH);
+// Tabloları (yoksa) oluşturur ve eski şemaları yeni kolonlarla tamamlar.
+// initDatabase() içinde İLK açılışta, ayrıca restoreFromGithub() içinde HER
+// geri yüklemeden SONRA da çağrılır — çünkü GitHub'daki bir yedek, botun en
+// güncel kod sürümünden ÖNCE alınmış olabilir ve yeni tablo/kolonları
+// (ör. bank_accounts, fish_cast_state, temp_xp_boosts.usesLeft) içermeyebilir.
+// Bu çağrılmazsa, eski bir yedek geri yüklendiğinde yeni özellikler
+// "no such table/column" hatasıyla kırılır.
+function ensureSchema() {
   db.exec(`
     CREATE TABLE IF NOT EXISTS guild_settings (guildId TEXT, key TEXT, value TEXT, PRIMARY KEY(guildId,key));
     CREATE TABLE IF NOT EXISTS economy (guildId TEXT, userId TEXT, balance INTEGER DEFAULT 0, bank INTEGER DEFAULT 0, PRIMARY KEY(guildId,userId));
@@ -84,7 +90,28 @@ function initDatabase() {
     CREATE TABLE IF NOT EXISTS fish_inventory (guildId TEXT, userId TEXT, fishKey TEXT, count INTEGER DEFAULT 0, PRIMARY KEY(guildId,userId,fishKey));
     CREATE TABLE IF NOT EXISTS fish_boosts (guildId TEXT, userId TEXT, usesLeft INTEGER DEFAULT 0, PRIMARY KEY(guildId,userId));
     CREATE TABLE IF NOT EXISTS chat_coin_counter (guildId TEXT, userId TEXT, count INTEGER DEFAULT 0, PRIMARY KEY(guildId,userId));
+
+    -- ── /banka sistemi + balıkçılık riskleri ─────────────────
+    CREATE TABLE IF NOT EXISTS bank_accounts (guildId TEXT, userId TEXT, createdAt INTEGER, PRIMARY KEY(guildId,userId));
+    CREATE TABLE IF NOT EXISTS fish_cast_state (
+      guildId TEXT, userId TEXT,
+      sinceLine INTEGER DEFAULT 0, lineThreshold INTEGER DEFAULT 0,
+      sinceRod  INTEGER DEFAULT 0, rodThreshold  INTEGER DEFAULT 0,
+      PRIMARY KEY(guildId,userId)
+    );
   `);
+
+  // Geçici XP Boost artık süreye değil kullanım hakkına dayanıyor.
+  // Eski (expiresAt tabanlı) veritabanlarını sorunsuz taşımak için usesLeft kolonunu ekliyoruz.
+  const tempBoostCols = db.prepare("PRAGMA table_info(temp_xp_boosts)").all().map(c => c.name);
+  if (!tempBoostCols.includes('usesLeft')) {
+    db.exec('ALTER TABLE temp_xp_boosts ADD COLUMN usesLeft INTEGER DEFAULT 0');
+  }
+}
+
+function initDatabase() {
+  db = new Database(DB_PATH);
+  ensureSchema();
   console.log('✅ Veritabanı hazır.');
 }
 
@@ -299,10 +326,12 @@ async function restoreFromGithub(filePath) {
     try {
       zip.extractEntryTo(dbEntry, path.dirname(DB_PATH), false, true);
       db = new Database(DB_PATH);
+      ensureSchema(); // eski bir yedek geri yüklendiyse eksik tablo/kolonları tamamla
     } catch (writeErr) {
       // Başarısız olursa eski DB'yi geri yükle
       fs.renameSync(tmpDb, DB_PATH);
       db = new Database(DB_PATH);
+      ensureSchema();
       throw writeErr;
     }
     // Eski backup DB'sini sil
@@ -333,22 +362,52 @@ async function deleteBackupFromGithub(filePath, sha) {
   });
 }
 
-// Otomatik yedekleme: her 6 saatte bir
+// Otomatik yedekleme aralığı: ENV ile ayarlanabilir, varsayılan 15 dakika.
+// NOT: Barındırma ortamı disk üzerinde kalıcılık sağlamıyorsa (ör. her birkaç
+// dakikada bir yeniden başlıyorsa), 6 saatlik eski aralık veri kaybını çok
+// büyütüyordu — 15 dakikaya indirmek kayıp penceresini önemli ölçüde azaltır.
+// Ek olarak aşağıdaki autoRestoreIfEmpty() ile açılışta otomatik kurtarma yapılıyor.
+const AUTO_BACKUP_INTERVAL_MS = (parseInt(process.env.AUTO_BACKUP_INTERVAL_MINUTES, 10) || 15) * 60 * 1000;
+
 function startAutoBackup() {
   if (!octokit || !GITHUB_OWNER || !GITHUB_REPO) {
     console.warn('⚠️ GITHUB_TOKEN/GITHUB_OWNER/GITHUB_REPO tanımlı değil, otomatik yedekleme kapalı.');
     return;
   }
-  const INTERVAL_MS = 6 * 60 * 60 * 1000;
   setInterval(async () => {
     try {
-      const { filePath } = await backupToGithub('otomatik 6 saatlik yedek');
+      const { filePath } = await backupToGithub('otomatik yedek');
       console.log(`✅ Otomatik yedek alındı: ${filePath}`);
     } catch (err) {
       console.error('⛔ Otomatik yedekleme hatası:', err.message);
     }
-  }, INTERVAL_MS);
-  console.log('🕒 Otomatik GitHub yedeklemesi başlatıldı (6 saatte bir).');
+  }, AUTO_BACKUP_INTERVAL_MS);
+  console.log(`🕒 Otomatik GitHub yedeklemesi başlatıldı (${Math.round(AUTO_BACKUP_INTERVAL_MS / 60000)} dakikada bir).`);
+}
+
+/**
+ * Açılışta veritabanı "boş" görünüyorsa (ör. barındırma ortamı diski sıfırladıysa)
+ * GitHub'daki en güncel yedeği otomatik olarak geri yükler. Bu, kullanıcıların
+ * her seferinde elle /veriyukle çalıştırma zorunluluğunu kaldırır ve disk
+ * kalıcılığı olmayan ortamlarda veri kaybı penceresini minimuma indirir.
+ */
+async function autoRestoreIfEmpty() {
+  if (!octokit || !GITHUB_OWNER || !GITHUB_REPO) return;
+  try {
+    const row = db.prepare('SELECT COUNT(*) AS c FROM economy').get();
+    if (row && row.c > 0) return; // veritabanında zaten veri var, dokunma
+
+    const backups = await listBackupsFromGithub();
+    if (!backups.length) {
+      console.log('ℹ️ Veritabanı boş ve GitHub üzerinde yedek bulunamadı, temiz başlanıyor.');
+      return;
+    }
+    console.log(`♻️ Veritabanı boş görünüyor, en güncel yedek otomatik geri yükleniyor: ${backups[0].path}`);
+    await restoreFromGithub(backups[0].path);
+    console.log('✅ Otomatik geri yükleme tamamlandı.');
+  } catch (err) {
+    console.error('⛔ Otomatik geri yükleme hatası:', err.message);
+  }
 }
 
 // ── DB yardımcıları ───────────────────────────────────────────
@@ -397,7 +456,7 @@ function addXp(gid, uid, amt)          { db.prepare('INSERT OR IGNORE INTO level
 function topLevels(gid, n = 10)        { return db.prepare('SELECT userId,level,xp FROM level_data WHERE guildId=? ORDER BY level DESC,xp DESC LIMIT ?').all(gid, n); }
 
 // ── Yeni özellik yardımcıları ───────────────────────────────────
-// Hırsızlık Kalkanı (30 coin, 4 saat, /oyunlar cal komutundan korur)
+// Hırsızlık Kalkanı (45 coin, 4 saat, /oyunlar cal komutundan korur)
 function hasShield(gid, uid) {
   const r = db.prepare('SELECT expiresAt FROM theft_shields WHERE guildId=? AND userId=?').get(gid, uid);
   if (!r) return false;
@@ -406,22 +465,43 @@ function hasShield(gid, uid) {
 }
 function setShield(gid, uid, ms) { db.prepare('INSERT OR REPLACE INTO theft_shields(guildId,userId,expiresAt)VALUES(?,?,?)').run(gid, uid, Date.now() + ms); }
 
-// Geçici XP Boost (24 saat, 2x, tek seferlik satın alma)
-function hasTempBoost(gid, uid) {
-  const r = db.prepare('SELECT expiresAt FROM temp_xp_boosts WHERE guildId=? AND userId=?').get(gid, uid);
-  if (!r) return false;
-  if (r.expiresAt < Date.now()) { db.prepare('DELETE FROM temp_xp_boosts WHERE guildId=? AND userId=?').run(gid, uid); return false; }
+// Geçici XP Boost — süreye değil kullanım hakkına dayanır (80 coin, 50 kullanım, 2x)
+function getTempBoostUses(gid, uid) { const r = db.prepare('SELECT usesLeft FROM temp_xp_boosts WHERE guildId=? AND userId=?').get(gid, uid); return r ? (r.usesLeft || 0) : 0; }
+function hasTempBoost(gid, uid) { return getTempBoostUses(gid, uid) > 0; }
+function addTempBoostUses(gid, uid, n) {
+  db.prepare('INSERT OR IGNORE INTO temp_xp_boosts(guildId,userId,usesLeft)VALUES(?,?,0)').run(gid, uid);
+  db.prepare('UPDATE temp_xp_boosts SET usesLeft=usesLeft+? WHERE guildId=? AND userId=?').run(n, gid, uid);
+}
+function consumeTempBoost(gid, uid) {
+  if (!hasTempBoost(gid, uid)) return false;
+  db.prepare('UPDATE temp_xp_boosts SET usesLeft=usesLeft-1 WHERE guildId=? AND userId=?').run(gid, uid);
   return true;
 }
-function setTempBoost(gid, uid, ms) { db.prepare('INSERT OR REPLACE INTO temp_xp_boosts(guildId,userId,expiresAt)VALUES(?,?,?)').run(gid, uid, Date.now() + ms); }
 
-// Kalıcı (1.5x) + geçici (2x) boostları birleştiren çarpan
-function getBoostMultiplier(gid, uid) {
+// Kalıcı (1.5x) + geçici (2x) boostları birleştiren çarpan.
+// consume=true olduğunda (gerçek bir ödül verilirken) geçici boost hakkı 1 azalır.
+// Sadece durum göstermek için (ör. /voice durum) consume=false kullan.
+function getBoostMultiplier(gid, uid, consume = true) {
   let m = 1;
   if (hasBoost(gid, uid)) m *= 1.5;
-  if (hasTempBoost(gid, uid)) m *= 2;
+  if (hasTempBoost(gid, uid)) {
+    m *= 2;
+    if (consume) consumeTempBoost(gid, uid);
+  }
   return m;
 }
+
+// ── /banka sistemi ────────────────────────────────────────────
+// Bir üye /banka olustur demeden hiçbir oyun komutu çalışmaz.
+// Banka hesabı açılınca yeni üyeler otomatik 6 saatlik hırsızlık koruması kazanır.
+function hasBankAccount(gid, uid) { return !!db.prepare('SELECT 1 FROM bank_accounts WHERE guildId=? AND userId=?').get(gid, uid); }
+function createBankAccount(gid, uid) {
+  db.prepare('INSERT OR IGNORE INTO bank_accounts(guildId,userId,createdAt)VALUES(?,?,?)').run(gid, uid, Date.now());
+  db.prepare('INSERT OR IGNORE INTO economy(guildId,userId,balance,bank)VALUES(?,?,0,0)').run(gid, uid);
+}
+
+// Komutlardan hangilerinin banka hesabı olmadan da çalışabileceği (yönetimsel/owner komutları)
+const BANK_EXEMPT_COMMANDS = new Set(['setup', 'yardim', 'banka', 'verikaydet', 'backuplist', 'veriyukle', 'backupsil']);
 
 // İsim Rengi Rolleri (admin /setup üzerinden ekler, kullanıcı /renk al ile satın alır)
 function getColorRoles(gid)              { return db.prepare('SELECT * FROM color_roles WHERE guildId=?').all(gid); }
@@ -566,6 +646,115 @@ function pickFish(boosted) {
   return pool[0];
 }
 
+// ── Balık Market Fiyat Havuzu ────────────────────────────────
+// Her 6 saatte bir yeniden karılıyor, böylece fiyatlar günden güne değişiyor.
+// Bazı turlarda nadir balıklar bile 30-50 coin'e fırlayabiliyor, bazı turlarda
+// çoğu balık sadece 1 coin ediyor — piyasa gerçekten dalgalı hissettiriyor.
+const FISH_MARKET_REFRESH_MS = 6 * 60 * 60 * 1000; // 6 saat
+let fishMarketPool = null;
+let fishMarketGeneratedAt = 0;
+
+function generateFishMarketPool() {
+  const pool = {};
+  for (const f of FISH_TYPES) {
+    const roll = Math.random();
+    let value;
+    if (roll < 0.05) {
+      // Fiyat patlaması: bu turda balıklar (nadir olsun olmasın) çok değerli
+      value = 30 + Math.floor(Math.random() * 21); // 30-50 coin
+    } else if (roll < 0.35) {
+      // Piyasa çöküşü: bu turda balıkların çoğu neredeyse değersiz
+      value = 1;
+    } else {
+      // Normal dalgalanma: temel değerin ±%40'ı kadar oynar
+      const variance = f.value * 0.4;
+      value = Math.max(1, Math.round(f.value + (Math.random() * 2 - 1) * variance));
+    }
+    pool[f.key] = value;
+  }
+  fishMarketPool = pool;
+  fishMarketGeneratedAt = Date.now();
+  return pool;
+}
+
+function ensureFishMarketPool() {
+  if (!fishMarketPool || Date.now() - fishMarketGeneratedAt >= FISH_MARKET_REFRESH_MS) {
+    generateFishMarketPool();
+  }
+  return fishMarketPool;
+}
+
+function getFishValue(key) {
+  const pool = ensureFishMarketPool();
+  const v = pool[key];
+  if (v !== undefined) return v;
+  return FISH_TYPES.find(f => f.key === key)?.value ?? 1;
+}
+
+function startFishMarketRefresh() {
+  ensureFishMarketPool();
+  setInterval(generateFishMarketPool, FISH_MARKET_REFRESH_MS);
+  console.log('🎣 Balık market fiyat havuzu başlatıldı (6 saatte bir yenilenir).');
+}
+
+// ── Balık Tutma Riskleri: boş atma / mısına kopma / olta kırılması ──
+// sinceLine/sinceRod sayaçları her /balik tut denemesinde artar. Sayaç
+// rastgele belirlenmiş eşiğe ulaşınca olay tetiklenir ve sayaç sıfırlanıp
+// yeni bir rastgele eşik seçilir.
+const EMPTY_CAST_CHANCE  = 0.18; // ~%18 ihtimalle olta boş döner
+const LINE_SNAP_COST     = 2;    // mısına kopunca kesilen coin
+const ROD_BREAK_COST     = 5;    // olta kırılınca kesilen coin
+function randBetween(min, max) { return min + Math.floor(Math.random() * (max - min + 1)); }
+
+function getFishCastState(gid, uid) {
+  let r = db.prepare('SELECT * FROM fish_cast_state WHERE guildId=? AND userId=?').get(gid, uid);
+  if (!r) {
+    r = { guildId: gid, userId: uid, sinceLine: 0, lineThreshold: randBetween(4, 8), sinceRod: 0, rodThreshold: randBetween(20, 30) };
+    db.prepare('INSERT INTO fish_cast_state(guildId,userId,sinceLine,lineThreshold,sinceRod,rodThreshold)VALUES(?,?,?,?,?,?)')
+      .run(gid, uid, r.sinceLine, r.lineThreshold, r.sinceRod, r.rodThreshold);
+  }
+  return r;
+}
+function saveFishCastState(gid, uid, state) {
+  db.prepare('UPDATE fish_cast_state SET sinceLine=?, lineThreshold=?, sinceRod=?, rodThreshold=? WHERE guildId=? AND userId=?')
+    .run(state.sinceLine, state.lineThreshold, state.sinceRod, state.rodThreshold, gid, uid);
+}
+
+/**
+ * Bir /balik tut denemesinin sonucunu belirler.
+ * @returns {{ type: 'rod_break'|'line_snap'|'empty'|'catch', fish?: object }}
+ */
+function resolveFishCast(gid, uid, boosted) {
+  const state = getFishCastState(gid, uid);
+  state.sinceLine++;
+  state.sinceRod++;
+
+  // Olta kırılması önce kontrol edilir (daha nadir ama daha ciddi bir olay)
+  if (state.sinceRod >= state.rodThreshold) {
+    state.sinceRod = 0;
+    state.rodThreshold = randBetween(20, 30);
+    state.sinceLine = 0;
+    state.lineThreshold = randBetween(4, 8);
+    saveFishCastState(gid, uid, state);
+    return { type: 'rod_break' };
+  }
+
+  if (state.sinceLine >= state.lineThreshold) {
+    state.sinceLine = 0;
+    state.lineThreshold = randBetween(4, 8);
+    saveFishCastState(gid, uid, state);
+    return { type: 'line_snap' };
+  }
+
+  saveFishCastState(gid, uid, state);
+
+  if (Math.random() < EMPTY_CAST_CHANCE) {
+    return { type: 'empty' };
+  }
+
+  return { type: 'catch', fish: pickFish(boosted) };
+}
+
 // Blackjack / At Yarışı ortak ödül hesaplayıcı — %2x kazanç, ~%0.1 ihtimalle 5x
 function resolveWinAmount(bet) {
   if (Math.random() < 0.001) return bet * 5;
@@ -603,6 +792,12 @@ const SLASH_COMMANDS = [
     .setName('setup')
     .setDescription('Bot ayar panelini aç (sadece yöneticiler)')
     .setDefaultMemberPermissions(PermissionFlagsBits.Administrator),
+
+  // /banka — sisteme katılmak için zorunlu ilk adım
+  new SlashCommandBuilder()
+    .setName('banka')
+    .setDescription('Banka hesabı işlemleri')
+    .addSubcommand(s => s.setName('olustur').setDescription('Banka hesabı oluştur (diğer tüm komutlar için zorunlu)')),
 
   // /yardim
   new SlashCommandBuilder()
@@ -692,8 +887,8 @@ const SLASH_COMMANDS = [
     .addSubcommand(s => s.setName('esyalar').setDescription('Özel eşyaları gör (Hırsızlık Kalkanı, Geçici XP Boost)'))
     .addSubcommand(s => s.setName('esya-al').setDescription('Özel eşya satın al').addStringOption(o => o.setName('esya').setDescription('Eşya').setRequired(true)
       .addChoices(
-        { name: '🛡️ Hırsızlık Kalkanı (30 coin, 4 saat)', value: 'kalkan' },
-        { name: '⚡ Geçici XP Boost (60 coin, 24 saat 2x, tek kullanım)', value: 'gecici_boost' },
+        { name: '🛡️ Hırsızlık Kalkanı (45 coin, 4 saat)', value: 'kalkan' },
+        { name: '⚡ Geçici XP Boost (80 coin, 50 kullanım, 2x)', value: 'gecici_boost' },
       ))),
 
   // /market-yonet (admin)
@@ -715,7 +910,7 @@ const SLASH_COMMANDS = [
   // /xpboost (kalıcı)
   new SlashCommandBuilder()
     .setName('xpboost')
-    .setDescription('Kalıcı 1.5x XPBoost satın al (200 coin)'),
+    .setDescription('Kalıcı 1.5x XPBoost satın al (400 coin)'),
 
   // /renk — isim rengi rolleri
   new SlashCommandBuilder()
@@ -891,6 +1086,7 @@ client.on('voiceStateUpdate', async (oldState, newState) => {
 
 async function checkVoiceReward(guild, uid, totalSec, day) {
   const gid = guild.id;
+  if (!hasBankAccount(gid, uid)) return; // banka hesabı yoksa ses ödülü de birikmesin
   const claimKey = `${gid}:${uid}:${day}`;
   if (voiceDailyClaimed.get(claimKey)) return;
   const tier = VOICE_TIERS.find(t => totalSec >= t.needSec);
@@ -997,6 +1193,8 @@ client.on('messageCreate', async message => {
   const cid = message.channel.id;
 
   // ── XP KAZANMA (pasif, otomatik) ────────────────────────────
+  // Not: XP kazanma ve seviye atlayınca verilen rol, banka hesabı olmasa
+  // da çalışır — sadece coin ile ilgili sistemler banka hesabı istiyor.
   try {
     const xpGained = Math.round((Math.floor(Math.random() * 5) + 1) * 1.15);
     const result = addXp(gid, uid, xpGained);
@@ -1042,8 +1240,9 @@ client.on('messageCreate', async message => {
   } catch {}
 
   // ── SOHBET MESAJ SAYACI + PASİF COIN (her 2 mesaj = 1 coin) ─
+  // Coin ödülü banka hesabı ister — hesabı yoksa mesaj sayılır ama coin verilmez.
   const sohbetCh = getSetting(gid, 'sohbet_channel');
-  if (sohbetCh && cid === sohbetCh) {
+  if (sohbetCh && cid === sohbetCh && hasBankAccount(gid, uid)) {
     addMsgCount(gid, cid, uid, todayTR());
     const total = incChatCoinCounter(gid, uid);
     if (total % 2 === 0) {
@@ -1179,6 +1378,29 @@ client.on('interactionCreate', async interaction => {
     sendSlashLog(interaction);
 
     // ─────────────────────────────────────────────────────────
+    //  /banka — hesap açmadan diğer hiçbir komut çalışmaz
+    // ─────────────────────────────────────────────────────────
+    if (gid && !BANK_EXEMPT_COMMANDS.has(cmd) && !hasBankAccount(gid, uid)) {
+      return interaction.reply({
+        ephemeral: true,
+        content: '🏦 Önce bir banka hesabı açman gerekiyor! `/banka olustur` komutunu kullan.',
+      });
+    }
+
+    if (cmd === 'banka') {
+      if (sub === 'olustur') {
+        if (hasBankAccount(gid, uid)) {
+          return interaction.reply({ ephemeral: true, content: '🏦 Zaten bir banka hesabın var.' });
+        }
+        createBankAccount(gid, uid);
+        setShield(gid, uid, 6 * 60 * 60 * 1000); // yeni hesaplara 6 saat hırsızlık koruması
+        sendLog(gid, 'economy', new EmbedBuilder().setTitle('🏦 Banka Hesabı Açıldı').setColor(0x2ECC71)
+          .addFields({ name: 'Kullanıcı', value: `<@${uid}>`, inline: true }).setTimestamp());
+        return interaction.reply(`🏦 Banka hesabın oluşturuldu! Artık tüm komutları kullanabilirsin.\n🛡️ Ayrıca **6 saatlik hırsızlık koruması** kazandın.`);
+      }
+    }
+
+    // ─────────────────────────────────────────────────────────
     //  /yardim
     // ─────────────────────────────────────────────────────────
     if (cmd === 'yardim') {
@@ -1187,6 +1409,10 @@ client.on('interactionCreate', async interaction => {
         .setColor(0x5865F2)
         .setDescription('Tüm komutlar `/` ile çalışır.')
         .addFields(
+          {
+            name: '🏦 Başlangıç',
+            value: '`/banka olustur` — Banka hesabı aç (**zorunlu**, açmadan diğer komutlar çalışmaz). 6 saatlik hırsızlık koruması hediye!',
+          },
           {
             name: '💰 Ekonomi',
             value: [
@@ -1263,7 +1489,7 @@ client.on('interactionCreate', async interaction => {
               '`/market iade <rolid>` — Rol iade et',
               '`/market esyalar` — Özel eşyalar (Kalkan, Geçici Boost)',
               '`/market esya-al` — Özel eşya satın al',
-              '`/xpboost` — Kalıcı 1.5x boost (200 coin)',
+              '`/xpboost` — Kalıcı 1.5x boost (400 coin)',
               '`/renk al` — İsim rengi rolü satın al (50 coin)',
               '`/renk liste` — Renk rollerini listele',
             ].join('\n'),
@@ -1310,7 +1536,7 @@ client.on('interactionCreate', async interaction => {
 
       if (sub === 'gunluk') {
         const day = todayTR();
-        const base = parseInt(getSetting(gid, 'daily_reward') || '100');
+        const base = parseInt(getSetting(gid, 'daily_reward') || '80');
         if (hasClaimed(gid, uid, day, 'daily')) return interaction.reply({ ephemeral: true, content: '⛔ Bugün zaten aldın. Yarın tekrar gel!' });
         setClaimed(gid, uid, day, 'daily');
         const boost = getBoostMultiplier(gid, uid);
@@ -1532,7 +1758,7 @@ client.on('interactionCreate', async interaction => {
           .addFields(
             { name: '⏱️ Bugünkü Süre', value: `**${fmtMin(total)}**`, inline: true },
             { name: '📊 Durum', value: claimed ? '✅ Ödül alındı' : '🕒 Devam ediyor', inline: true },
-            { name: '🔥 Boost', value: `${getBoostMultiplier(gid, uid)}x`, inline: true },
+            { name: '🔥 Boost', value: `${getBoostMultiplier(gid, uid, false)}x`, inline: true },
             { name: '🎯 Eşikler', value: VOICE_TIERS.map(t => t.label).join('\n') },
           );
         return interaction.reply({ embeds: [embed] });
@@ -1837,9 +2063,9 @@ client.on('interactionCreate', async interaction => {
               value: [
                 '🎲 **Şans Kutusu** — 8 coin • `/oyunlar sanskutusu`',
                 '💍 **Evlilik Yüzüğü** — 150 coin • `/evlilik yuzuk-al`',
-                '💎 **XPBoost** (Kalıcı 1.5x) — 200 coin • `/xpboost`',
-                '🛡️ **Hırsızlık Kalkanı** (4 saat) — 30 coin • `/market esya-al esya:kalkan`',
-                '⚡ **Geçici XP Boost** (24 saat 2x) — 60 coin • `/market esya-al esya:gecici_boost`',
+                '💎 **XPBoost** (Kalıcı 1.5x) — 400 coin • `/xpboost`',
+                '🛡️ **Hırsızlık Kalkanı** (4 saat) — 45 coin • `/market esya-al esya:kalkan`',
+                '⚡ **Geçici XP Boost** (50 kullanım, 2x) — 80 coin • `/market esya-al esya:gecici_boost`',
                 '🎨 **İsim Rengi Rolü** — 50 coin • `/renk al`',
                 '🎣 **Balıkçılık Şansı Boost** (100 kullanım) — 200 coin • `/balik boost-al`',
               ].join('\n'),
@@ -1908,8 +2134,8 @@ client.on('interactionCreate', async interaction => {
           .setTitle('🎁 Özel Eşyalar')
           .setColor(0xE67E22)
           .addFields(
-            { name: '🛡️ Hırsızlık Kalkanı', value: '**30 coin** — 4 saat boyunca `/oyunlar cal` komutundan korur.\nSatın al: `/market esya-al esya:kalkan`' },
-            { name: '⚡ Geçici XP Boost', value: '**60 coin** — 24 saat boyunca coin/xp ödüllerin **2 katı** (tek seferlik).\nSatın al: `/market esya-al esya:gecici_boost`' },
+            { name: '🛡️ Hırsızlık Kalkanı', value: '**45 coin** — 4 saat boyunca `/oyunlar cal` komutundan korur.\nSatın al: `/market esya-al esya:kalkan`' },
+            { name: '⚡ Geçici XP Boost', value: '**80 coin** — sonraki **50** coin/xp ödülünde **2 katı** kazanç sağlar.\nSatın al: `/market esya-al esya:gecici_boost`' },
           );
         return interaction.reply({ embeds: [embed] });
       }
@@ -1919,23 +2145,22 @@ client.on('interactionCreate', async interaction => {
         if (esya === 'kalkan') {
           if (hasShield(gid, uid)) return interaction.reply({ ephemeral: true, content: '🛡️ Zaten aktif bir kalkanın var.' });
           const bal = getBalance(gid, uid);
-          if (bal.balance < 30) return interaction.reply({ ephemeral: true, content: `⛔ Yetersiz coin! Gerekli: **30**, Bakiye: **${bal.balance}**` });
-          addBalance(gid, uid, -30);
+          if (bal.balance < 45) return interaction.reply({ ephemeral: true, content: `⛔ Yetersiz coin! Gerekli: **45**, Bakiye: **${bal.balance}**` });
+          addBalance(gid, uid, -45);
           setShield(gid, uid, 4 * 60 * 60 * 1000);
           sendLog(gid, 'market', new EmbedBuilder().setTitle('🛡️ Hırsızlık Kalkanı Satın Alındı').setColor(0xE67E22)
             .addFields({ name: 'Kullanıcı', value: `<@${uid}>`, inline: true }).setTimestamp());
           return interaction.reply('🛡️ **Hırsızlık Kalkanı** aktif! 4 saat boyunca `/oyunlar cal` komutundan korunuyorsun.');
         }
         if (esya === 'gecici_boost') {
-          if (hasTempBoost(gid, uid)) return interaction.reply({ ephemeral: true, content: '⚡ Zaten aktif bir geçici XP Boost\'un var.' });
           const bal = getBalance(gid, uid);
-          const price = 60;
+          const price = 80;
           if (bal.balance < price) return interaction.reply({ ephemeral: true, content: `⛔ Yetersiz coin! Gerekli: **${price}**, Bakiye: **${bal.balance}**` });
           addBalance(gid, uid, -price);
-          setTempBoost(gid, uid, 24 * 60 * 60 * 1000);
+          addTempBoostUses(gid, uid, 50);
           sendLog(gid, 'market', new EmbedBuilder().setTitle('⚡ Geçici XP Boost Satın Alındı').setColor(0xE67E22)
             .addFields({ name: 'Kullanıcı', value: `<@${uid}>`, inline: true }).setTimestamp());
-          return interaction.reply('⚡ **Geçici XP Boost (2x)** aktif! 24 saat boyunca coin/xp ödüllerin 2 katı.');
+          return interaction.reply(`⚡ **Geçici XP Boost (2x)** satın alındı! Sonraki **50** coin/xp ödülün 2 katı olacak. Kalan kullanım: **${getTempBoostUses(gid, uid)}**`);
         }
         return interaction.reply({ ephemeral: true, content: '⛔ Geçersiz eşya.' });
       }
@@ -2013,14 +2238,14 @@ client.on('interactionCreate', async interaction => {
         if (hasShield(gid, victim.id)) return interaction.reply({ ephemeral: true, content: `🛡️ ${victim.username} şu anda **Hırsızlık Kalkanı** ile korunuyor, çalamazsın.` });
         const key = `${uid}:${victim.id}`;
         if (activeSteals.has(key)) return interaction.reply({ ephemeral: true, content: 'Bu kullanıcıyla zaten aktif bir çalma denemen var, bekle.' });
-        if (getBalance(gid, victim.id).balance < 2) return interaction.reply({ ephemeral: true, content: 'Hedefin coin\'i yetersiz.' });
+        if (getBalance(gid, victim.id).balance < 5) return interaction.reply({ ephemeral: true, content: 'Hedefin coin\'i yetersiz.' });
         activeSteals.add(key);
         const cancelId = `cancel_steal_${Date.now()}_${uid}`;
         const row = new ActionRowBuilder().addComponents(
           new ButtonBuilder().setCustomId(cancelId).setLabel('İptal Et (30s)').setStyle(ButtonStyle.Danger).setEmoji('⛔')
         );
         await interaction.reply({
-          content: `${victim}, **${interaction.user.username}** senden **2 coin** çalmaya çalışıyor! 30 saniye içinde butona basmazsan para gider 😈`,
+          content: `${victim}, **${interaction.user.username}** senden **5 coin** çalmaya çalışıyor! 30 saniye içinde butona basmazsan para gider 😈`,
           components: [row],
         });
         const m2 = await interaction.fetchReply();
@@ -2038,9 +2263,9 @@ client.on('interactionCreate', async interaction => {
         coll.on('end', async () => {
           if (prevented) return;
           activeSteals.delete(key);
-          if (getBalance(gid, victim.id).balance < 2) return m2.edit({ content: '⚠️ Hedef zaten fakirleşmiş.', components: [] });
-          transfer(gid, victim.id, uid, 2);
-          await m2.edit({ content: `💰 **${interaction.user.username}**, **${victim.username}**'den **2 coin** çaldı!`, components: [] });
+          if (getBalance(gid, victim.id).balance < 5) return m2.edit({ content: '⚠️ Hedef zaten fakirleşmiş.', components: [] });
+          transfer(gid, victim.id, uid, 5);
+          await m2.edit({ content: `💰 **${interaction.user.username}**, **${victim.username}**'den **5 coin** çaldı!`, components: [] });
           stealUseCounter++;
           if (stealUseCounter >= 50) {
             stealUseCounter = 0;
@@ -2066,8 +2291,8 @@ client.on('interactionCreate', async interaction => {
     if (cmd === 'xpboost') {
       if (hasBoost(gid, uid)) return interaction.reply({ ephemeral: true, content: '⚡ Zaten kalıcı **XPBoost (1.5x)** sahibisin babuş!' });
       const bal = getBalance(gid, uid);
-      if (bal.balance < 200) return interaction.reply({ ephemeral: true, content: `⛔ Yetersiz coin! Gerekli: **200**, Bakiye: **${bal.balance}**` });
-      addBalance(gid, uid, -200);
+      if (bal.balance < 400) return interaction.reply({ ephemeral: true, content: `⛔ Yetersiz coin! Gerekli: **400**, Bakiye: **${bal.balance}**` });
+      addBalance(gid, uid, -400);
       setBoost(gid, uid);
       return interaction.reply('✅ **Kalıcı XPBoost (1.5x)** satın alındı! 🔥 Artık görev ödüllerin 1.5x!');
     }
@@ -2112,9 +2337,24 @@ client.on('interactionCreate', async interaction => {
         }
         fishCooldown.set(key, Date.now());
         const boosted = consumeFishBoost(gid, uid);
-        const fish = pickFish(boosted);
+        const result = resolveFishCast(gid, uid, boosted);
+
+        if (result.type === 'rod_break') {
+          addBalance(gid, uid, -ROD_BREAK_COST);
+          return interaction.reply(`💥 **Oltan kırıldı!** Tamir masrafı olarak **-${ROD_BREAK_COST} coin** kesildi. Bakiye: **${getBalance(gid, uid).balance}**`);
+        }
+        if (result.type === 'line_snap') {
+          addBalance(gid, uid, -LINE_SNAP_COST);
+          return interaction.reply(`✂️ **Mısıra koptu!** **-${LINE_SNAP_COST} coin** kesildi. Bakiye: **${getBalance(gid, uid).balance}**`);
+        }
+        if (result.type === 'empty') {
+          return interaction.reply('🎣 Oltanı attın... uzun süre bekledin ama olta **boş** döndü. Şansını tekrar dene!');
+        }
+
+        const fish = result.fish;
         addFish(gid, uid, fish.key, 1);
-        return interaction.reply(`🎣 Oltanı attın... ${fish.emoji} **${fish.name}** yakaladın! (~${fish.value} coin değerinde)${boosted ? ' ⚡ *Şans Boostu aktifti*' : ''}`);
+        const marketValue = getFishValue(fish.key);
+        return interaction.reply(`🎣 Oltanı attın... ${fish.emoji} **${fish.name}** yakaladın! (şu an ~${marketValue} coin değerinde)${boosted ? ' ⚡ *Şans Boostu aktifti*' : ''}`);
       }
 
       if (sub === 'envanter') {
@@ -2122,9 +2362,9 @@ client.on('interactionCreate', async interaction => {
         if (!inv.length) return interaction.reply({ ephemeral: true, content: '🎣 Envanterin boş. `/balik tut` ile balık tutmayı dene!' });
         const lines = inv.map(i => {
           const f = FISH_TYPES.find(x => x.key === i.fishKey);
-          return f ? `${f.emoji} **${f.name}** x${i.count} (${f.value} coin/adet)` : `${i.fishKey} x${i.count}`;
+          return f ? `${f.emoji} **${f.name}** x${i.count} (${getFishValue(f.key)} coin/adet)` : `${i.fishKey} x${i.count}`;
         });
-        return interaction.reply({ embeds: [new EmbedBuilder().setTitle(`🎒 ${interaction.user.username} — Balık Envanteri`).setColor(0x3498DB).setDescription(lines.join('\n'))] });
+        return interaction.reply({ embeds: [new EmbedBuilder().setTitle(`🎒 ${interaction.user.username} — Balık Envanteri`).setColor(0x3498DB).setDescription(lines.join('\n')).setFooter({ text: 'Fiyatlar piyasaya göre günlük dalgalanır.' })] });
       }
 
       if (sub === 'boost-al') {
@@ -2148,10 +2388,10 @@ client.on('interactionCreate', async interaction => {
     if (cmd === 'balik-market') {
       if (sub === 'liste') {
         const embed = new EmbedBuilder()
-          .setTitle('🐟 Balık Marketi — Sabit Fiyatlar')
+          .setTitle('🐟 Balık Marketi — Güncel Fiyatlar')
           .setColor(0x1ABC9C)
-          .setDescription(FISH_TYPES.map(f => `${f.emoji} **${f.name}** — **${f.value} coin**`).join('\n'))
-          .setFooter({ text: 'Satmak için: /balik-market sat • Üyeye satmak için: /balik-market oyuncuya-sat' });
+          .setDescription(FISH_TYPES.map(f => `${f.emoji} **${f.name}** — **${getFishValue(f.key)} coin**`).join('\n'))
+          .setFooter({ text: 'Fiyatlar 6 saatte bir yenilenir • Satmak için: /balik-market sat • Üyeye satmak için: /balik-market oyuncuya-sat' });
         return interaction.reply({ embeds: [embed] });
       }
 
@@ -2161,7 +2401,7 @@ client.on('interactionCreate', async interaction => {
         const fish = FISH_TYPES.find(f => f.key === key);
         if (!fish) return interaction.reply({ ephemeral: true, content: '⛔ Geçersiz balık türü.' });
         if (!removeFish(gid, uid, key, adet)) return interaction.reply({ ephemeral: true, content: '⛔ Envanterinde yeterli balık yok.' });
-        const total = fish.value * adet;
+        const total = getFishValue(key) * adet;
         addBalance(gid, uid, total);
         return interaction.reply(`✅ ${fish.emoji} **${adet}x ${fish.name}** sattın! **+${total} coin**. Bakiye: **${getBalance(gid, uid).balance}**`);
       }
@@ -2248,7 +2488,7 @@ client.on('interactionCreate', async interaction => {
         const standId = `bj_stand_${uid}_${Date.now()}`;
         const cancelId = `bj_cancel_${uid}_${Date.now()}`;
         const row = new ActionRowBuilder().addComponents(
-          new ButtonBuilder().setCustomId(hitId).setLabel('Çek (Hit)').setStyle(ButtonStyle.Primary).setEmoji('🂠'),
+          new ButtonBuilder().setCustomId(hitId).setLabel('Çek (Hit)').setStyle(ButtonStyle.Primary).setEmoji('🃏'),
           new ButtonBuilder().setCustomId(standId).setLabel('Dur (Stand)').setStyle(ButtonStyle.Secondary).setEmoji('✋'),
           new ButtonBuilder().setCustomId(cancelId).setLabel('Vazgeç (İptal)').setStyle(ButtonStyle.Danger).setEmoji('🚫'),
         );
@@ -2387,6 +2627,8 @@ client.on('interactionCreate', async interaction => {
         db.prepare('DELETE FROM fish_inventory WHERE guildId=?').run(gid);
         db.prepare('DELETE FROM fish_boosts WHERE guildId=?').run(gid);
         db.prepare('DELETE FROM chat_coin_counter WHERE guildId=?').run(gid);
+        db.prepare('DELETE FROM bank_accounts WHERE guildId=?').run(gid);
+        db.prepare('DELETE FROM fish_cast_state WHERE guildId=?').run(gid);
         return interaction.reply('🧨 Bu sunucuya ait tüm veriler temizlendi.');
       }
     }
@@ -2655,7 +2897,7 @@ async function sendSetupPanel(interaction) {
         `⛔ Hata: ${fmt('log_error_channel')}`,
         `📝 Slash: ${fmt('log_slash_channel')}`,
       ].join('\n') },
-      { name: '💰 Ekonomi', value: `Başlangıç Coin: **${s.start_coin || '0'}**\nGünlük Ödül: **${s.daily_reward || '100'}**` },
+      { name: '💰 Ekonomi', value: `Başlangıç Coin: **${s.start_coin || '0'}**\nGünlük Ödül: **${s.daily_reward || '80'}**` },
     );
 
   const mainMenu = new StringSelectMenuBuilder()
@@ -2811,6 +3053,8 @@ async function startBot() {
 
 (async () => {
   initDatabase();
+  await autoRestoreIfEmpty();
+  startFishMarketRefresh();
   await startBot();
   startAutoBackup();
 })();
