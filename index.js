@@ -1,7 +1,8 @@
 // ╔══════════════════════════════════════════════════════════════╗
 // ║         DeathWish Game Bot — TEK DOSYA                      ║
 // ║  Özellikler: Seviye/XP, Ekonomi, Ses Takibi, Sohbet,       ║
-// ║  Yazı Oyunu, Market, Evlilik, Gelişmiş Backup & Log         ║
+// ║  Yazı Oyunu, Market, Evlilik, Balıkçılık, Blackjack,        ║
+// ║  At Yarışı, Renk Rolleri, Gelişmiş Backup & Log             ║
 // ║  Tüm komutlar SLASH (/) komutu                              ║
 // ╠══════════════════════════════════════════════════════════════╣
 // ║  Gerekli paketler (npm install):                             ║
@@ -75,6 +76,14 @@ function initDatabase() {
     CREATE TABLE IF NOT EXISTS message_counts (guildId TEXT, channelId TEXT, userId TEXT, date TEXT, count INTEGER DEFAULT 0, PRIMARY KEY(guildId,channelId,userId,date));
     CREATE TABLE IF NOT EXISTS market_roles (guildId TEXT, roleId TEXT, price INTEGER, isPremium INTEGER DEFAULT 0, PRIMARY KEY(guildId,roleId));
     CREATE TABLE IF NOT EXISTS level_data (guildId TEXT, userId TEXT, xp INTEGER DEFAULT 0, level INTEGER DEFAULT 0, PRIMARY KEY(guildId,userId));
+
+    -- ── Yeni özellikler ──────────────────────────────────────
+    CREATE TABLE IF NOT EXISTS theft_shields (guildId TEXT, userId TEXT, expiresAt INTEGER, PRIMARY KEY(guildId,userId));
+    CREATE TABLE IF NOT EXISTS temp_xp_boosts (guildId TEXT, userId TEXT, expiresAt INTEGER, PRIMARY KEY(guildId,userId));
+    CREATE TABLE IF NOT EXISTS color_roles (guildId TEXT, roleId TEXT, price INTEGER DEFAULT 50, PRIMARY KEY(guildId,roleId));
+    CREATE TABLE IF NOT EXISTS fish_inventory (guildId TEXT, userId TEXT, fishKey TEXT, count INTEGER DEFAULT 0, PRIMARY KEY(guildId,userId,fishKey));
+    CREATE TABLE IF NOT EXISTS fish_boosts (guildId TEXT, userId TEXT, usesLeft INTEGER DEFAULT 0, PRIMARY KEY(guildId,userId));
+    CREATE TABLE IF NOT EXISTS chat_coin_counter (guildId TEXT, userId TEXT, count INTEGER DEFAULT 0, PRIMARY KEY(guildId,userId));
   `);
   console.log('✅ Veritabanı hazır.');
 }
@@ -387,6 +396,67 @@ function getLevel(gid, uid)            { return db.prepare('SELECT xp,level FROM
 function addXp(gid, uid, amt)          { db.prepare('INSERT OR IGNORE INTO level_data(guildId,userId,xp,level)VALUES(?,?,0,0)').run(gid, uid); db.prepare('UPDATE level_data SET xp=xp+? WHERE guildId=? AND userId=?').run(amt, gid, uid); const d = getLevel(gid, uid); const needed = Math.round((d.level + 1) * 100 * 0.85); if (d.xp >= needed) { db.prepare('UPDATE level_data SET level=level+1,xp=xp-? WHERE guildId=? AND userId=?').run(needed, gid, uid); return { leveled: true, newLevel: d.level + 1, xpGained: amt }; } return { leveled: false, xpGained: amt }; }
 function topLevels(gid, n = 10)        { return db.prepare('SELECT userId,level,xp FROM level_data WHERE guildId=? ORDER BY level DESC,xp DESC LIMIT ?').all(gid, n); }
 
+// ── Yeni özellik yardımcıları ───────────────────────────────────
+// Hırsızlık Kalkanı (30 coin, 4 saat, /oyunlar cal komutundan korur)
+function hasShield(gid, uid) {
+  const r = db.prepare('SELECT expiresAt FROM theft_shields WHERE guildId=? AND userId=?').get(gid, uid);
+  if (!r) return false;
+  if (r.expiresAt < Date.now()) { db.prepare('DELETE FROM theft_shields WHERE guildId=? AND userId=?').run(gid, uid); return false; }
+  return true;
+}
+function setShield(gid, uid, ms) { db.prepare('INSERT OR REPLACE INTO theft_shields(guildId,userId,expiresAt)VALUES(?,?,?)').run(gid, uid, Date.now() + ms); }
+
+// Geçici XP Boost (24 saat, 2x, tek seferlik satın alma)
+function hasTempBoost(gid, uid) {
+  const r = db.prepare('SELECT expiresAt FROM temp_xp_boosts WHERE guildId=? AND userId=?').get(gid, uid);
+  if (!r) return false;
+  if (r.expiresAt < Date.now()) { db.prepare('DELETE FROM temp_xp_boosts WHERE guildId=? AND userId=?').run(gid, uid); return false; }
+  return true;
+}
+function setTempBoost(gid, uid, ms) { db.prepare('INSERT OR REPLACE INTO temp_xp_boosts(guildId,userId,expiresAt)VALUES(?,?,?)').run(gid, uid, Date.now() + ms); }
+
+// Kalıcı (1.5x) + geçici (2x) boostları birleştiren çarpan
+function getBoostMultiplier(gid, uid) {
+  let m = 1;
+  if (hasBoost(gid, uid)) m *= 1.5;
+  if (hasTempBoost(gid, uid)) m *= 2;
+  return m;
+}
+
+// İsim Rengi Rolleri (admin /setup üzerinden ekler, kullanıcı /renk al ile satın alır)
+function getColorRoles(gid)              { return db.prepare('SELECT * FROM color_roles WHERE guildId=?').all(gid); }
+function addColorRole(gid, rid, price = 50) { db.prepare('INSERT OR REPLACE INTO color_roles(guildId,roleId,price)VALUES(?,?,?)').run(gid, rid, price); }
+function removeColorRole(gid, rid)       { db.prepare('DELETE FROM color_roles WHERE guildId=? AND roleId=?').run(gid, rid); }
+
+// Sohbet — her 2 mesajda 1 coin (pasif, otomatik, günlük görev sistemi yerine)
+function incChatCoinCounter(gid, uid) {
+  db.prepare('INSERT OR IGNORE INTO chat_coin_counter(guildId,userId,count)VALUES(?,?,0)').run(gid, uid);
+  db.prepare('UPDATE chat_coin_counter SET count=count+1 WHERE guildId=? AND userId=?').run(gid, uid);
+  return db.prepare('SELECT count FROM chat_coin_counter WHERE guildId=? AND userId=?').get(gid, uid).count;
+}
+
+// Balıkçılık envanteri
+function addFish(gid, uid, key, n = 1) {
+  db.prepare('INSERT OR IGNORE INTO fish_inventory(guildId,userId,fishKey,count)VALUES(?,?,?,0)').run(gid, uid, key);
+  db.prepare('UPDATE fish_inventory SET count=count+? WHERE guildId=? AND userId=? AND fishKey=?').run(n, gid, uid, key);
+}
+function getFishCount(gid, uid, key) { const r = db.prepare('SELECT count FROM fish_inventory WHERE guildId=? AND userId=? AND fishKey=?').get(gid, uid, key); return r ? r.count : 0; }
+function removeFish(gid, uid, key, n) { const cur = getFishCount(gid, uid, key); if (cur < n) return false; db.prepare('UPDATE fish_inventory SET count=count-? WHERE guildId=? AND userId=? AND fishKey=?').run(n, gid, uid, key); return true; }
+function getInventory(gid, uid) { return db.prepare('SELECT fishKey,count FROM fish_inventory WHERE guildId=? AND userId=? AND count>0').all(gid, uid); }
+
+// Balıkçılık Şansı Boost — 200 coin, süre sınırı yok, 100 kullanım hakkı
+function getFishBoostUses(gid, uid) { const r = db.prepare('SELECT usesLeft FROM fish_boosts WHERE guildId=? AND userId=?').get(gid, uid); return r ? r.usesLeft : 0; }
+function addFishBoostUses(gid, uid, n) {
+  db.prepare('INSERT OR IGNORE INTO fish_boosts(guildId,userId,usesLeft)VALUES(?,?,0)').run(gid, uid);
+  db.prepare('UPDATE fish_boosts SET usesLeft=usesLeft+? WHERE guildId=? AND userId=?').run(n, gid, uid);
+}
+function consumeFishBoost(gid, uid) {
+  const u = getFishBoostUses(gid, uid);
+  if (u <= 0) return false;
+  db.prepare('UPDATE fish_boosts SET usesLeft=usesLeft-1 WHERE guildId=? AND userId=?').run(gid, uid);
+  return true;
+}
+
 // Seviye ödül rolleri
 const LEVEL_ROLE_REWARDS = {
   5:  '1524109066929045626',
@@ -470,6 +540,38 @@ const PROPOSAL_SAD_GIFS = [
   'https://media.tenor.com/7BqZyq7n0xAAAAAM/rejected.gif',
 ];
 
+// Balık türleri — value: 1-50 coin, weight: ne kadar nadir (düşük = nadir)
+const FISH_TYPES = [
+  { key: 'sardalya', name: 'Sardalya',            emoji: '🐟', value: 1,  weight: 30   },
+  { key: 'hamsi',    name: 'Hamsi',                emoji: '🐠', value: 2,  weight: 26   },
+  { key: 'levrek',   name: 'Levrek',                emoji: '🐡', value: 5,  weight: 18   },
+  { key: 'cupra',    name: 'Çipura',               emoji: '🐟', value: 8,  weight: 13   },
+  { key: 'somon',    name: 'Somon',                 emoji: '🍣', value: 14, weight: 8    },
+  { key: 'ton',      name: 'Ton Balığı',            emoji: '🐋', value: 22, weight: 4.5  },
+  { key: 'yilanbal', name: 'Yılan Balığı',          emoji: '🐍', value: 30, weight: 2.5  },
+  { key: 'kilic',    name: 'Kılıç Balığı',          emoji: '⚔️', value: 38, weight: 1.2  },
+  { key: 'orkinos',  name: 'Dev Orkinos',           emoji: '🐳', value: 45, weight: 0.6  },
+  { key: 'ejder',    name: 'Efsanevi Ejder Balığı', emoji: '🐉', value: 50, weight: 0.2  },
+];
+
+function pickFish(boosted) {
+  let pool = FISH_TYPES.map(f => ({ ...f }));
+  if (boosted) pool = pool.map(f => ({ ...f, weight: f.value >= 14 ? f.weight * 3 : f.weight }));
+  const total = pool.reduce((a, f) => a + f.weight, 0);
+  let r = Math.random() * total;
+  for (const f of pool) {
+    if (r < f.weight) return f;
+    r -= f.weight;
+  }
+  return pool[0];
+}
+
+// Blackjack / At Yarışı ortak ödül hesaplayıcı — %2x kazanç, ~%0.1 ihtimalle 5x
+function resolveWinAmount(bet) {
+  if (Math.random() < 0.001) return bet * 5;
+  return bet * 2;
+}
+
 // ──────────────────────────────────────────────────────────────
 //  OYUN DURUM HARİTALARI (in-memory)
 // ──────────────────────────────────────────────────────────────
@@ -482,6 +584,11 @@ const voiceJoinTimes    = new Map();
 const voiceDailySec     = new Map();
 const voiceDailyClaimed = new Map();
 let stealUseCounter     = 0;
+
+// Yeni özellikler için in-memory durumlar
+const fishCooldown   = new Map(); // `${gid}:${uid}` -> son tutma zamanı (ms)
+const activeBlackjack = new Map(); // `${gid}:${uid}` -> oyun durumu
+const activeRaces    = new Map(); // channelId -> yarış durumu
 
 function normalizeTR(s) {
   return String(s || '').toLocaleLowerCase('tr').replace(/[.,;:!?'"~^_()[\]{}<>/@#$%&=+\\|-]/g, ' ').replace(/\s+/g, ' ').trim();
@@ -532,12 +639,12 @@ const SLASH_COMMANDS = [
     .addSubcommand(s => s.setName('gorev').setDescription('Günlük ses görevi durumu'))
     .addSubcommand(s => s.setName('sifirla').setDescription('[OWNER] Ses verilerini sıfırla')),
 
-  // /sohbet
+  // /sohbet — günlük mesaj görevi kaldırıldı, artık pasif "her 2 mesaj = 1 coin" sistemi var
   new SlashCommandBuilder()
     .setName('sohbet')
     .setDescription('Sohbet mesaj sayacı komutları')
     .addSubcommand(s => s.setName('siralama').setDescription('Bugünkü mesaj liderliği'))
-    .addSubcommand(s => s.setName('gorev').setDescription('Günlük mesaj görevi durumu'))
+    .addSubcommand(s => s.setName('durum').setDescription('Pasif coin kazanımı hakkında bilgi'))
     .addSubcommand(s => s.setName('sifirla').setDescription('[OWNER] Sohbet sayaçlarını sıfırla')),
 
   // /zar
@@ -581,7 +688,13 @@ const SLASH_COMMANDS = [
     .setDescription('Market komutları')
     .addSubcommand(s => s.setName('liste').setDescription('Market listesi'))
     .addSubcommand(s => s.setName('al').setDescription('Marketten rol satın al').addStringOption(o => o.setName('rolid').setDescription('Rol ID\'si').setRequired(true)))
-    .addSubcommand(s => s.setName('iade').setDescription('Marketten aldığın rolü iade et').addStringOption(o => o.setName('rolid').setDescription('Rol ID\'si').setRequired(true))),
+    .addSubcommand(s => s.setName('iade').setDescription('Marketten aldığın rolü iade et').addStringOption(o => o.setName('rolid').setDescription('Rol ID\'si').setRequired(true)))
+    .addSubcommand(s => s.setName('esyalar').setDescription('Özel eşyaları gör (Hırsızlık Kalkanı, Geçici XP Boost)'))
+    .addSubcommand(s => s.setName('esya-al').setDescription('Özel eşya satın al').addStringOption(o => o.setName('esya').setDescription('Eşya').setRequired(true)
+      .addChoices(
+        { name: '🛡️ Hırsızlık Kalkanı (30 coin, 4 saat)', value: 'kalkan' },
+        { name: '⚡ Geçici XP Boost (60 coin, 24 saat 2x, tek kullanım)', value: 'gecici_boost' },
+      ))),
 
   // /market-yonet (admin)
   new SlashCommandBuilder()
@@ -599,10 +712,55 @@ const SLASH_COMMANDS = [
     .addSubcommand(s => s.setName('sanskutusu').setDescription('Şans kutusu aç (8 coin, günlük 5 hak)'))
     .addSubcommand(s => s.setName('cal').setDescription('Birinin coinini çalmaya çalış').addUserOption(o => o.setName('hedef').setDescription('Hedef kullanıcı').setRequired(true))),
 
-  // /xpboost
+  // /xpboost (kalıcı)
   new SlashCommandBuilder()
     .setName('xpboost')
     .setDescription('Kalıcı 1.5x XPBoost satın al (200 coin)'),
+
+  // /renk — isim rengi rolleri
+  new SlashCommandBuilder()
+    .setName('renk')
+    .setDescription('İsim rengi rolü komutları')
+    .addSubcommand(s => s.setName('al').setDescription('Renk rolü satın al (50 coin, sadece 1 tane sahip olabilirsin)'))
+    .addSubcommand(s => s.setName('liste').setDescription('Mevcut renk rollerini gör')),
+
+  // /balik — balıkçılık
+  new SlashCommandBuilder()
+    .setName('balik')
+    .setDescription('Balıkçılık komutları')
+    .addSubcommand(s => s.setName('tut').setDescription('Balık tutmayı dene'))
+    .addSubcommand(s => s.setName('envanter').setDescription('Balık envanterini gör'))
+    .addSubcommand(s => s.setName('boost-al').setDescription('Balıkçılık Şansı Boost satın al (200 coin, 100 kullanım)'))
+    .addSubcommand(s => s.setName('durum').setDescription('Boost durumunu gör')),
+
+  // /balik-market
+  new SlashCommandBuilder()
+    .setName('balik-market')
+    .setDescription('Balık marketi')
+    .addSubcommand(s => s.setName('liste').setDescription('Balık fiyat listesi'))
+    .addSubcommand(s => s.setName('sat').setDescription('Balığını markete sat')
+      .addStringOption(o => o.setName('balik').setDescription('Balık türü').setRequired(true)
+        .addChoices(...FISH_TYPES.map(f => ({ name: `${f.emoji} ${f.name} (${f.value} coin)`, value: f.key }))))
+      .addIntegerOption(o => o.setName('adet').setDescription('Adet').setRequired(true).setMinValue(1)))
+    .addSubcommand(s => s.setName('oyuncuya-sat').setDescription('Balığını başka bir üyeye sat')
+      .addUserOption(o => o.setName('hedef').setDescription('Alıcı').setRequired(true))
+      .addStringOption(o => o.setName('balik').setDescription('Balık türü').setRequired(true)
+        .addChoices(...FISH_TYPES.map(f => ({ name: `${f.emoji} ${f.name} (${f.value} coin)`, value: f.key }))))
+      .addIntegerOption(o => o.setName('adet').setDescription('Adet').setRequired(true).setMinValue(1))
+      .addIntegerOption(o => o.setName('fiyat').setDescription('Toplam fiyat (coin)').setRequired(true).setMinValue(1))),
+
+  // /yirmibir — blackjack
+  new SlashCommandBuilder()
+    .setName('yirmibir')
+    .setDescription('Blackjack (21) oyna — botla')
+    .addIntegerOption(o => o.setName('bahis').setDescription('Bahis miktarı').setRequired(true).setMinValue(1)),
+
+  // /atyarisi — at yarışı (çok oyunculu bahis)
+  new SlashCommandBuilder()
+    .setName('atyarisi')
+    .setDescription('At yarışına bahis koy (20 saniyelik paylaşımlı yarış penceresi)')
+    .addIntegerOption(o => o.setName('at').setDescription('At numarası (1-6)').setRequired(true).setMinValue(1).setMaxValue(6))
+    .addIntegerOption(o => o.setName('bahis').setDescription('Bahis miktarı').setRequired(true).setMinValue(1)),
 
   // /sifirla (owner)
   new SlashCommandBuilder()
@@ -737,7 +895,7 @@ async function checkVoiceReward(guild, uid, totalSec, day) {
   if (voiceDailyClaimed.get(claimKey)) return;
   const tier = VOICE_TIERS.find(t => totalSec >= t.needSec);
   if (!tier) return;
-  const boost = hasBoost(gid, uid) ? 1.5 : 1;
+  const boost = getBoostMultiplier(gid, uid);
   const reward = Math.round(tier.reward * boost);
   addBalance(gid, uid, reward);
   voiceDailyClaimed.set(claimKey, true);
@@ -758,7 +916,7 @@ async function checkVoiceReward(guild, uid, totalSec, day) {
   if (voiceLogCh) {
     const ch = guild.channels.cache.get(voiceLogCh);
     if (ch?.isTextBased?.()) {
-      ch.send(`🎧 <@${uid}> günlük ses görevini tamamladı! **+${reward} coin** (${tier.label}${boost > 1 ? ' • XPBoost 🔥' : ''})`).catch(() => {});
+      ch.send(`🎧 <@${uid}> günlük ses görevini tamamladı! **+${reward} coin** (${tier.label}${boost > 1 ? ' • Boost 🔥' : ''})`).catch(() => {});
     }
   }
 }
@@ -883,9 +1041,27 @@ client.on('messageCreate', async message => {
     }
   } catch {}
 
-  // ── SOHBET MESAJ SAYACI (pasif, otomatik) ───────────────────
+  // ── SOHBET MESAJ SAYACI + PASİF COIN (her 2 mesaj = 1 coin) ─
   const sohbetCh = getSetting(gid, 'sohbet_channel');
-  if (sohbetCh && cid === sohbetCh) addMsgCount(gid, cid, uid, todayTR());
+  if (sohbetCh && cid === sohbetCh) {
+    addMsgCount(gid, cid, uid, todayTR());
+    const total = incChatCoinCounter(gid, uid);
+    if (total % 2 === 0) {
+      const mult = getBoostMultiplier(gid, uid);
+      const reward = Math.max(1, Math.round(1 * mult));
+      addBalance(gid, uid, reward);
+      sendLog(gid, 'coin', new EmbedBuilder()
+        .setTitle('💰 Coin — Sohbet (pasif)')
+        .setColor(0xF1C40F)
+        .addFields(
+          { name: 'Kullanıcı', value: `<@${uid}>`, inline: true },
+          { name: 'Ödül', value: `+${reward} coin`, inline: true },
+          { name: 'Mesaj Sayısı', value: `${total}`, inline: true },
+        )
+        .setTimestamp()
+      );
+    }
+  }
 
   // ── YAZIYOYUNU CEVAP DİNLEME (pasif) ────────────────────────
   const yaziCh = getSetting(gid, 'yazi_oyunu_channel');
@@ -932,6 +1108,51 @@ client.on('interactionCreate', async interaction => {
       return sendSetupPanel(interaction);
     }
 
+    // ── RENK ROLÜ SEÇİM MENÜSÜ ────────────────────────────────
+    if (interaction.isStringSelectMenu() && interaction.customId.startsWith('renkpick_')) {
+      const ownerUid = interaction.customId.split('_')[1];
+      if (interaction.user.id !== ownerUid) return interaction.reply({ ephemeral: true, content: 'Bu menü sana ait değil.' });
+      const roleId = interaction.values[0];
+      const gid2 = interaction.guild.id;
+      const cr = getColorRoles(gid2).find(r => r.roleId === roleId);
+      if (!cr) return interaction.update({ content: '⛔ Bu rol artık listede yok.', components: [] });
+      const role = interaction.guild.roles.cache.get(roleId);
+      if (!role) return interaction.update({ content: '⛔ Rol sunucuda bulunamadı.', components: [] });
+      const me = interaction.guild.members.me;
+      if (!me?.permissions.has(PermissionFlagsBits.ManageRoles) || role.position >= me.roles.highest.position) {
+        return interaction.update({ content: '⛔ Bu rolü yönetemiyorum (hiyerarşi/izin).', components: [] });
+      }
+      const member = interaction.member;
+      if (member.roles.cache.has(roleId)) return interaction.update({ content: 'ℹ️ Bu role zaten sahipsin.', components: [] });
+      const bal = getBalance(gid2, ownerUid);
+      if (bal.balance < cr.price) return interaction.update({ content: `⛔ Yetersiz coin! Gerekli: **${cr.price}**, Bakiye: **${bal.balance}**`, components: [] });
+
+      // Önceki renk rolünü kaldır (sadece 1 tane sahip olunabilir)
+      const allColorRoleIds = getColorRoles(gid2).map(r => r.roleId);
+      const owned = allColorRoleIds.filter(rid => member.roles.cache.has(rid));
+      for (const rid of owned) await member.roles.remove(rid).catch(() => {});
+      await member.roles.add(roleId).catch(() => {});
+      addBalance(gid2, ownerUid, -cr.price);
+
+      sendLog(gid2, 'market', new EmbedBuilder()
+        .setTitle('🎨 Renk Rolü Satın Alındı')
+        .setColor(0xEB459E)
+        .addFields(
+          { name: 'Kullanıcı', value: `<@${ownerUid}>`, inline: true },
+          { name: 'Rol', value: `<@&${roleId}>`, inline: true },
+          { name: 'Fiyat', value: `${cr.price} coin`, inline: true },
+        ).setTimestamp()
+      );
+
+      return interaction.update({ content: `✅ <@&${roleId}> renk rolünü aldın! **-${cr.price}** coin. Bakiye: **${getBalance(gid2, ownerUid).balance}**`, components: [] });
+    }
+
+    // ── BALIK OYUNCUYA SATMA ONAY BUTONLARI ───────────────────
+    if (interaction.isButton()) {
+      const id0 = interaction.customId;
+      if (id0.startsWith('fishtrade_yes_') || id0.startsWith('fishtrade_no_')) return; // collector'da işleniyor
+    }
+
     // ── SETUP SELECT MENÜ / BUTON ─────────────────────────────
     if (interaction.isButton() || interaction.isAnySelectMenu()) {
       const [prefix, ...rest] = (interaction.customId || '').split('_');
@@ -945,6 +1166,7 @@ client.on('interactionCreate', async interaction => {
       if (id.startsWith('cancel_steal_')) return;
       if (id.startsWith('restore_yes_') || id.startsWith('restore_no_')) return;
       if (id.startsWith('backupsil_yes_') || id.startsWith('backupsil_no_')) return;
+      if (id.startsWith('bj_hit_') || id.startsWith('bj_stand_')) return;
     }
 
     if (!interaction.isChatInputCommand()) return;
@@ -991,10 +1213,10 @@ client.on('interactionCreate', async interaction => {
             ].join('\n'),
           },
           {
-            name: '💬 Sohbet Sayacı',
+            name: '💬 Sohbet',
             value: [
               '`/sohbet siralama` — Bugünkü mesaj liderleri',
-              '`/sohbet gorev` — Günlük mesaj görevi',
+              '`/sohbet durum` — Pasif coin kazanımı (her 2 mesaj = 1 coin)',
             ].join('\n'),
           },
           {
@@ -1007,6 +1229,19 @@ client.on('interactionCreate', async interaction => {
               '`/yazioyunu bonus` — Günlük +15 coin',
               '`/oyunlar sanskutusu` — Şans kutusu (8 coin)',
               '`/oyunlar cal` — Coinini çal',
+              '`/yirmibir bahis:` — Blackjack (botla, 2x / ~%0.1 ihtimalle 5x)',
+              '`/atyarisi at: bahis:` — At yarışı (paylaşımlı, 2x / ~%0.1 ihtimalle 5x)',
+            ].join('\n'),
+          },
+          {
+            name: '🎣 Balıkçılık',
+            value: [
+              '`/balik tut` — Balık tutmayı dene',
+              '`/balik envanter` — Envanterini gör',
+              '`/balik boost-al` — Şans Boost (200 coin, 100 kullanım)',
+              '`/balik-market liste` — Balık fiyat listesi',
+              '`/balik-market sat` — Markete sat',
+              '`/balik-market oyuncuya-sat` — Başka üyeye sat',
             ].join('\n'),
           },
           {
@@ -1026,13 +1261,17 @@ client.on('interactionCreate', async interaction => {
               '`/market liste` — Market listesi',
               '`/market al <rolid>` — Rol satın al',
               '`/market iade <rolid>` — Rol iade et',
+              '`/market esyalar` — Özel eşyalar (Kalkan, Geçici Boost)',
+              '`/market esya-al` — Özel eşya satın al',
               '`/xpboost` — Kalıcı 1.5x boost (200 coin)',
+              '`/renk al` — İsim rengi rolü satın al (50 coin)',
+              '`/renk liste` — Renk rollerini listele',
             ].join('\n'),
           },
           {
             name: '⚙️ Yönetim',
             value: [
-              '`/setup` — Bot ayarları (admin)',
+              '`/setup` — Bot ayarları (admin, renk rolleri de dahil)',
               '`/market-yonet ekle/cikar/liste` — Market yönetimi',
               '`/ses sifirla` — Ses verisi sıfırla (owner)',
               '`/sohbet sifirla` — Sohbet verisi sıfırla (owner)',
@@ -1046,7 +1285,7 @@ client.on('interactionCreate', async interaction => {
             ].join('\n'),
           }
         )
-        .setFooter({ text: 'XP mesaj yazarak otomatik kazanılır • Ses süresi otomatik takip edilir' });
+        .setFooter({ text: 'XP mesaj yazarak otomatik kazanılır • Her 2 mesajda 1 coin otomatik verilir' });
       return interaction.reply({ embeds: [embed], ephemeral: true });
     }
 
@@ -1074,7 +1313,7 @@ client.on('interactionCreate', async interaction => {
         const base = parseInt(getSetting(gid, 'daily_reward') || '100');
         if (hasClaimed(gid, uid, day, 'daily')) return interaction.reply({ ephemeral: true, content: '⛔ Bugün zaten aldın. Yarın tekrar gel!' });
         setClaimed(gid, uid, day, 'daily');
-        const boost = hasBoost(gid, uid) ? 1.5 : 1;
+        const boost = getBoostMultiplier(gid, uid);
         const reward = Math.floor(base * boost);
         addBalance(gid, uid, reward);
 
@@ -1088,7 +1327,7 @@ client.on('interactionCreate', async interaction => {
           .setTimestamp()
         );
 
-        return interaction.reply(`✅ Günlük **+${reward} coin** aldın! ${boost > 1 ? '(XPBoost 🔥)' : ''}\n💰 Bakiye: **${getBalance(gid, uid).balance}**`);
+        return interaction.reply(`✅ Günlük **+${reward} coin** aldın! ${boost > 1 ? '(Boost 🔥)' : ''}\n💰 Bakiye: **${getBalance(gid, uid).balance}**`);
       }
 
       if (sub === 'yatir') {
@@ -1293,7 +1532,7 @@ client.on('interactionCreate', async interaction => {
           .addFields(
             { name: '⏱️ Bugünkü Süre', value: `**${fmtMin(total)}**`, inline: true },
             { name: '📊 Durum', value: claimed ? '✅ Ödül alındı' : '🕒 Devam ediyor', inline: true },
-            { name: '🔥 Boost', value: hasBoost(gid, uid) ? '1.5x aktif' : 'Yok', inline: true },
+            { name: '🔥 Boost', value: `${getBoostMultiplier(gid, uid)}x`, inline: true },
             { name: '🎯 Eşikler', value: VOICE_TIERS.map(t => t.label).join('\n') },
           );
         return interaction.reply({ embeds: [embed] });
@@ -1310,7 +1549,7 @@ client.on('interactionCreate', async interaction => {
     }
 
     // ─────────────────────────────────────────────────────────
-    //  /sohbet
+    //  /sohbet (günlük görev sistemi kaldırıldı)
     // ─────────────────────────────────────────────────────────
     if (cmd === 'sohbet') {
       const sohbetCh = getSetting(gid, 'sohbet_channel');
@@ -1327,52 +1566,9 @@ client.on('interactionCreate', async interaction => {
         return interaction.reply({ embeds: [embed] });
       }
 
-      if (sub === 'gorev') {
+      if (sub === 'durum') {
         if (!sohbetCh) return interaction.reply({ ephemeral: true, content: '⛔ Sohbet kanalı ayarlanmamış. `/setup` ile ayarla.' });
-        const day = todayTR();
-        const count = getMsgCount(gid, sohbetCh, uid, day);
-        const tiers = [
-          { need: 200, reward: 20, key: 't200', label: '200 mesaj → +20 coin' },
-          { need: 100, reward: 10, key: 't100', label: '100 mesaj → +10 coin' },
-          { need: 10,  reward: 1,  key: 't10',  label: '10 mesaj → +1 coin'  },
-        ];
-        const progLines = tiers.map(t => {
-          const done = hasClaimed(gid, uid, day, `gorev_${t.key}`);
-          if (done) return `✅ ${t.label}`;
-          return `${count >= t.need ? '🟢' : '⚪'} ${t.label} (${count}/${t.need})`;
-        }).join('\n');
-        const eligible = tiers.find(t => count >= t.need && !hasClaimed(gid, uid, day, `gorev_${t.key}`));
-        if (!eligible) {
-          const embed = new EmbedBuilder()
-            .setTitle('📊 Günlük Mesaj Görevi')
-            .setColor(0x3498DB)
-            .addFields(
-              { name: '💬 Bugünkü Mesaj Sayın', value: `**${count}**` },
-              { name: '📋 Görevler', value: progLines },
-            );
-          return interaction.reply({ embeds: [embed] });
-        }
-        const boost  = hasBoost(gid, uid) ? 1.5 : 1;
-        const reward = Math.floor(eligible.reward * boost);
-        addBalance(gid, uid, reward);
-        setClaimed(gid, uid, day, `gorev_${eligible.key}`);
-        sendLog(gid, 'coin', new EmbedBuilder()
-          .setTitle('💰 Coin — Sohbet Görevi')
-          .setColor(0xF1C40F)
-          .addFields(
-            { name: 'Kullanıcı', value: `<@${uid}>`, inline: true },
-            { name: 'Ödül', value: `+${reward} coin`, inline: true },
-          ).setTimestamp()
-        );
-        const embed = new EmbedBuilder()
-          .setTitle('✅ Görev Ödülü Alındı!')
-          .setColor(0x57F287)
-          .addFields(
-            { name: '🎁 Ödül', value: `**+${reward} coin**${boost > 1 ? ' (XPBoost 1.5x 🔥)' : ''}`, inline: true },
-            { name: '💬 Mesaj Sayın', value: `**${count}**`, inline: true },
-            { name: '📋 Durum', value: progLines },
-          );
-        return interaction.reply({ embeds: [embed] });
+        return interaction.reply({ ephemeral: true, content: `💬 Sohbet kanalında (**<#${sohbetCh}>**) attığın her **2 mesajda 1 coin** otomatik olarak hesabına ekleniyor. Herhangi bir komuta gerek yok, sadece sohbet et!` });
       }
 
       if (sub === 'sifirla') {
@@ -1642,6 +1838,10 @@ client.on('interactionCreate', async interaction => {
                 '🎲 **Şans Kutusu** — 8 coin • `/oyunlar sanskutusu`',
                 '💍 **Evlilik Yüzüğü** — 150 coin • `/evlilik yuzuk-al`',
                 '💎 **XPBoost** (Kalıcı 1.5x) — 200 coin • `/xpboost`',
+                '🛡️ **Hırsızlık Kalkanı** (4 saat) — 30 coin • `/market esya-al esya:kalkan`',
+                '⚡ **Geçici XP Boost** (24 saat 2x) — 60 coin • `/market esya-al esya:gecici_boost`',
+                '🎨 **İsim Rengi Rolü** — 50 coin • `/renk al`',
+                '🎣 **Balıkçılık Şansı Boost** (100 kullanım) — 200 coin • `/balik boost-al`',
               ].join('\n'),
             }
           );
@@ -1701,6 +1901,43 @@ client.on('interactionCreate', async interaction => {
           ).setTimestamp()
         );
         return interaction.reply(`↩️ <@&${roleId}> iade edildi. **+${refund}** coin geri yüklendi. Bakiye: **${getBalance(gid, uid).balance}**`);
+      }
+
+      if (sub === 'esyalar') {
+        const embed = new EmbedBuilder()
+          .setTitle('🎁 Özel Eşyalar')
+          .setColor(0xE67E22)
+          .addFields(
+            { name: '🛡️ Hırsızlık Kalkanı', value: '**30 coin** — 4 saat boyunca `/oyunlar cal` komutundan korur.\nSatın al: `/market esya-al esya:kalkan`' },
+            { name: '⚡ Geçici XP Boost', value: '**60 coin** — 24 saat boyunca coin/xp ödüllerin **2 katı** (tek seferlik).\nSatın al: `/market esya-al esya:gecici_boost`' },
+          );
+        return interaction.reply({ embeds: [embed] });
+      }
+
+      if (sub === 'esya-al') {
+        const esya = interaction.options.getString('esya');
+        if (esya === 'kalkan') {
+          if (hasShield(gid, uid)) return interaction.reply({ ephemeral: true, content: '🛡️ Zaten aktif bir kalkanın var.' });
+          const bal = getBalance(gid, uid);
+          if (bal.balance < 30) return interaction.reply({ ephemeral: true, content: `⛔ Yetersiz coin! Gerekli: **30**, Bakiye: **${bal.balance}**` });
+          addBalance(gid, uid, -30);
+          setShield(gid, uid, 4 * 60 * 60 * 1000);
+          sendLog(gid, 'market', new EmbedBuilder().setTitle('🛡️ Hırsızlık Kalkanı Satın Alındı').setColor(0xE67E22)
+            .addFields({ name: 'Kullanıcı', value: `<@${uid}>`, inline: true }).setTimestamp());
+          return interaction.reply('🛡️ **Hırsızlık Kalkanı** aktif! 4 saat boyunca `/oyunlar cal` komutundan korunuyorsun.');
+        }
+        if (esya === 'gecici_boost') {
+          if (hasTempBoost(gid, uid)) return interaction.reply({ ephemeral: true, content: '⚡ Zaten aktif bir geçici XP Boost\'un var.' });
+          const bal = getBalance(gid, uid);
+          const price = 60;
+          if (bal.balance < price) return interaction.reply({ ephemeral: true, content: `⛔ Yetersiz coin! Gerekli: **${price}**, Bakiye: **${bal.balance}**` });
+          addBalance(gid, uid, -price);
+          setTempBoost(gid, uid, 24 * 60 * 60 * 1000);
+          sendLog(gid, 'market', new EmbedBuilder().setTitle('⚡ Geçici XP Boost Satın Alındı').setColor(0xE67E22)
+            .addFields({ name: 'Kullanıcı', value: `<@${uid}>`, inline: true }).setTimestamp());
+          return interaction.reply('⚡ **Geçici XP Boost (2x)** aktif! 24 saat boyunca coin/xp ödüllerin 2 katı.');
+        }
+        return interaction.reply({ ephemeral: true, content: '⛔ Geçersiz eşya.' });
       }
     }
 
@@ -1773,6 +2010,7 @@ client.on('interactionCreate', async interaction => {
         const victim = interaction.options.getUser('hedef');
         if (victim.bot) return interaction.reply({ ephemeral: true, content: 'Botlardan çalamazsın 😅' });
         if (victim.id === uid) return interaction.reply({ ephemeral: true, content: 'Kendinden çalamazsın 🙂' });
+        if (hasShield(gid, victim.id)) return interaction.reply({ ephemeral: true, content: `🛡️ ${victim.username} şu anda **Hırsızlık Kalkanı** ile korunuyor, çalamazsın.` });
         const key = `${uid}:${victim.id}`;
         if (activeSteals.has(key)) return interaction.reply({ ephemeral: true, content: 'Bu kullanıcıyla zaten aktif bir çalma denemen var, bekle.' });
         if (getBalance(gid, victim.id).balance < 2) return interaction.reply({ ephemeral: true, content: 'Hedefin coin\'i yetersiz.' });
@@ -1823,7 +2061,7 @@ client.on('interactionCreate', async interaction => {
     }
 
     // ─────────────────────────────────────────────────────────
-    //  /xpboost
+    //  /xpboost (kalıcı)
     // ─────────────────────────────────────────────────────────
     if (cmd === 'xpboost') {
       if (hasBoost(gid, uid)) return interaction.reply({ ephemeral: true, content: '⚡ Zaten kalıcı **XPBoost (1.5x)** sahibisin babuş!' });
@@ -1832,6 +2070,269 @@ client.on('interactionCreate', async interaction => {
       addBalance(gid, uid, -200);
       setBoost(gid, uid);
       return interaction.reply('✅ **Kalıcı XPBoost (1.5x)** satın alındı! 🔥 Artık görev ödüllerin 1.5x!');
+    }
+
+    // ─────────────────────────────────────────────────────────
+    //  /renk — isim rengi rolleri
+    // ─────────────────────────────────────────────────────────
+    if (cmd === 'renk') {
+      const colorRoles = getColorRoles(gid);
+      if (sub === 'liste') {
+        if (!colorRoles.length) return interaction.reply({ ephemeral: true, content: '🎨 Henüz renk rolü eklenmemiş. Bir yönetici `/setup` üzerinden ekleyebilir.' });
+        const embed = new EmbedBuilder()
+          .setTitle('🎨 Renk Rolleri')
+          .setColor(0xEB459E)
+          .setDescription(colorRoles.map(r => `<@&${r.roleId}> — **${r.price} coin**`).join('\n'));
+        return interaction.reply({ embeds: [embed] });
+      }
+      if (sub === 'al') {
+        if (!colorRoles.length) return interaction.reply({ ephemeral: true, content: '⛔ Henüz renk rolü eklenmemiş. Bir yönetici `/setup` üzerinden ekleyebilir.' });
+        const menu = new StringSelectMenuBuilder()
+          .setCustomId(`renkpick_${uid}`)
+          .setPlaceholder('Bir renk rolü seç...')
+          .addOptions(colorRoles.slice(0, 25).map(r => {
+            const role = interaction.guild.roles.cache.get(r.roleId);
+            return { label: role ? role.name : r.roleId, value: r.roleId, description: `${r.price} coin` };
+          }));
+        return interaction.reply({ ephemeral: true, content: '🎨 Almak istediğin renk rolünü seç (sadece 1 tane sahip olabilirsin, yenisi öncekinin yerine geçer):', components: [new ActionRowBuilder().addComponents(menu)] });
+      }
+    }
+
+    // ─────────────────────────────────────────────────────────
+    //  /balik — balıkçılık
+    // ─────────────────────────────────────────────────────────
+    if (cmd === 'balik') {
+      if (sub === 'tut') {
+        const key = `${gid}:${uid}`;
+        const last = fishCooldown.get(key) || 0;
+        const cd = 15_000;
+        if (Date.now() - last < cd) {
+          const wait = Math.ceil((cd - (Date.now() - last)) / 1000);
+          return interaction.reply({ ephemeral: true, content: `⏳ Oltanı topla, **${wait}** saniye sonra tekrar dene.` });
+        }
+        fishCooldown.set(key, Date.now());
+        const boosted = consumeFishBoost(gid, uid);
+        const fish = pickFish(boosted);
+        addFish(gid, uid, fish.key, 1);
+        return interaction.reply(`🎣 Oltanı attın... ${fish.emoji} **${fish.name}** yakaladın! (~${fish.value} coin değerinde)${boosted ? ' ⚡ *Şans Boostu aktifti*' : ''}`);
+      }
+
+      if (sub === 'envanter') {
+        const inv = getInventory(gid, uid);
+        if (!inv.length) return interaction.reply({ ephemeral: true, content: '🎣 Envanterin boş. `/balik tut` ile balık tutmayı dene!' });
+        const lines = inv.map(i => {
+          const f = FISH_TYPES.find(x => x.key === i.fishKey);
+          return f ? `${f.emoji} **${f.name}** x${i.count} (${f.value} coin/adet)` : `${i.fishKey} x${i.count}`;
+        });
+        return interaction.reply({ embeds: [new EmbedBuilder().setTitle(`🎒 ${interaction.user.username} — Balık Envanteri`).setColor(0x3498DB).setDescription(lines.join('\n'))] });
+      }
+
+      if (sub === 'boost-al') {
+        const bal = getBalance(gid, uid);
+        if (bal.balance < 200) return interaction.reply({ ephemeral: true, content: `⛔ Yetersiz coin! Gerekli: **200**, Bakiye: **${bal.balance}**` });
+        addBalance(gid, uid, -200);
+        addFishBoostUses(gid, uid, 100);
+        sendLog(gid, 'market', new EmbedBuilder().setTitle('🎣 Balıkçılık Şansı Boost Satın Alındı').setColor(0xE67E22)
+          .addFields({ name: 'Kullanıcı', value: `<@${uid}>`, inline: true }).setTimestamp());
+        return interaction.reply(`⚡ **Balıkçılık Şansı Boost** aktif! Sonraki **100** tutma denemende nadir balık şansın artacak. Kalan: **${getFishBoostUses(gid, uid)}**`);
+      }
+
+      if (sub === 'durum') {
+        return interaction.reply({ ephemeral: true, content: `⚡ Kalan balıkçılık boost kullanımı: **${getFishBoostUses(gid, uid)}**` });
+      }
+    }
+
+    // ─────────────────────────────────────────────────────────
+    //  /balik-market
+    // ─────────────────────────────────────────────────────────
+    if (cmd === 'balik-market') {
+      if (sub === 'liste') {
+        const embed = new EmbedBuilder()
+          .setTitle('🐟 Balık Marketi — Sabit Fiyatlar')
+          .setColor(0x1ABC9C)
+          .setDescription(FISH_TYPES.map(f => `${f.emoji} **${f.name}** — **${f.value} coin**`).join('\n'))
+          .setFooter({ text: 'Satmak için: /balik-market sat • Üyeye satmak için: /balik-market oyuncuya-sat' });
+        return interaction.reply({ embeds: [embed] });
+      }
+
+      if (sub === 'sat') {
+        const key = interaction.options.getString('balik');
+        const adet = interaction.options.getInteger('adet');
+        const fish = FISH_TYPES.find(f => f.key === key);
+        if (!fish) return interaction.reply({ ephemeral: true, content: '⛔ Geçersiz balık türü.' });
+        if (!removeFish(gid, uid, key, adet)) return interaction.reply({ ephemeral: true, content: '⛔ Envanterinde yeterli balık yok.' });
+        const total = fish.value * adet;
+        addBalance(gid, uid, total);
+        return interaction.reply(`✅ ${fish.emoji} **${adet}x ${fish.name}** sattın! **+${total} coin**. Bakiye: **${getBalance(gid, uid).balance}**`);
+      }
+
+      if (sub === 'oyuncuya-sat') {
+        const target = interaction.options.getUser('hedef');
+        const key = interaction.options.getString('balik');
+        const adet = interaction.options.getInteger('adet');
+        const fiyat = interaction.options.getInteger('fiyat');
+        const fish = FISH_TYPES.find(f => f.key === key);
+        if (!fish) return interaction.reply({ ephemeral: true, content: '⛔ Geçersiz balık türü.' });
+        if (target.id === uid) return interaction.reply({ ephemeral: true, content: '⛔ Kendine satamazsın.' });
+        if (target.bot) return interaction.reply({ ephemeral: true, content: '⛔ Botlara satamazsın.' });
+        if (getFishCount(gid, uid, key) < adet) return interaction.reply({ ephemeral: true, content: '⛔ Yeterli balığın yok.' });
+        const yesId = `fishtrade_yes_${Date.now()}_${uid}_${target.id}`;
+        const noId  = `fishtrade_no_${Date.now()}_${uid}_${target.id}`;
+        const row = new ActionRowBuilder().addComponents(
+          new ButtonBuilder().setCustomId(yesId).setLabel('Satın Al').setStyle(ButtonStyle.Success).setEmoji('🐟'),
+          new ButtonBuilder().setCustomId(noId).setLabel('Reddet').setStyle(ButtonStyle.Danger).setEmoji('❌'),
+        );
+        await interaction.reply({ content: `${target}, **${interaction.user.username}** sana **${adet}x ${fish.emoji} ${fish.name}**'ı **${fiyat} coin** karşılığında satmak istiyor. Kabul ediyor musun?`, components: [row] });
+        const m2 = await interaction.fetchReply();
+        const coll = m2.createMessageComponentCollector({ componentType: ComponentType.Button, time: 30000, filter: i => (i.customId === yesId || i.customId === noId) && i.user.id === target.id });
+        coll.on('collect', async i => {
+          coll.stop();
+          if (i.customId === noId) return i.update({ content: '❌ Teklif reddedildi.', components: [] });
+          if (getBalance(gid, target.id).balance < fiyat) return i.update({ content: '⛔ Yeterli coin\'in yok.', components: [] });
+          if (getFishCount(gid, uid, key) < adet) return i.update({ content: '⛔ Satıcının artık yeterli balığı yok.', components: [] });
+          removeFish(gid, uid, key, adet);
+          addFish(gid, target.id, key, adet);
+          addBalance(gid, target.id, -fiyat);
+          addBalance(gid, uid, fiyat);
+          await i.update({ content: `✅ Takas tamam! <@${target.id}> **${adet}x ${fish.emoji} ${fish.name}** aldı, <@${uid}> **${fiyat} coin** kazandı.`, components: [] });
+        });
+        coll.on('end', (_, reason) => { if (reason === 'time') interaction.editReply({ content: '⏰ Süre doldu, teklif iptal oldu.', components: [] }).catch(() => {}); });
+        return;
+      }
+    }
+
+    // ─────────────────────────────────────────────────────────
+    //  /yirmibir — blackjack
+    // ─────────────────────────────────────────────────────────
+    if (cmd === 'yirmibir') {
+      const bet = interaction.options.getInteger('bahis');
+      const bkey = `${gid}:${uid}`;
+      if (activeBlackjack.has(bkey)) return interaction.reply({ ephemeral: true, content: '⛔ Zaten aktif bir blackjack elin var.' });
+      const bal = getBalance(gid, uid);
+      if (bal.balance < bet) return interaction.reply({ ephemeral: true, content: `⛔ Yetersiz coin! Bakiye: **${bal.balance}**` });
+      addBalance(gid, uid, -bet);
+
+      const drawCard = () => pick([2, 3, 4, 5, 6, 7, 8, 9, 10, 10, 10, 10, 11]);
+      const handValue = (cards) => { let sum = cards.reduce((a, b) => a + b, 0); let aces = cards.filter(c => c === 11).length; while (sum > 21 && aces > 0) { sum -= 10; aces--; } return sum; };
+      const cardsStr = (cards) => cards.join(' + ');
+
+      const player = [drawCard(), drawCard()];
+      const dealer = [drawCard(), drawCard()];
+      activeBlackjack.set(bkey, { player, dealer, bet });
+
+      const buildEmbed = (reveal = false, desc) => {
+        const e = new EmbedBuilder()
+          .setTitle('🃏 Blackjack (21)')
+          .setColor(0x2ECC71)
+          .addFields(
+            { name: `${interaction.user.username} (${handValue(player)})`, value: cardsStr(player), inline: true },
+            { name: `Bot (${reveal ? handValue(dealer) : '?'})`, value: reveal ? cardsStr(dealer) : `${dealer[0]} + ?`, inline: true },
+          )
+          .setFooter({ text: `Bahis: ${bet} coin` });
+        if (desc) e.setDescription(desc);
+        return e;
+      };
+
+      if (handValue(player) === 21) {
+        activeBlackjack.delete(bkey);
+        const win = resolveWinAmount(bet);
+        addBalance(gid, uid, win);
+        return interaction.reply({ embeds: [buildEmbed(true, `🎉 **BLACKJACK!** Kazandın: **+${win} coin**`)] });
+      }
+
+      const hitId = `bj_hit_${uid}_${Date.now()}`;
+      const standId = `bj_stand_${uid}_${Date.now()}`;
+      const row = new ActionRowBuilder().addComponents(
+        new ButtonBuilder().setCustomId(hitId).setLabel('Çek (Hit)').setStyle(ButtonStyle.Primary).setEmoji('🂠'),
+        new ButtonBuilder().setCustomId(standId).setLabel('Dur (Stand)').setStyle(ButtonStyle.Secondary).setEmoji('✋'),
+      );
+      await interaction.reply({ embeds: [buildEmbed(false)], components: [row] });
+      const m2 = await interaction.fetchReply();
+
+      const finish = async (i, resultText, won) => {
+        activeBlackjack.delete(bkey);
+        await i.update({ embeds: [buildEmbed(true, resultText).setColor(won ? 0x2ECC71 : 0xED4245)], components: [] });
+      };
+
+      const coll = m2.createMessageComponentCollector({ componentType: ComponentType.Button, time: 60000, filter: i => i.user.id === uid && (i.customId === hitId || i.customId === standId) });
+      coll.on('collect', async i => {
+        if (i.customId === hitId) {
+          player.push(drawCard());
+          if (handValue(player) > 21) {
+            coll.stop();
+            return finish(i, `💥 **Battın!** ${handValue(player)} puan. **-${bet} coin** kaybettin.`, false);
+          }
+          return i.update({ embeds: [buildEmbed(false)], components: [row] });
+        }
+        if (i.customId === standId) {
+          coll.stop();
+          while (handValue(dealer) < 17) dealer.push(drawCard());
+          const pv = handValue(player), dv = handValue(dealer);
+          if (dv > 21 || pv > dv) {
+            const win = resolveWinAmount(bet);
+            addBalance(gid, uid, win);
+            return finish(i, `🎉 **Kazandın!** ${pv} vs ${dv}. **+${win} coin**`, true);
+          } else if (pv === dv) {
+            addBalance(gid, uid, bet);
+            return finish(i, `🤝 **Berabere.** ${pv} vs ${dv}. Bahsin iade edildi.`, true);
+          } else {
+            return finish(i, `😿 **Kaybettin.** ${pv} vs ${dv}. **-${bet} coin**`, false);
+          }
+        }
+      });
+      coll.on('end', (_, reason) => {
+        if (reason === 'time' && activeBlackjack.has(bkey)) {
+          activeBlackjack.delete(bkey);
+          addBalance(gid, uid, bet);
+          m2.edit({ content: '⏰ Süre doldu, bahis iade edildi.', components: [] }).catch(() => {});
+        }
+      });
+      return;
+    }
+
+    // ─────────────────────────────────────────────────────────
+    //  /atyarisi — at yarışı (çok oyunculu)
+    // ─────────────────────────────────────────────────────────
+    if (cmd === 'atyarisi') {
+      const horse = interaction.options.getInteger('at');
+      const bet = interaction.options.getInteger('bahis');
+      const bal = getBalance(gid, uid);
+      if (bal.balance < bet) return interaction.reply({ ephemeral: true, content: `⛔ Yetersiz coin! Bakiye: **${bal.balance}**` });
+      const cid = interaction.channelId;
+      let race = activeRaces.get(cid);
+      const isNew = !race;
+      if (!race) {
+        race = { participants: [] };
+        activeRaces.set(cid, race);
+      }
+      if (race.participants.find(p => p.uid === uid)) return interaction.reply({ ephemeral: true, content: '⛔ Bu yarışa zaten bahis koydun.' });
+      addBalance(gid, uid, -bet);
+      race.participants.push({ uid, horse, bet });
+
+      if (isNew) {
+        await interaction.reply(`🐎 **At Yarışı** başladı! Katılmak için **20 saniye** içinde \`/atyarisi at:<1-6> bahis:<miktar>\` komutunu kullan.\n🏇 **${interaction.user.username}** → At **${horse}** — **${bet} coin**`);
+        setTimeout(async () => {
+          const winner = Math.floor(Math.random() * 6) + 1;
+          const lines = race.participants.map(p => {
+            if (p.horse === winner) {
+              const win = resolveWinAmount(p.bet);
+              addBalance(gid, p.uid, win);
+              return `🏆 <@${p.uid}> — At ${p.horse} ✅ **+${win} coin**`;
+            }
+            return `💨 <@${p.uid}> — At ${p.horse} ❌ **-${p.bet} coin**`;
+          });
+          activeRaces.delete(cid);
+          const embed = new EmbedBuilder()
+            .setTitle('🏁 At Yarışı Sonuçlandı!')
+            .setColor(0xF1C40F)
+            .setDescription(`🐎 Kazanan at: **${winner}**\n\n${lines.join('\n') || '_Katılımcı yok._'}`);
+          const ch = await client.channels.fetch(cid).catch(() => null);
+          if (ch?.isTextBased?.()) ch.send({ embeds: [embed] }).catch(() => {});
+        }, 20_000);
+        return;
+      } else {
+        return interaction.reply({ ephemeral: true, content: `✅ Yarışa katıldın! At **${horse}** — **${bet} coin** bahis koydun. Sonuç 20 saniyelik pencere bitince açıklanacak.` });
+      }
     }
 
     // ─────────────────────────────────────────────────────────
@@ -1849,6 +2350,12 @@ client.on('interactionCreate', async interaction => {
         db.prepare('DELETE FROM message_counts WHERE guildId=?').run(gid);
         db.prepare('DELETE FROM voice_time WHERE guildId=?').run(gid);
         db.prepare('DELETE FROM level_data WHERE guildId=?').run(gid);
+        db.prepare('DELETE FROM theft_shields WHERE guildId=?').run(gid);
+        db.prepare('DELETE FROM temp_xp_boosts WHERE guildId=?').run(gid);
+        db.prepare('DELETE FROM color_roles WHERE guildId=?').run(gid);
+        db.prepare('DELETE FROM fish_inventory WHERE guildId=?').run(gid);
+        db.prepare('DELETE FROM fish_boosts WHERE guildId=?').run(gid);
+        db.prepare('DELETE FROM chat_coin_counter WHERE guildId=?').run(gid);
         return interaction.reply('🧨 Bu sunucuya ait tüm veriler temizlendi.');
       }
     }
@@ -2090,6 +2597,7 @@ async function sendSetupPanel(interaction) {
   const gid = interaction.guild.id;
   const s   = getAllSettings(gid);
   const fmt  = key => s[key] ? `<#${s[key]}>` : '_(ayarlanmamış)_';
+  const colorRoles = getColorRoles(gid);
 
   const embed = new EmbedBuilder()
     .setTitle('⚙️ DeathWish Game — Ayar Paneli')
@@ -2100,6 +2608,7 @@ async function sendSetupPanel(interaction) {
       { name: '💬 Sohbet',        value: `Kanal: ${fmt('sohbet_channel')}` },
       { name: '⌨️ Yazı Oyunu',   value: `Kanal: ${fmt('yazi_oyunu_channel')}` },
       { name: '💰 Çal Kanalı',   value: `Kanal: ${fmt('cal_channel')}` },
+      { name: '🎨 Renk Rolleri', value: colorRoles.length ? colorRoles.map(r => `<@&${r.roleId}> — ${r.price} coin`).join('\n') : '_(henüz eklenmedi)_' },
       { name: '📋 Log Kanalları', value: [
         `⚡ XP: ${fmt('log_xp_channel')}`,
         `🏆 Level: ${fmt('log_level_channel')}`,
@@ -2123,9 +2632,12 @@ async function sendSetupPanel(interaction) {
     .setPlaceholder('Ayarlamak istediğin bölümü seç...')
     .addOptions([
       { label: '📊 Seviye Kanalı',        value: 'level_channel',       description: 'Seviye atlama mesajı kanalı' },
-      { label: '💬 Sohbet Kanalı',        value: 'sohbet_channel',       description: 'Mesaj sayacı ve günlük görev kanalı' },
+      { label: '💬 Sohbet Kanalı',        value: 'sohbet_channel',       description: 'Mesaj sayacı ve pasif coin kanalı' },
       { label: '⌨️ Yazı Oyunu Kanalı',   value: 'yazi_oyunu_channel',   description: '/yazioyunu baslat için özel kanal' },
       { label: '💰 Çal Komutu Kanalı',   value: 'cal_channel',           description: '/oyunlar cal komutunun kanalı' },
+      { label: '🎨 Renk Rolü Ekle', value: '__color_add__', description: 'İsim rengi rolleri listesine ekle (50 coin)' },
+      { label: '🎨 Renk Rolü Çıkar', value: '__color_remove__', description: 'Listeden renk rolü çıkar' },
+      { label: '🎨 Renk Rollerini Listele', value: '__color_list__', description: 'Mevcut renk rollerini gör' },
       { label: '📋 Log Kanallarını Ayarla', value: '__log_submenu__',    description: 'XP, Coin, Backup, Error vb. log kanalları' },
     ]);
 
@@ -2164,6 +2676,19 @@ async function handleSetupInteraction(interaction, key) {
       return interaction.update({ content: '📋 **Log Kanalları** — Ayarlamak istediğin log türünü seç:', components: [new ActionRowBuilder().addComponents(logMenu)], embeds: [] });
     }
 
+    if (val === '__color_add__') {
+      const menu2 = new RoleSelectMenuBuilder().setCustomId('setup_addColorRoles').setPlaceholder('Eklenecek renk rollerini seç (çoklu)...').setMinValues(1).setMaxValues(10);
+      return interaction.update({ content: '🎨 Renk rolleri listesine eklemek istediğin rolleri seç (her biri 50 coin olacak):', components: [new ActionRowBuilder().addComponents(menu2)], embeds: [] });
+    }
+    if (val === '__color_remove__') {
+      const menu2 = new RoleSelectMenuBuilder().setCustomId('setup_removeColorRoles').setPlaceholder('Çıkarılacak rolleri seç...').setMinValues(1).setMaxValues(10);
+      return interaction.update({ content: '🎨 Renk rolleri listesinden çıkarmak istediğin rolleri seç:', components: [new ActionRowBuilder().addComponents(menu2)], embeds: [] });
+    }
+    if (val === '__color_list__') {
+      const roles = getColorRoles(interaction.guild.id);
+      return interaction.update({ content: roles.length ? `🎨 **Renk Rolleri:**\n${roles.map(r => `<@&${r.roleId}> — ${r.price} coin`).join('\n')}` : '🎨 Henüz renk rolü eklenmemiş.', components: [], embeds: [] });
+    }
+
     const isRole = ['welcome_auto_role'].includes(val);
     if (isRole) {
       const menu2 = new RoleSelectMenuBuilder().setCustomId(`setup_setRole_${val}`).setPlaceholder('Rol seç...');
@@ -2178,6 +2703,19 @@ async function handleSetupInteraction(interaction, key) {
     const val = interaction.values[0];
     const menu2 = new ChannelSelectMenuBuilder().setCustomId(`setup_setChannel_${val}`).setPlaceholder('Kanal seç...').addChannelTypes(ChannelType.GuildText);
     return interaction.update({ content: `**${val}** için kanal seç:`, components: [new ActionRowBuilder().addComponents(menu2)], embeds: [] });
+  }
+
+  if (key === 'addColorRoles') {
+    const roleIds = interaction.values;
+    for (const rid of roleIds) addColorRole(interaction.guild.id, rid, 50);
+    sendLog(interaction.guild.id, 'setup', new EmbedBuilder().setTitle('🎨 Renk Rolleri Eklendi').setColor(0xEB459E)
+      .addFields({ name: 'Yetkili', value: `<@${interaction.user.id}>`, inline: true }, { name: 'Roller', value: roleIds.map(r => `<@&${r}>`).join(', '), inline: false }).setTimestamp());
+    return interaction.update({ content: `✅ ${roleIds.length} rol renk rolü listesine eklendi (her biri 50 coin).`, components: [], embeds: [] });
+  }
+  if (key === 'removeColorRoles') {
+    const roleIds = interaction.values;
+    for (const rid of roleIds) removeColorRole(interaction.guild.id, rid);
+    return interaction.update({ content: `✅ ${roleIds.length} rol renk rolü listesinden çıkarıldı.`, components: [], embeds: [] });
   }
 
   if (key.startsWith('setChannel_')) {
@@ -2245,4 +2783,3 @@ async function startBot() {
   await startBot();
   startAutoBackup();
 })();
-
