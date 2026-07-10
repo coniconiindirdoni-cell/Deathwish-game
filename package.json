@@ -1,16 +1,19 @@
 {
-  "name": "@workspace/discord-bot",
-  "version": "2.0.0",
-  "private": true,
-  "description": "DeathWish Game Bot — PostgreSQL edition (kalıcı veri)",
+  "name": "deathwish-game",
+  "version": "1.0.0",
+  "description": "DeathWish Game Discord Bot",
   "main": "index.js",
   "scripts": {
-    "start": "node index.js",
-    "dev": "node index.js"
+    "start": "node index.js"
   },
+  "author": "",
+  "license": "MIT",
   "dependencies": {
-    "discord.js": "^14.16.3",
-    "pg": "^8.13.3",
-    "dotenv": "^16.4.5"
+    "axios": "^1.11.0",
+    "discord.js": "^14.21.0",
+    "dotenv": "^17.2.1",
+    "fs-extra": "^11.3.0",
+    "mongoose": "^8.18.0",
+    "ms": "^2.1.3"
   }
 }
