@@ -36,7 +36,25 @@ const PORT   = process.env.PORT || 3000;
 const GITHUB_OWNER   = process.env.GITHUB_OWNER || '';
 const GITHUB_REPO    = process.env.GITHUB_REPO  || '';
 const GITHUB_TOKEN   = process.env.GITHUB_TOKEN  || '';
-const BACKUP_BRANCH  = process.env.BACKUP_BRANCH || 'main';
+// ⚠️ KRİTİK: Bu branch'e atılan HER commit, Render/Railway gibi platformlarda
+// "Auto-Deploy" kuruluysa YENİ BİR DEPLOY tetikler. Eğer GITHUB_OWNER/GITHUB_REPO
+// botun kaynak kodunun bulunduğu repo ise ve BACKUP_BRANCH o deploy'un izlediği
+// branch (genelde "main") ile AYNIYSA, backup -> yeni commit -> yeni deploy ->
+// bot yeniden başlar -> (kalıcı disk yoksa) veritabanı sıfırlanır -> boş DB
+// otomatik geri yükleme tetikler -> o da yeni bir backup commit atar -> sonsuz
+// döngü oluşur. Bu yüzden varsayılanı bilerek "main" DEĞİL, ayrı bir branch
+// yaptık. Yine de en güvenlisi: GITHUB_REPO'yu botun kaynak koduyla PAYLAŞMAYAN,
+// yalnızca yedekler için ayrılmış ayrı bir repo yapmaktır.
+const BACKUP_BRANCH  = process.env.BACKUP_BRANCH || 'data-backups';
+if (GITHUB_TOKEN && GITHUB_OWNER && GITHUB_REPO && (BACKUP_BRANCH === 'main' || BACKUP_BRANCH === 'master')) {
+  console.warn(
+    `⚠️⚠️⚠️ DİKKAT: BACKUP_BRANCH="${BACKUP_BRANCH}" olarak ayarlı. Eğer barındırma ` +
+    `platformunuz (Render/Railway/vb.) bu repodaki "${BACKUP_BRANCH}" branch'ini Auto-Deploy ` +
+    `için izliyorsa, her otomatik yedek yeni bir deploy tetikleyip botu yeniden başlatır ve ` +
+    `(kalıcı disk yoksa) TÜM VERİYİ SIFIRLAR. Ayrı bir backup branch/repo kullanın ve ` +
+    `barındırma platformunda Auto-Deploy'un yalnızca kod branch'ini izlediğinden emin olun.`
+  );
+}
 const octokit = GITHUB_TOKEN ? new Octokit({ auth: GITHUB_TOKEN }) : null;
 
 // Bu role sahip olan herkes owner-only komutları da kullanabilir.
@@ -271,7 +289,15 @@ async function listBackupsFromGithub() {
  * Restore öncesi otomatik bir yedek alır.
  * @param {string} filePath — GitHub'daki dosya yolu
  */
-async function restoreFromGithub(filePath) {
+// En son yedeğin dosya adından (YYYY-MM-DD_HH-MM.zip) tarihini çıkarır.
+function parseBackupTimestamp(fileName) {
+  const m = /^(\d{4})-(\d{2})-(\d{2})_(\d{2})-(\d{2})\.zip$/.exec(fileName);
+  if (!m) return null;
+  const [, y, mo, d, h, mi] = m;
+  return new Date(Number(y), Number(mo) - 1, Number(d), Number(h), Number(mi)).getTime();
+}
+
+async function restoreFromGithub(filePath, opts = {}) {
   if (!octokit)              throw new Error('GITHUB_TOKEN tanımlı değil.');
   if (!GITHUB_OWNER || !GITHUB_REPO) throw new Error('GITHUB_OWNER / GITHUB_REPO tanımlı değil.');
   if (backupInProgress)      throw new Error('Şu an başka bir backup/restore işlemi çalışıyor.');
@@ -281,12 +307,36 @@ async function restoreFromGithub(filePath) {
     throw new Error('Geçersiz backup yolu.');
   }
 
-  // Restore öncesi otomatik yedek al
-  try {
-    await backupToGithub('pre-restore otomatik yedek');
-  } catch (preErr) {
-    console.warn('⚠️ Pre-restore yedek alınamadı:', preErr.message);
-    // Pre-restore başarısız olsa bile restore devam eder (kilidi serbest bıraktı)
+  // ⚠️ Sonsuz döngü freni: eğer en güncel yedek çok yakın zamanda (ör. son 5
+  // dakika içinde) alınmışsa, restore öncesi YENİ bir "pre-restore" yedeği
+  // ALMA. Aksi halde şu döngü oluşabilir: boş DB -> restore -> pre-restore
+  // backup commit -> (Auto-Deploy varsa) yeni deploy -> restart -> yine boş
+  // DB -> restore -> ... Bu kontrol, backup'ın GitHub'a yeni commit atmasını
+  // (ve dolayısıyla olası bir Auto-Deploy tetiklenmesini) engelleyerek
+  // döngüyü kırar. `opts.skipPreBackup` ile manuel çağrılarda da atlanabilir.
+  let shouldPreBackup = opts.skipPreBackup !== true;
+  if (shouldPreBackup) {
+    try {
+      const backups = await listBackupsFromGithub();
+      const mostRecent = backups[0];
+      const ts = mostRecent ? parseBackupTimestamp(mostRecent.name) : null;
+      if (ts && Date.now() - ts < 5 * 60 * 1000) {
+        shouldPreBackup = false;
+        console.warn('⚠️ En güncel yedek 5 dakikadan daha yeni — döngüyü önlemek için pre-restore yedeği atlanıyor.');
+      }
+    } catch (checkErr) {
+      console.warn('⚠️ Yedek listesi kontrol edilemedi, pre-restore yedeği yine de denenecek:', checkErr.message);
+    }
+  }
+
+  // Restore öncesi otomatik yedek al (yalnızca yukarıdaki döngü freni izin verirse)
+  if (shouldPreBackup) {
+    try {
+      await backupToGithub('pre-restore otomatik yedek');
+    } catch (preErr) {
+      console.warn('⚠️ Pre-restore yedek alınamadı:', preErr.message);
+      // Pre-restore başarısız olsa bile restore devam eder (kilidi serbest bıraktı)
+    }
   }
 
   backupInProgress = true;
