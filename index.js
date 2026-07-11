@@ -1115,8 +1115,7 @@ async function handleMineButton(interaction) {
     let data = getMiningData(gid, uid);
     data = regenEnergy(data);
 
-    const capacity   = getMiningCapacity(data.miningLevel);
-    const sendCount  = Math.min(data.miners, capacity);
+    const sendCount  = data.miners;
     const energyCost = sendCount;
 
     if (data.energy < energyCost) {
