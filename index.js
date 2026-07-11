@@ -65,6 +65,9 @@ function hasOwnerAccess(userId, member) {
   return false;
 }
 
+// Tüm komutların çalışacağı tek kanal (ownerlar hariç her yerde kısıtlı)
+const GAME_CHANNEL_ID = '1525046495127011388';
+
 if (!TOKEN) { console.error('⛔ DISCORD_TOKEN bulunamadı!'); process.exit(1); }
 
 // ──────────────────────────────────────────────────────────────
@@ -1461,6 +1464,19 @@ client.on('interactionCreate', async interaction => {
         return interaction.respond(matches);
       }
       return interaction.respond([]);
+    }
+
+    // ── KANAL KISITLAMASI ────────────────────────────────────
+    // Tüm slash komutları yalnızca GAME_CHANNEL_ID kanalında çalışır.
+    // Ownerlar (OWNERS listesi veya OWNER_ROLE_ID rolü) her kanaldan kullanabilir.
+    if (interaction.isChatInputCommand() && interaction.guild) {
+      const _uid = interaction.user.id;
+      if (interaction.channelId !== GAME_CHANNEL_ID && !hasOwnerAccess(_uid, interaction.member)) {
+        return interaction.reply({
+          ephemeral: true,
+          content: `⛔ Komutları yalnızca <#${GAME_CHANNEL_ID}> kanalında kullanabilirsin.`,
+        });
+      }
     }
 
     // ── SETUP PANELİ ─────────────────────────────────────────
