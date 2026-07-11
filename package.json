@@ -6,12 +6,20 @@
   "scripts": {
     "start": "node index.js"
   },
+  "engines": {
+    "node": ">=20.0.0"
+  },
   "author": "",
   "license": "MIT",
   "dependencies": {
+    "@octokit/rest": "^22.0.0",
+    "adm-zip": "^0.5.16",
+    "archiver": "^7.0.1",
     "axios": "^1.11.0",
+    "better-sqlite3": "^12.2.0",
     "discord.js": "^14.21.0",
     "dotenv": "^17.2.1",
+    "express": "^4.21.2",
     "fs-extra": "^11.3.0",
     "mongoose": "^8.18.0",
     "ms": "^2.1.3"
