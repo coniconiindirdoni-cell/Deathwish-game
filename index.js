@@ -140,6 +140,29 @@ function ensureSchema() {
   if (!tempBoostCols.includes('usesLeft')) {
     db.exec('ALTER TABLE temp_xp_boosts ADD COLUMN usesLeft INTEGER DEFAULT 0');
   }
+
+  // ── Madencilik oyunu tabloları ──────────────────────────────
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS mining_data (
+      guildId TEXT, userId TEXT,
+      miners INTEGER DEFAULT 2,
+      miningLevel INTEGER DEFAULT 1,
+      miningXp INTEGER DEFAULT 0,
+      energyLevel INTEGER DEFAULT 1,
+      energyXp INTEGER DEFAULT 0,
+      energy INTEGER DEFAULT 20,
+      lastEnergyRegen INTEGER DEFAULT 0,
+      hungryUntil INTEGER DEFAULT 0,
+      workerTier INTEGER DEFAULT 0,
+      purchasesInTier INTEGER DEFAULT 0,
+      totalOresMined INTEGER DEFAULT 0,
+      PRIMARY KEY(guildId, userId)
+    );
+    CREATE TABLE IF NOT EXISTS mining_inventory (
+      guildId TEXT, userId TEXT, ore TEXT, amount INTEGER DEFAULT 0,
+      PRIMARY KEY(guildId, userId, ore)
+    );
+  `);
 }
 
 function initDatabase() {
@@ -566,7 +589,7 @@ function createBankAccount(gid, uid) {
 }
 
 // Komutlardan hangilerinin banka hesabı olmadan da çalışabileceği (yönetimsel/owner komutları)
-const BANK_EXEMPT_COMMANDS = new Set(['setup', 'yardim', 'banka', 'verikaydet', 'backuplist', 'veriyukle', 'backupsil']);
+const BANK_EXEMPT_COMMANDS = new Set(['setup', 'yardim', 'banka', 'verikaydet', 'backuplist', 'veriyukle', 'backupsil', 'madencilik']);
 
 // İsim Rengi Rolleri (admin /setup üzerinden ekler, kullanıcı /renk al ile satın alır)
 function getColorRoles(gid)              { return db.prepare('SELECT * FROM color_roles WHERE guildId=?').all(gid); }
@@ -920,6 +943,566 @@ function normalizeTR(s) {
 }
 
 // ──────────────────────────────────────────────────────────────
+//  MADENCİLİK OYUNU SABİTLERİ & YARDIMCILARI
+// ──────────────────────────────────────────────────────────────
+const MINING_CHANNEL_ID = '1525528825247830126';
+
+const ORES = [
+  { key: 'coal',    name: 'Kömür',   emoji: '⬛', value: 1,  weight: 35   },
+  { key: 'copper',  name: 'Bakır',   emoji: '🟤', value: 1,  weight: 28   },
+  { key: 'iron',    name: 'Demir',   emoji: '⚙️',  value: 2,  weight: 18   },
+  { key: 'silver',  name: 'Gümüş',  emoji: '🩶', value: 2,  weight: 8    },
+  { key: 'steel',   name: 'Çelik',  emoji: '🔩', value: 2,  weight: 6    },
+  { key: 'gold',    name: 'Altın',  emoji: '🟡', value: 3,  weight: 3    },
+  { key: 'lignite', name: 'Linyit', emoji: '🔵', value: 5,  weight: 1.5  },
+  { key: 'diamond', name: 'Elmas',  emoji: '💎', value: 7,  weight: 0.35 },
+  { key: 'uranium', name: 'Uranyum',emoji: '☢️',  value: 10, weight: 0.15 },
+];
+
+const MINING_FOODS = [
+  { key: 'bread', name: 'Ekmek', emoji: '🍞', price: 5,  durationMs: 10 * 60 * 1000, desc: '10 dk tok kalır' },
+  { key: 'soup',  name: 'Çorba', emoji: '🍲', price: 10, durationMs: 20 * 60 * 1000, desc: '20 dk tok kalır' },
+  { key: 'meat',  name: 'Et',    emoji: '🥩', price: 30, durationMs: 60 * 60 * 1000, desc: '1 saat tok kalır' },
+];
+
+// Başlangıç: 2 işçi bedava
+// Tier 0: 50 coin (Lv.1 gerekli, 1 alım → max 3 işçi)
+// Tier 1: 200 coin (Lv.10 gerekli, 5 alım → max 8 işçi)
+// Tier 2: 400 coin (Lv.20 gerekli, 5 alım → max 13 işçi)
+const WORKER_TIERS = [
+  { price: 50,  minLevel: 1,  maxPurchases: 1 },
+  { price: 200, minLevel: 10, maxPurchases: 5 },
+  { price: 400, minLevel: 20, maxPurchases: 5 },
+];
+
+const MINING_COOLDOWNS = new Map(); // key: guildId:userId → timestamp
+
+function miningCooldownCheck(gid, uid) {
+  const key = `${gid}:${uid}`;
+  const last = MINING_COOLDOWNS.get(key) || 0;
+  const remaining = 10000 - (Date.now() - last);
+  if (remaining > 0) return Math.ceil(remaining / 1000);
+  MINING_COOLDOWNS.set(key, Date.now());
+  return 0;
+}
+
+function getMiningData(gid, uid) {
+  let r = db.prepare('SELECT * FROM mining_data WHERE guildId=? AND userId=?').get(gid, uid);
+  if (!r) {
+    db.prepare(
+      `INSERT OR IGNORE INTO mining_data(guildId,userId,miners,miningLevel,miningXp,energyLevel,energyXp,energy,lastEnergyRegen,hungryUntil,workerTier,purchasesInTier,totalOresMined)
+       VALUES(?,?,2,1,0,1,0,20,?,0,0,0,0)`
+    ).run(gid, uid, Date.now());
+    r = db.prepare('SELECT * FROM mining_data WHERE guildId=? AND userId=?').get(gid, uid);
+  }
+  return r;
+}
+
+function saveMiningData(gid, uid, data) {
+  db.prepare(
+    `UPDATE mining_data SET miners=?,miningLevel=?,miningXp=?,energyLevel=?,energyXp=?,energy=?,lastEnergyRegen=?,hungryUntil=?,workerTier=?,purchasesInTier=?,totalOresMined=?
+     WHERE guildId=? AND userId=?`
+  ).run(
+    data.miners, data.miningLevel, data.miningXp,
+    data.energyLevel, data.energyXp,
+    data.energy, data.lastEnergyRegen, data.hungryUntil,
+    data.workerTier, data.purchasesInTier, data.totalOresMined,
+    gid, uid
+  );
+}
+
+function getMiningMaxEnergy(data)   { return 19 + data.energyLevel; } // Lv.1=20, Lv.2=21 …
+function getMiningCapacity(level)   { return level >= 20 ? 5 : level >= 10 ? 3 : 2; }
+function getMiningXpNeeded(level)   { return level * 50; }
+function getEnergyXpNeeded(level)   { return level * 10; }
+
+function getMiningRank(level) {
+  if (level >= 20) return { name: 'Master', emoji: '👑', color: 0xE74C3C };
+  if (level >= 15) return { name: 'Gold',   emoji: '🥇', color: 0xF1C40F };
+  if (level >= 10) return { name: 'Iron',   emoji: '⚙️', color: 0x95A5A6 };
+  if (level >= 5)  return { name: 'Bronze', emoji: '🥉', color: 0xCD7F32 };
+  return { name: 'Beginner', emoji: '⛏️', color: 0x3498DB };
+}
+
+function regenEnergy(data) {
+  const now = Date.now();
+  const elapsed = now - (data.lastEnergyRegen || now);
+  const regenCount = Math.floor(elapsed / (2 * 60 * 1000));
+  if (regenCount > 0) {
+    const maxEnergy = getMiningMaxEnergy(data);
+    data.energy = Math.min(maxEnergy, data.energy + regenCount);
+    data.lastEnergyRegen = (data.lastEnergyRegen || now) + regenCount * 2 * 60 * 1000;
+  }
+  return data;
+}
+
+function pickOre() {
+  const total = ORES.reduce((a, o) => a + o.weight, 0);
+  let r = Math.random() * total;
+  for (const o of ORES) { if (r < o.weight) return o; r -= o.weight; }
+  return ORES[0];
+}
+
+function getMiningInventory(gid, uid) {
+  return db.prepare('SELECT * FROM mining_inventory WHERE guildId=? AND userId=?').all(gid, uid);
+}
+function addMiningOre(gid, uid, oreKey, amount) {
+  db.prepare('INSERT OR IGNORE INTO mining_inventory(guildId,userId,ore,amount)VALUES(?,?,?,0)').run(gid, uid, oreKey);
+  db.prepare('UPDATE mining_inventory SET amount=amount+? WHERE guildId=? AND userId=? AND ore=?').run(amount, gid, uid, oreKey);
+}
+function clearMiningInventory(gid, uid) {
+  db.prepare('DELETE FROM mining_inventory WHERE guildId=? AND userId=?').run(gid, uid);
+}
+function getMiningLeaderboard(gid, limit = 10) {
+  return db.prepare(
+    'SELECT userId,miningLevel,totalOresMined FROM mining_data WHERE guildId=? ORDER BY miningLevel DESC, totalOresMined DESC LIMIT ?'
+  ).all(gid, limit);
+}
+
+function buildMiningPanel() {
+  const embed = new EmbedBuilder()
+    .setTitle('⛏️ Madencilik Oyunu')
+    .setColor(0x8B4513)
+    .setDescription(
+      '**Madene işçi gönder, maden çıkar, envanterini sat!**\n\n' +
+      '🔒 Tüm oyun verilerin yalnızca sana görünür.\n' +
+      '⏱️ Her eylem için **10 saniye** bekleme süresi var.\n' +
+      '⚡ Enerji her **2 dakikada bir** 1 adet yenilenir.\n' +
+      '🍽️ Madencilerin aç kalırsa verim düşer!'
+    )
+    .addFields(
+      { name: '⛏️ Madene Gönder', value: 'İşçilerini madene yolla, maden çıkar', inline: true },
+      { name: '⚡ Enerji',         value: 'Enerji durumunu kontrol et',           inline: true },
+      { name: '🎒 Envanter',       value: 'Çıkardığın madenleri gör',             inline: true },
+      { name: '💰 Sat',            value: 'Tüm envanteri coin\'e çevir',          inline: true },
+      { name: '🛒 Market',         value: 'İşçi, enerji ve yemek satın al',       inline: true },
+      { name: '📊 Profil',         value: 'Madencilik istatistiklerini gör',      inline: true },
+    )
+    .setFooter({ text: 'Başlangıç: 2 işçi | Rütbeler: Bronze(Lv5) • Iron(Lv10) • Gold(Lv15) • Master(Lv20)' });
+
+  const row1 = new ActionRowBuilder().addComponents(
+    new ButtonBuilder().setCustomId('mine_dig').setLabel('⛏️ Madene Gönder').setStyle(ButtonStyle.Primary),
+    new ButtonBuilder().setCustomId('mine_energy').setLabel('⚡ Enerji').setStyle(ButtonStyle.Secondary),
+    new ButtonBuilder().setCustomId('mine_inventory').setLabel('🎒 Envanter').setStyle(ButtonStyle.Secondary),
+  );
+  const row2 = new ActionRowBuilder().addComponents(
+    new ButtonBuilder().setCustomId('mine_sell').setLabel('💰 Sat').setStyle(ButtonStyle.Success),
+    new ButtonBuilder().setCustomId('mine_market').setLabel('🛒 Market').setStyle(ButtonStyle.Secondary),
+    new ButtonBuilder().setCustomId('mine_profile').setLabel('📊 Profil').setStyle(ButtonStyle.Secondary),
+  );
+  const row3 = new ActionRowBuilder().addComponents(
+    new ButtonBuilder().setCustomId('mine_help').setLabel('📖 Nasıl Oynanır?').setStyle(ButtonStyle.Secondary),
+  );
+  return { embeds: [embed], components: [row1, row2, row3] };
+}
+
+async function handleMineButton(interaction) {
+  const gid = interaction.guild?.id;
+  const uid = interaction.user.id;
+  if (!gid) return interaction.reply({ ephemeral: true, content: '⛔ Bu bir sunucu içinde kullanılabilir.' });
+
+  const cd = miningCooldownCheck(gid, uid);
+  if (cd > 0) return interaction.reply({ ephemeral: true, content: `⏳ **${cd}** saniye beklemelisin!` });
+
+  if (!hasBankAccount(gid, uid)) {
+    return interaction.reply({ ephemeral: true, content: '🏦 Önce `/banka olustur` ile hesap açman gerekiyor!' });
+  }
+
+  const id = interaction.customId;
+
+  // ── ⛏️ MADENE GÖNDER ───────────────────────────────────────
+  if (id === 'mine_dig') {
+    let data = getMiningData(gid, uid);
+    data = regenEnergy(data);
+
+    const capacity   = getMiningCapacity(data.miningLevel);
+    const sendCount  = Math.min(data.miners, capacity);
+    const energyCost = sendCount;
+
+    if (data.energy < energyCost) {
+      saveMiningData(gid, uid, data);
+      const maxE = getMiningMaxEnergy(data);
+      const secToNext = Math.ceil((2 * 60 * 1000 - (Date.now() - data.lastEnergyRegen) % (2 * 60 * 1000)) / 1000);
+      return interaction.reply({
+        ephemeral: true,
+        content: `⚡ Yeterli enerji yok!\nGerekli: **${energyCost}**, Mevcut: **${data.energy}/${maxE}**\n⏱️ Sonraki yenilenme: **${secToNext}s** | 🛒 Marketten de alabilirsin.`,
+      });
+    }
+
+    // Açlık kontrolü: hungryUntil = -1 → aç, 0 → hiç yenilmedi (tok say), >0 → tarih kontrolü
+    const isHungry = data.hungryUntil === -1 || (data.hungryUntil > 0 && Date.now() >= data.hungryUntil);
+    const effectiveSend = isHungry ? Math.max(1, Math.floor(sendCount / 2)) : sendCount;
+
+    data.energy -= energyCost;
+
+    // Maden çıkarma
+    const results = [];
+    for (let i = 0; i < effectiveSend; i++) results.push(pickOre());
+    for (const ore of results) addMiningOre(gid, uid, ore.key, 1);
+    data.totalOresMined += effectiveSend;
+
+    // Madencilik XP
+    data.miningXp += effectiveSend;
+    let leveledUp = false;
+    while (data.miningXp >= getMiningXpNeeded(data.miningLevel)) {
+      data.miningXp -= getMiningXpNeeded(data.miningLevel);
+      data.miningLevel++;
+      leveledUp = true;
+    }
+
+    // Açlık şansı: %40 ihtimalle işçiler acıkır
+    let newlyHungry = false;
+    if (!isHungry && Math.random() < 0.4) { data.hungryUntil = -1; newlyHungry = true; }
+    else if (isHungry)                     { data.hungryUntil = -1; }
+
+    saveMiningData(gid, uid, data);
+
+    const rank     = getMiningRank(data.miningLevel);
+    const maxEnergy = getMiningMaxEnergy(data);
+    const oreLines  = results.map(o => `${o.emoji} ${o.name}`).join('\n') || '—';
+
+    const embed = new EmbedBuilder()
+      .setTitle('⛏️ Madencilik Sonucu')
+      .setColor(rank.color)
+      .addFields(
+        { name: '🏭 Çıkarılan Madenler',  value: oreLines,                                               inline: true },
+        { name: '👷 Gönderilen İşçi',     value: `**${effectiveSend}** / ${data.miners}${isHungry ? ' *(aç 😫)*' : ''}`, inline: true },
+        { name: '⚡ Kalan Enerji',         value: `**${data.energy}** / ${maxEnergy}`,                    inline: true },
+        { name: '🏅 Rütbe / Seviye',       value: `${rank.emoji} **${rank.name}** Lv.${data.miningLevel}`, inline: true },
+        { name: '📈 Madencilik XP',        value: `${data.miningXp} / ${getMiningXpNeeded(data.miningLevel)}`, inline: true },
+      );
+
+    if (leveledUp)    embed.addFields({ name: '🎉 SEVİYE ATLADI!',    value: `Madencilik Lv.**${data.miningLevel}** oldun!`,              inline: false });
+    if (newlyHungry)  embed.addFields({ name: '🍽️ İşçiler Acıktı!',  value: 'Market\'ten yemek al, verimliliği koruyalım!',             inline: false });
+    if (isHungry)     embed.addFields({ name: '😫 İşçiler Aç!',       value: 'Açlık nedeniyle verimlilik %50 düştü! Market\'ten yemek al.', inline: false });
+
+    return interaction.reply({ ephemeral: true, embeds: [embed] });
+  }
+
+  // ── ⚡ ENERJİ ───────────────────────────────────────────────
+  if (id === 'mine_energy') {
+    let data = getMiningData(gid, uid);
+    data = regenEnergy(data);
+    saveMiningData(gid, uid, data);
+
+    const maxEnergy = getMiningMaxEnergy(data);
+    const msToNext  = 2 * 60 * 1000 - (Date.now() - data.lastEnergyRegen) % (2 * 60 * 1000);
+    const secToNext = Math.ceil(msToNext / 1000);
+
+    const embed = new EmbedBuilder()
+      .setTitle('⚡ Enerji Durumu')
+      .setColor(0xF39C12)
+      .addFields(
+        { name: '⚡ Mevcut Enerji',   value: `**${data.energy}** / ${maxEnergy}`,                           inline: true },
+        { name: '⏱️ Sonraki Yenilenme', value: `**${secToNext}** saniye`,                                  inline: true },
+        { name: '⚡ Enerji Seviyesi', value: `Lv.**${data.energyLevel}** (Max: ${maxEnergy})`,              inline: true },
+        { name: '📈 Enerji XP',       value: `${data.energyXp} / ${getEnergyXpNeeded(data.energyLevel)}`,  inline: true },
+      )
+      .setFooter({ text: '2 dk = +1 enerji otomatik | Market: 2 coin = 1 enerji' });
+
+    return interaction.reply({ ephemeral: true, embeds: [embed] });
+  }
+
+  // ── 🎒 ENVANTER ─────────────────────────────────────────────
+  if (id === 'mine_inventory') {
+    const inv = getMiningInventory(gid, uid).filter(r => r.amount > 0);
+    if (!inv.length) return interaction.reply({ ephemeral: true, content: '🎒 Envanterin boş! Madene işçi gönder.' });
+
+    let totalValue = 0;
+    const lines = inv.map(r => {
+      const ore = ORES.find(o => o.key === r.ore);
+      if (!ore) return null;
+      const val = ore.value * r.amount;
+      totalValue += val;
+      return `${ore.emoji} **${ore.name}** × ${r.amount} — ${val} coin`;
+    }).filter(Boolean);
+
+    const embed = new EmbedBuilder()
+      .setTitle('🎒 Madencilik Envanteri')
+      .setColor(0x8B4513)
+      .setDescription(lines.join('\n'))
+      .addFields({ name: '💰 Toplam Değer', value: `**${totalValue} coin**`, inline: true })
+      .setFooter({ text: 'Satmak için "Sat" düğmesine bas' });
+
+    return interaction.reply({ ephemeral: true, embeds: [embed] });
+  }
+
+  // ── 💰 SAT ──────────────────────────────────────────────────
+  if (id === 'mine_sell') {
+    const inv = getMiningInventory(gid, uid).filter(r => r.amount > 0);
+    if (!inv.length) return interaction.reply({ ephemeral: true, content: '🎒 Satacak maden yok! Önce madene gönder.' });
+
+    let totalValue = 0;
+    const lines = [];
+    for (const r of inv) {
+      const ore = ORES.find(o => o.key === r.ore);
+      if (!ore) continue;
+      const earned = ore.value * r.amount;
+      totalValue += earned;
+      lines.push(`${ore.emoji} ${ore.name} × ${r.amount} = ${earned} coin`);
+    }
+    clearMiningInventory(gid, uid);
+    addBalance(gid, uid, totalValue);
+
+    const embed = new EmbedBuilder()
+      .setTitle('💰 Madenler Satıldı!')
+      .setColor(0x2ECC71)
+      .setDescription(lines.join('\n'))
+      .addFields({ name: '💰 Kazanılan', value: `**+${totalValue} coin**`, inline: true },
+                 { name: '💳 Yeni Bakiye', value: `**${getBalance(gid, uid).balance} coin**`, inline: true });
+
+    return interaction.reply({ ephemeral: true, embeds: [embed] });
+  }
+
+  // ── 🛒 MARKET ───────────────────────────────────────────────
+  if (id === 'mine_market') {
+    let data = getMiningData(gid, uid);
+    data = regenEnergy(data);
+    const bal         = getBalance(gid, uid).balance;
+    const tierIdx     = Math.min(data.workerTier, WORKER_TIERS.length - 1);
+    const tier        = WORKER_TIERS[tierIdx];
+    const nextTier    = WORKER_TIERS[tierIdx + 1] || null;
+    const allWorkersBought = data.workerTier >= WORKER_TIERS.length;
+    const canBuyWorker = !allWorkersBought && data.miningLevel >= tier.minLevel;
+    const maxEnergy   = getMiningMaxEnergy(data);
+    const remaining   = allWorkersBought ? 0 : tier.maxPurchases - data.purchasesInTier;
+
+    const workerLines = allWorkersBought
+      ? ['**👷 İşçi Satın Al**', '  ✅ Maksimum işçi sayısına ulaştın! (**13 işçi**)']
+      : [
+          '**👷 İşçi Satın Al**',
+          `  Fiyat: **${tier.price} coin** | Mevcut: **${data.miners}** işçi`,
+          canBuyWorker ? `  ✅ Seviye yeterli (Lv.${data.miningLevel})` : `  ❌ Gereken seviye: Lv.${tier.minLevel}`,
+          `  Bu tier'dan kalan: **${remaining}** alım`,
+          nextTier ? `  Sonraki tier: **${nextTier.price}** coin (Lv.${nextTier.minLevel} gerekli)` : '  📌 Bu son tier',
+        ];
+
+    const infoLines = [
+      ...workerLines,
+      '',
+      '**⚡ Enerji Satın Al** — 2 coin / adet (5 adet = 10 coin)',
+      `  Mevcut: ${data.energy}/${maxEnergy}`,
+      '',
+      '**🍞 Ekmek** — 5 coin (10 dk tok)',
+      '**🍲 Çorba** — 10 coin (20 dk tok)',
+      '**🥩 Et** — 30 coin (1 saat tok)',
+      '',
+      `💰 Bakiye: **${bal} coin**`,
+    ].join('\n');
+
+    const row = new ActionRowBuilder().addComponents(
+      new ButtonBuilder().setCustomId('mine_buy_worker').setLabel('👷 İşçi Al').setStyle(ButtonStyle.Primary).setDisabled(!canBuyWorker || bal < tier.price),
+      new ButtonBuilder().setCustomId('mine_buy_energy').setLabel('⚡ Enerji +5').setStyle(ButtonStyle.Secondary).setDisabled(bal < 10 || data.energy >= maxEnergy),
+      new ButtonBuilder().setCustomId('mine_buy_bread').setLabel('🍞 Ekmek 5c').setStyle(ButtonStyle.Success).setDisabled(bal < 5),
+      new ButtonBuilder().setCustomId('mine_buy_soup').setLabel('🍲 Çorba 10c').setStyle(ButtonStyle.Success).setDisabled(bal < 10),
+      new ButtonBuilder().setCustomId('mine_buy_meat').setLabel('🥩 Et 30c').setStyle(ButtonStyle.Success).setDisabled(bal < 30),
+    );
+
+    return interaction.reply({ ephemeral: true, content: infoLines, components: [row] });
+  }
+
+  // ── 👷 İŞÇİ SATIN AL ─────────────────────────────────────
+  if (id === 'mine_buy_worker') {
+    let data = getMiningData(gid, uid);
+    data = regenEnergy(data);
+
+    if (data.workerTier >= WORKER_TIERS.length)
+      return interaction.reply({ ephemeral: true, content: '✅ Zaten maksimum işçi sayısına ulaştın! (**13 işçi**)' });
+
+    const tierIdx = Math.min(data.workerTier, WORKER_TIERS.length - 1);
+    const tier    = WORKER_TIERS[tierIdx];
+    const bal     = getBalance(gid, uid).balance;
+
+    if (data.miningLevel < tier.minLevel)
+      return interaction.reply({ ephemeral: true, content: `❌ İşçi almak için Madencilik Lv.**${tier.minLevel}** gerekiyor! (Şu an: Lv.${data.miningLevel})` });
+    if (bal < tier.price)
+      return interaction.reply({ ephemeral: true, content: `❌ Yetersiz coin! Gerekli: **${tier.price}**, Bakiye: **${bal}**` });
+
+    addBalance(gid, uid, -tier.price);
+    data.miners++;
+    data.purchasesInTier++;
+
+    if (data.purchasesInTier >= tier.maxPurchases) {
+      data.workerTier++;
+      data.purchasesInTier = 0;
+    }
+
+    saveMiningData(gid, uid, data);
+
+    const newBal = getBalance(gid, uid).balance;
+    const allDone = data.workerTier >= WORKER_TIERS.length;
+    const nextInfo = allDone
+      ? '✅ Maksimum işçi sayısına ulaştın! (13/13)'
+      : (() => {
+          const nt = WORKER_TIERS[data.workerTier];
+          return `📌 Sonraki işçi: **${nt.price}** coin (Lv.${nt.minLevel} gerekli)`;
+        })();
+
+    return interaction.reply({
+      ephemeral: true,
+      content: `✅ Yeni işçi alındı! Toplam işçi: **${data.miners}**\n💰 Kalan: **${newBal}** coin\n${nextInfo}`,
+    });
+  }
+
+  // ── ⚡ ENERJİ SATIN AL ────────────────────────────────────
+  if (id === 'mine_buy_energy') {
+    let data = getMiningData(gid, uid);
+    data = regenEnergy(data);
+    const maxEnergy = getMiningMaxEnergy(data);
+    const bal       = getBalance(gid, uid).balance;
+    const cost      = 10; // 5 enerji × 2 coin
+
+    if (data.energy >= maxEnergy) return interaction.reply({ ephemeral: true, content: `⚡ Enerji zaten dolu! (${data.energy}/${maxEnergy})` });
+    if (bal < cost)               return interaction.reply({ ephemeral: true, content: `❌ Yetersiz coin! 5 enerji = **10 coin**. Bakiye: **${bal}**` });
+
+    addBalance(gid, uid, -cost);
+    const added   = Math.min(5, maxEnergy - data.energy);
+    data.energy   = Math.min(maxEnergy, data.energy + 5);
+
+    // Enerji XP
+    data.energyXp += 5;
+    let energyLvlUp = false;
+    while (data.energyXp >= getEnergyXpNeeded(data.energyLevel)) {
+      data.energyXp -= getEnergyXpNeeded(data.energyLevel);
+      data.energyLevel++;
+      energyLvlUp = true;
+    }
+
+    saveMiningData(gid, uid, data);
+    const newMaxE = getMiningMaxEnergy(data);
+    let msg = `✅ **+${added}** enerji satın alındı! Mevcut: **${data.energy}/${newMaxE}**\n💰 Kalan: **${getBalance(gid, uid).balance}** coin`;
+    if (energyLvlUp) msg += `\n🎉 **Enerji Lv.${data.energyLevel}!** Maksimum enerji **${newMaxE}** oldu!`;
+    return interaction.reply({ ephemeral: true, content: msg });
+  }
+
+  // ── 🍽️ YEMEK SATIN AL ────────────────────────────────────
+  if (id === 'mine_buy_bread' || id === 'mine_buy_soup' || id === 'mine_buy_meat') {
+    const foodMap = { mine_buy_bread: 'bread', mine_buy_soup: 'soup', mine_buy_meat: 'meat' };
+    const food    = MINING_FOODS.find(f => f.key === foodMap[id]);
+    const bal     = getBalance(gid, uid).balance;
+
+    if (bal < food.price)
+      return interaction.reply({ ephemeral: true, content: `❌ Yetersiz coin! **${food.emoji} ${food.name}** için **${food.price} coin** gerekli. Bakiye: **${bal}**` });
+
+    let data = getMiningData(gid, uid);
+    addBalance(gid, uid, -food.price);
+    data.hungryUntil = Date.now() + food.durationMs;
+    saveMiningData(gid, uid, data);
+
+    return interaction.reply({
+      ephemeral: true,
+      content: `✅ **${food.emoji} ${food.name}** satın alındı! İşçiler **${food.desc}**.\n💰 Kalan: **${getBalance(gid, uid).balance}** coin`,
+    });
+  }
+
+  // ── 📖 NASIL OYNANIR? ────────────────────────────────────
+  if (id === 'mine_help') {
+    const embed = new EmbedBuilder()
+      .setTitle('📖 Madencilik — Nasıl Oynanır?')
+      .setColor(0x8B4513)
+      .addFields(
+        {
+          name: '⛏️ Madene Gönder',
+          value: [
+            'İşçilerini madene yollar, maden çıkarırsın.',
+            '• Her gezi **işçi başına 1 enerji** harcar',
+            '• Lv.1-9: gezi başına **2 maden** | Lv.10-19: **3** | Lv.20+: **5**',
+            '• Kaç işçin varsa o kadar maden çıkar (kapasite kadar)',
+            '• %40 ihtimalle işçiler acıkır → verim **yarıya düşer**',
+          ].join('\n'),
+        },
+        {
+          name: '⚡ Enerji',
+          value: [
+            '• Başlangıç: **20 enerji** | Her 2 dakikada **+1** otomatik yenilenir',
+            '• Enerji XP kazanarak Enerji Level atla → max enerji **+1** artar',
+            '• Marketten **10 coin = 5 enerji** satın alabilirsin',
+          ].join('\n'),
+        },
+        {
+          name: '👷 İşçi Sistemi',
+          value: [
+            '• **Başlangıç:** 2 işçi (bedava)',
+            '• **1. alım:** 50 coin (Lv.1 gerekli) → 3 işçi',
+            '• **2-6. alım:** 200 coin her biri (Lv.10 gerekli) → 8 işçi',
+            '• **7-11. alım:** 400 coin her biri (Lv.20 gerekli) → **max 13 işçi**',
+          ].join('\n'),
+        },
+        {
+          name: '🍽️ Açlık Sistemi',
+          value: [
+            'İşçiler acıkınca verim yarıya düşer. Marketten yemek al:',
+            '• 🍞 **Ekmek** — 5 coin (10 dakika tok)',
+            '• 🍲 **Çorba** — 10 coin (20 dakika tok)',
+            '• 🥩 **Et** — 30 coin (1 saat tok)',
+          ].join('\n'),
+        },
+        {
+          name: '⬛ Maden Değerleri',
+          value: [
+            '`Kömür/Bakır` → **1** 🪙 | `Demir/Gümüş/Çelik` → **2** 🪙',
+            '`Altın` → **3** 🪙 | `Linyit` → **5** 🪙',
+            '`Elmas` → **7** 🪙 | `Uranyum` → **10** 🪙',
+            '*(Değerli madenler çok nadir düşer)*',
+          ].join('\n'),
+        },
+        {
+          name: '🏅 Rütbeler',
+          value: [
+            '⛏️ Beginner (Lv.1) → 🥉 Bronze (Lv.5) → ⚙️ Iron (Lv.10)',
+            '🥇 Gold (Lv.15) → 👑 Master (Lv.20)',
+          ].join('\n'),
+        },
+        {
+          name: '⏱️ Cooldown',
+          value: 'Her buton için **10 saniye** bekleme süresi vardır.',
+        },
+      )
+      .setFooter({ text: '/madencilik siralama — Sunucu sıralamasını gör' });
+    return interaction.reply({ ephemeral: true, embeds: [embed] });
+  }
+
+  // ── 📊 PROFİL ────────────────────────────────────────────
+  if (id === 'mine_profile') {
+    let data = getMiningData(gid, uid);
+    data = regenEnergy(data);
+    saveMiningData(gid, uid, data);
+
+    const rank      = getMiningRank(data.miningLevel);
+    const maxEnergy = getMiningMaxEnergy(data);
+    const capacity  = getMiningCapacity(data.miningLevel);
+    const isHungry  = data.hungryUntil === -1 || (data.hungryUntil > 0 && Date.now() >= data.hungryUntil);
+    const hungryStr = data.hungryUntil <= 0 && data.hungryUntil !== -1
+      ? '✅ Tok (henüz yemek yenmedi)'
+      : isHungry
+        ? '😫 Aç — market\'ten yemek al!'
+        : `🍽️ Tok (${Math.ceil((data.hungryUntil - Date.now()) / 60000)} dk kaldı)`;
+
+    const tierIdx   = Math.min(data.workerTier, WORKER_TIERS.length - 1);
+    const tier      = WORKER_TIERS[tierIdx];
+
+    const embed = new EmbedBuilder()
+      .setTitle(`⛏️ ${interaction.user.username} — Madencilik Profili`)
+      .setColor(rank.color)
+      .setThumbnail(interaction.user.displayAvatarURL())
+      .addFields(
+        { name: '🏅 Rütbe',           value: `${rank.emoji} **${rank.name}** Lv.${data.miningLevel}`, inline: true },
+        { name: '📈 Madencilik XP',    value: `${data.miningXp} / ${getMiningXpNeeded(data.miningLevel)}`,    inline: true },
+        { name: '👷 İşçi Sayısı',     value: `**${data.miners}** işçi`,                              inline: true },
+        { name: '⚡ Enerji',           value: `**${data.energy}** / ${maxEnergy}`,                   inline: true },
+        { name: '⚡ Enerji Seviyesi',  value: `Lv.**${data.energyLevel}** (${data.energyXp}/${getEnergyXpNeeded(data.energyLevel)} XP)`, inline: true },
+        { name: '🏭 Gezi Kapasitesi', value: `Gezi başına **${capacity}** maden`,                   inline: true },
+        { name: '🍽️ İşçi Durumu',   value: hungryStr,                                              inline: true },
+        { name: '📦 Toplam Maden',    value: `**${data.totalOresMined}** adet`,                     inline: true },
+        { name: '💰 Sonraki İşçi',    value: `**${tier.price}** coin (Lv.${tier.minLevel})`,        inline: true },
+      )
+      .setFooter({ text: 'Rütbeler: Bronze(Lv5) • Iron(Lv10) • Gold(Lv15) • Master(Lv20)' });
+
+    return interaction.reply({ ephemeral: true, embeds: [embed] });
+  }
+}
+
+// ──────────────────────────────────────────────────────────────
 //  SLASH KOMUT TANIMLARI
 // ──────────────────────────────────────────────────────────────
 const SLASH_COMMANDS = [
@@ -1132,6 +1715,13 @@ const SLASH_COMMANDS = [
     .setName('backupsil')
     .setDescription('[OWNER] GitHub\'daki bir backup dosyasını sil')
     .addStringOption(o => o.setName('dosya').setDescription('Backup dosyasının tam yolu (backuplist\'ten kopyala)').setRequired(true)),
+
+  // /madencilik
+  new SlashCommandBuilder()
+    .setName('madencilik')
+    .setDescription('Madencilik oyunu komutları')
+    .addSubcommand(s => s.setName('panel').setDescription('[OWNER] Madencilik panelini kanala gönder'))
+    .addSubcommand(s => s.setName('siralama').setDescription('Madencilik sıralamasını gör')),
 
 ].map(c => c.toJSON());
 
@@ -1545,6 +2135,11 @@ client.on('interactionCreate', async interaction => {
       if (id.startsWith('bj_hit_') || id.startsWith('bj_stand_')) return;
     }
 
+    // ── MADENCİLİK BUTONLARI ─────────────────────────────────
+    if (interaction.isButton() && interaction.customId.startsWith('mine_')) {
+      return handleMineButton(interaction);
+    }
+
     if (!interaction.isChatInputCommand()) return;
     const gid = interaction.guild?.id;
     const uid = interaction.user.id;
@@ -1685,6 +2280,24 @@ client.on('interactionCreate', async interaction => {
               '`/backuplist` — Backup listesi (owner)',
               '`/veriyukle` — Backup geri yükle (owner)',
               '`/backupsil` — Backup sil (owner)',
+            ].join('\n'),
+          },
+          {
+            name: '⛏️ Madencilik',
+            value: [
+              '`/madencilik panel` — Madencilik panelini kanala gönder (owner)',
+              '`/madencilik siralama` — Madencilik sıralaması',
+              '',
+              '**Panel butonları** (Madencilik kanalı):',
+              '`⛏️ Madene Gönder` — İşçileri madene yolla (her maden gezisi enerji harcar)',
+              '`⚡ Enerji` — Enerji durumunu görüntüle (2 dk = +1 enerji)',
+              '`🎒 Envanter` — Çıkardığın madenleri gör',
+              '`💰 Sat` — Tüm madenleri coin\'e çevir',
+              '`🛒 Market` — İşçi/enerji/yemek satın al',
+              '`📊 Profil` — Madencilik profilini gör',
+              '',
+              '**Maden değerleri:** Kömür/Bakır=1🪙 • Demir/Gümüş/Çelik=2🪙 • Altın=3🪙 • Linyit=5🪙 • Elmas=7🪙 • Uranyum=10🪙',
+              '**Rütbeler:** ⛏️Beginner → 🥉Bronze(Lv5) → ⚙️Iron(Lv10) → 🥇Gold(Lv15) → 👑Master(Lv20)',
             ].join('\n'),
           }
         )
@@ -2940,7 +3553,37 @@ client.on('interactionCreate', async interaction => {
         db.prepare('DELETE FROM chat_coin_counter WHERE guildId=?').run(gid);
         db.prepare('DELETE FROM bank_accounts WHERE guildId=?').run(gid);
         db.prepare('DELETE FROM fish_cast_state WHERE guildId=?').run(gid);
+        db.prepare('DELETE FROM mining_data WHERE guildId=?').run(gid);
+        db.prepare('DELETE FROM mining_inventory WHERE guildId=?').run(gid);
         return interaction.reply('🧨 Bu sunucuya ait tüm veriler temizlendi.');
+      }
+    }
+
+    // ─────────────────────────────────────────────────────────
+    //  /madencilik
+    // ─────────────────────────────────────────────────────────
+    if (cmd === 'madencilik') {
+      if (sub === 'panel') {
+        if (!hasOwnerAccess(uid, interaction.member)) return interaction.reply({ ephemeral: true, content: '⛔ Sadece bot sahipleri kullanabilir.' });
+        const mineCh = await client.channels.fetch(MINING_CHANNEL_ID).catch(() => null);
+        if (!mineCh?.isTextBased()) return interaction.reply({ ephemeral: true, content: `⛔ Madencilik kanalı bulunamadı (<#${MINING_CHANNEL_ID}>).` });
+        await mineCh.send(buildMiningPanel());
+        return interaction.reply({ ephemeral: true, content: `✅ Madencilik paneli <#${MINING_CHANNEL_ID}> kanalına gönderildi!` });
+      }
+
+      if (sub === 'siralama') {
+        const rows = getMiningLeaderboard(gid);
+        if (!rows.length) return interaction.reply({ ephemeral: true, content: '⛏️ Henüz kimse madencilik yapmamış!' });
+        const lines = rows.map((r, i) => {
+          const rank = getMiningRank(r.miningLevel);
+          return `**${i + 1}.** <@${r.userId}> — ${rank.emoji} **${rank.name}** Lv.${r.miningLevel} (${r.totalOresMined} maden)`;
+        });
+        const embed = new EmbedBuilder()
+          .setTitle('⛏️ Madencilik Sıralaması')
+          .setColor(0x8B4513)
+          .setDescription(lines.join('\n'))
+          .setFooter({ text: 'Rütbeler: Bronze(Lv5) • Iron(Lv10) • Gold(Lv15) • Master(Lv20)' });
+        return interaction.reply({ ephemeral: true, embeds: [embed] });
       }
     }
 
