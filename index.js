@@ -115,9 +115,21 @@ function ensureSchema() {
       guildId TEXT, userId TEXT,
       sinceLine INTEGER DEFAULT 0, lineThreshold INTEGER DEFAULT 0,
       sinceRod  INTEGER DEFAULT 0, rodThreshold  INTEGER DEFAULT 0,
+      sinceEmpty INTEGER DEFAULT 0, emptyThreshold INTEGER DEFAULT 0,
       PRIMARY KEY(guildId,userId)
     );
   `);
+
+  // Boş olta çekme artık sabit bir ihtimalle değil, mısına kopması/olta
+  // kırılmasıyla aynı mantıkta bir sayaç+eşik ile çalışıyor (2-10 atışta bir).
+  // Eski veritabanlarında bu kolonlar yoksa ekliyoruz.
+  const fishCastCols = db.prepare("PRAGMA table_info(fish_cast_state)").all().map(c => c.name);
+  if (!fishCastCols.includes('sinceEmpty')) {
+    db.exec('ALTER TABLE fish_cast_state ADD COLUMN sinceEmpty INTEGER DEFAULT 0');
+  }
+  if (!fishCastCols.includes('emptyThreshold')) {
+    db.exec('ALTER TABLE fish_cast_state ADD COLUMN emptyThreshold INTEGER DEFAULT 0');
+  }
 
   // Geçici XP Boost artık süreye değil kullanım hakkına dayanıyor.
   // Eski (expiresAt tabanlı) veritabanlarını sorunsuz taşımak için usesLeft kolonunu ekliyoruz.
@@ -555,7 +567,7 @@ const BANK_EXEMPT_COMMANDS = new Set(['setup', 'yardim', 'banka', 'verikaydet', 
 
 // İsim Rengi Rolleri (admin /setup üzerinden ekler, kullanıcı /renk al ile satın alır)
 function getColorRoles(gid)              { return db.prepare('SELECT * FROM color_roles WHERE guildId=?').all(gid); }
-function addColorRole(gid, rid, price = 50) { db.prepare('INSERT OR REPLACE INTO color_roles(guildId,roleId,price)VALUES(?,?,?)').run(gid, rid, price); }
+function addColorRole(gid, rid, price = 400) { db.prepare('INSERT OR REPLACE INTO color_roles(guildId,roleId,price)VALUES(?,?,?)').run(gid, rid, price); }
 function removeColorRole(gid, rid)       { db.prepare('DELETE FROM color_roles WHERE guildId=? AND roleId=?').run(gid, rid); }
 
 // Sohbet — her 2 mesajda 1 coin (pasif, otomatik, günlük görev sistemi yerine)
@@ -649,40 +661,96 @@ const TYPING_SENTENCES = [
   'Kendin ol, çünkü herkes zaten alınmış.',
 ];
 
+// NOT: Bu dosyada daha önce yer alan gif linkleri (uydurma tenor ID'leri)
+// gerçekte hiç var olmayan/404 dönen linklerdi; hepsi gerçek, çalıştığı
+// doğrulanmış tenor linkleriyle değiştirildi.
 const DICE_GIFS   = [
-  'https://media.tenor.com/9UeW5Qm4rREAAAAM/dice-roll.gif',
-  'https://media.tenor.com/vyPpM1mR9WgAAAAM/rolling-dice.gif',
-  'https://media.tenor.com/1Qm6kQxRMgAAAAAM/dices.gif',
+  'https://media1.tenor.com/m/oOStgR8Xfd8AAAAC/dice-dice-roll.gif',
+  'https://media1.tenor.com/m/wmXw4IwUrB8AAAAC/dice-roll-the-dice.gif',
 ];
 const COOKED_GIFS = [
-  'https://media.tenor.com/L7bG8GkZZxQAAAAM/gordon-ramsay-cooked.gif',
-  'https://media.tenor.com/8y0K0b2v8b0AAAAM/burn-fire.gif',
-  'https://media.tenor.com/3j2sQwEw1yAAAAAM/you-are-cooked.gif',
+  'https://media1.tenor.com/m/4Je-dlgy1-MAAAAC/getting-cooked-you-got-cooked-bro.gif',
 ];
 const PROPOSAL_HAPPY_GIFS = [
-  'https://media.tenor.com/3zRz0Vt2sHIAAAAM/ring-propose.gif',
-  'https://media.tenor.com/WYQv8r2m5LgAAAAM/marriage-proposal-propose.gif',
-  'https://media.tenor.com/3qY9hQw9gAkAAAAM/marry-me-proposal.gif',
+  'https://media.tenor.com/-YBoNtfhc0UAAAAM/kai-and-afine-kiss.gif',
 ];
 const PROPOSAL_SAD_GIFS = [
-  'https://media.tenor.com/jjH1h1Q8fQoAAAAM/sad-anime.gif',
-  'https://media.tenor.com/-cBz3s7f7GMAAAAM/sad-cry.gif',
-  'https://media.tenor.com/7BqZyq7n0xAAAAAM/rejected.gif',
+  'https://media.tenor.com/_qDh7tYIsSoAAAAM/son-im-crine.gif',
 ];
 
-// Balık türleri — value: 1-50 coin, weight: ne kadar nadir (düşük = nadir)
-const FISH_TYPES = [
-  { key: 'sardalya', name: 'Sardalya',            emoji: '🐟', value: 1,  weight: 30   },
-  { key: 'hamsi',    name: 'Hamsi',                emoji: '🐠', value: 2,  weight: 26   },
-  { key: 'levrek',   name: 'Levrek',                emoji: '🐡', value: 5,  weight: 18   },
-  { key: 'cupra',    name: 'Çipura',               emoji: '🐟', value: 8,  weight: 13   },
-  { key: 'somon',    name: 'Somon',                 emoji: '🍣', value: 14, weight: 8    },
-  { key: 'ton',      name: 'Ton Balığı',            emoji: '🐋', value: 22, weight: 4.5  },
-  { key: 'yilanbal', name: 'Yılan Balığı',          emoji: '🐍', value: 30, weight: 2.5  },
-  { key: 'kilic',    name: 'Kılıç Balığı',          emoji: '⚔️', value: 38, weight: 1.2  },
-  { key: 'orkinos',  name: 'Dev Orkinos',           emoji: '🐳', value: 45, weight: 0.6  },
-  { key: 'ejder',    name: 'Efsanevi Ejder Balığı', emoji: '🐉', value: 50, weight: 0.2  },
+// /çal GIFleri
+const STEAL_START_GIF  = 'https://media.tenor.com/jL1f0JCmZEkAAAAM/ill-be-taking-that-spongebob.gif';
+const STEAL_SUCCESS_GIF = 'https://media.tenor.com/HzQkgpZ0neQAAAAM/madman-kazuma.gif';
+const STEAL_FAIL_GIF    = 'https://media4.giphy.com/media/v1.Y2lkPTc5MGI3NjExbXMzdW0wbHFzc29iZ2J2ZzM2YTJjbnNxM3l4OGN6emZ2aGlrbjhwMiZlcD12MV9pbnRlcm5hbF9naWZfYnlfaWQmY3Q9Zw/59d1zo8SUSaUU/giphy.gif';
+
+// Balık türleri — 4 nadirlik katmanına ayrılmış, her katmanın TOPLAM çıkma
+// oranı (weight toplamı) sabit bir yüzdeye denk gelir, katman içindeki
+// balıklara eşit bölünür:
+//   30-40 coin (3 balık)  -> toplam %2   çıkma oranı (en nadir)
+//   10-25 coin (4 balık)  -> toplam %6   çıkma oranı (~%5-7)
+//    5-10 coin (10 balık) -> toplam %30  çıkma oranı
+//    1-2  coin (15 balık) -> toplam %62  çıkma oranı (en yüksek, en yaygın)
+// weight'lerin toplamı tam 100 olduğu için weight = yüzde olarak okunabilir.
+const FISH_TIERS = [
+  {
+    totalWeight: 62, // en yaygın, en düşük değerli katman
+    fish: [
+      { key: 'sardalya',  name: 'Sardalya',        emoji: '🐟', value: 1 },
+      { key: 'hamsi',     name: 'Hamsi',            emoji: '🐠', value: 1 },
+      { key: 'istavrit',  name: 'İstavrit',         emoji: '🐡', value: 1 },
+      { key: 'caca',      name: 'Çaça',             emoji: '🐟', value: 1 },
+      { key: 'gumus',     name: 'Gümüş Balığı',     emoji: '🐠', value: 1 },
+      { key: 'kayabaligi',name: 'Kaya Balığı',      emoji: '🐡', value: 1 },
+      { key: 'tekir',     name: 'Tekir',            emoji: '🐟', value: 1 },
+      { key: 'igneli',    name: 'İğneli Balık',     emoji: '🐠', value: 1 },
+      { key: 'kefal',     name: 'Kefal',            emoji: '🐡', value: 2 },
+      { key: 'mezgit',    name: 'Mezgit',           emoji: '🐟', value: 2 },
+      { key: 'barbunya',  name: 'Barbunya',         emoji: '🐠', value: 2 },
+      { key: 'kolyoz',    name: 'Kolyoz',           emoji: '🐡', value: 2 },
+      { key: 'uskumru',   name: 'Uskumru',          emoji: '🐟', value: 2 },
+      { key: 'sarpa',     name: 'Sarpa',            emoji: '🐠', value: 2 },
+      { key: 'zargana',   name: 'Zargana',          emoji: '🐡', value: 2 },
+    ],
+  },
+  {
+    totalWeight: 30,
+    fish: [
+      { key: 'levrek',   name: 'Levrek',          emoji: '🐟', value: 5  },
+      { key: 'cupra',    name: 'Çipura',          emoji: '🐠', value: 5  },
+      { key: 'karagoz',  name: 'Karagöz',         emoji: '🐡', value: 6  },
+      { key: 'sinarit',  name: 'Sinarit',         emoji: '🐟', value: 6  },
+      { key: 'mercan',   name: 'Mercan',          emoji: '🐠', value: 7  },
+      { key: 'sargoz',   name: 'Sargoz',          emoji: '🐡', value: 7  },
+      { key: 'lahoz',    name: 'Lahoz',           emoji: '🐟', value: 8  },
+      { key: 'palamut',  name: 'Palamut',         emoji: '🐠', value: 8  },
+      { key: 'lufer',    name: 'Lüfer',           emoji: '🐡', value: 9  },
+      { key: 'somon',    name: 'Somon',           emoji: '🍣', value: 10 },
+    ],
+  },
+  {
+    totalWeight: 6, // ~%5-7 aralığı, orta nokta %6
+    fish: [
+      { key: 'orfoz',    name: 'Orfoz',           emoji: '🐋', value: 12 },
+      { key: 'yilanbal', name: 'Yılan Balığı',    emoji: '🐍', value: 16 },
+      { key: 'kilic',    name: 'Kılıç Balığı',    emoji: '⚔️', value: 20 },
+      { key: 'ton',      name: 'Ton Balığı',      emoji: '🐬', value: 25 },
+    ],
+  },
+  {
+    totalWeight: 2, // en nadir katman
+    fish: [
+      { key: 'orkinos',  name: 'Dev Orkinos',           emoji: '🐳', value: 32 },
+      { key: 'kopekbal', name: 'Köpekbalığı',           emoji: '🦈', value: 36 },
+      { key: 'ejder',    name: 'Efsanevi Ejder Balığı', emoji: '🐉', value: 40 },
+    ],
+  },
 ];
+
+// FISH_TIERS'i düz bir listeye açar; her balığa, kendi katmanının toplam
+// ağırlığını katmandaki balık sayısına eşit bölerek weight atar.
+const FISH_TYPES = FISH_TIERS.flatMap(tier =>
+  tier.fish.map(f => ({ ...f, weight: tier.totalWeight / tier.fish.length }))
+);
 
 function pickFish(boosted) {
   let pool = FISH_TYPES.map(f => ({ ...f }));
@@ -748,10 +816,11 @@ function startFishMarketRefresh() {
 }
 
 // ── Balık Tutma Riskleri: boş atma / mısına kopma / olta kırılması ──
-// sinceLine/sinceRod sayaçları her /balik tut denemesinde artar. Sayaç
-// rastgele belirlenmiş eşiğe ulaşınca olay tetiklenir ve sayaç sıfırlanıp
-// yeni bir rastgele eşik seçilir.
-const EMPTY_CAST_CHANCE  = 0.18; // ~%18 ihtimalle olta boş döner
+// sinceLine/sinceRod/sinceEmpty sayaçları her /balik tut denemesinde artar.
+// Sayaç rastgele belirlenmiş eşiğe ulaşınca olay tetiklenir ve sayaç
+// sıfırlanıp yeni bir rastgele eşik seçilir. Boş olta çekme artık (mısına
+// kopma/olta kırılmasıyla aynı mantıkla) 2-10 atışta bir garanti şekilde
+// tetiklenen bir sayaç, sabit bir ihtimal DEĞİL.
 const LINE_SNAP_COST     = 2;    // mısına kopunca kesilen coin
 const ROD_BREAK_COST     = 5;    // olta kırılınca kesilen coin
 function randBetween(min, max) { return min + Math.floor(Math.random() * (max - min + 1)); }
@@ -759,15 +828,24 @@ function randBetween(min, max) { return min + Math.floor(Math.random() * (max - 
 function getFishCastState(gid, uid) {
   let r = db.prepare('SELECT * FROM fish_cast_state WHERE guildId=? AND userId=?').get(gid, uid);
   if (!r) {
-    r = { guildId: gid, userId: uid, sinceLine: 0, lineThreshold: randBetween(4, 8), sinceRod: 0, rodThreshold: randBetween(20, 30) };
-    db.prepare('INSERT INTO fish_cast_state(guildId,userId,sinceLine,lineThreshold,sinceRod,rodThreshold)VALUES(?,?,?,?,?,?)')
-      .run(gid, uid, r.sinceLine, r.lineThreshold, r.sinceRod, r.rodThreshold);
+    r = {
+      guildId: gid, userId: uid,
+      sinceLine: 0, lineThreshold: randBetween(4, 8),
+      sinceRod: 0, rodThreshold: randBetween(20, 30),
+      sinceEmpty: 0, emptyThreshold: randBetween(2, 10),
+    };
+    db.prepare('INSERT INTO fish_cast_state(guildId,userId,sinceLine,lineThreshold,sinceRod,rodThreshold,sinceEmpty,emptyThreshold)VALUES(?,?,?,?,?,?,?,?)')
+      .run(gid, uid, r.sinceLine, r.lineThreshold, r.sinceRod, r.rodThreshold, r.sinceEmpty, r.emptyThreshold);
   }
+  // Eski (migrate edilmiş) satırlarda emptyThreshold varsayılan olarak 0
+  // gelir — bu durumda ilk atışta hemen "boş" tetiklenmesini önlemek için
+  // taze bir rastgele eşik ata.
+  if (!r.emptyThreshold) r.emptyThreshold = randBetween(2, 10);
   return r;
 }
 function saveFishCastState(gid, uid, state) {
-  db.prepare('UPDATE fish_cast_state SET sinceLine=?, lineThreshold=?, sinceRod=?, rodThreshold=? WHERE guildId=? AND userId=?')
-    .run(state.sinceLine, state.lineThreshold, state.sinceRod, state.rodThreshold, gid, uid);
+  db.prepare('UPDATE fish_cast_state SET sinceLine=?, lineThreshold=?, sinceRod=?, rodThreshold=?, sinceEmpty=?, emptyThreshold=? WHERE guildId=? AND userId=?')
+    .run(state.sinceLine, state.lineThreshold, state.sinceRod, state.rodThreshold, state.sinceEmpty, state.emptyThreshold, gid, uid);
 }
 
 /**
@@ -778,6 +856,7 @@ function resolveFishCast(gid, uid, boosted) {
   const state = getFishCastState(gid, uid);
   state.sinceLine++;
   state.sinceRod++;
+  state.sinceEmpty++;
 
   // Olta kırılması önce kontrol edilir (daha nadir ama daha ciddi bir olay)
   if (state.sinceRod >= state.rodThreshold) {
@@ -796,11 +875,15 @@ function resolveFishCast(gid, uid, boosted) {
     return { type: 'line_snap' };
   }
 
-  saveFishCastState(gid, uid, state);
-
-  if (Math.random() < EMPTY_CAST_CHANCE) {
+  // Boş olta: 2-10 atışta bir garanti tetiklenir (sabit ihtimal değil)
+  if (state.sinceEmpty >= state.emptyThreshold) {
+    state.sinceEmpty = 0;
+    state.emptyThreshold = randBetween(2, 10);
+    saveFishCastState(gid, uid, state);
     return { type: 'empty' };
   }
+
+  saveFishCastState(gid, uid, state);
 
   return { type: 'catch', fish: pickFish(boosted) };
 }
@@ -915,17 +998,26 @@ const SLASH_COMMANDS = [
     .addSubcommand(s => s.setName('iptal').setDescription('Aktif yazı oyununu iptal et (yetkili)'))
     .addSubcommand(s => s.setName('bonus').setDescription('Günlük yazı bonusu al (+15 coin)')),
 
-  // /evlilik
+  // /evlilik (evlen ve eşim artık ayrı, kısa üst düzey komutlar: /evlen, /eşim)
   new SlashCommandBuilder()
     .setName('evlilik')
     .setDescription('Evlilik komutları')
     .addSubcommand(s => s.setName('yuzuk-al').setDescription('Evlilik yüzüğü satın al (150 coin)'))
     .addSubcommand(s => s.setName('yuzugum').setDescription('Yüzük durumunu gör'))
-    .addSubcommand(s => s.setName('evlen').setDescription('Evlilik teklifi et').addUserOption(o => o.setName('hedef').setDescription('Teklif etmek istediğin kişi').setRequired(true)))
-    .addSubcommand(s => s.setName('esim').setDescription('Eşini gör'))
     .addSubcommand(s => s.setName('bosan').setDescription('Eşinden boşan (50 coin ücret + 80 coin nafaka)'))
     .addSubcommand(s => s.setName('liste').setDescription('Tüm evlilik listesi'))
     .addSubcommand(s => s.setName('ciftyazitura').setDescription('Evlilere özel çift yazı tura (günlük 10 kez)').addStringOption(o => o.setName('secim').setDescription('yazı veya tura').setRequired(true).addChoices({ name: 'yazı', value: 'yazı' }, { name: 'tura', value: 'tura' }))),
+
+  // /evlen — kısa komut (eskiden /evlilik evlen)
+  new SlashCommandBuilder()
+    .setName('evlen')
+    .setDescription('Evlilik teklifi et')
+    .addUserOption(o => o.setName('hedef').setDescription('Teklif etmek istediğin kişi').setRequired(true)),
+
+  // /esim — kısa komut (eskiden /evlilik esim)
+  new SlashCommandBuilder()
+    .setName('esim')
+    .setDescription('Eşini gör'),
 
   // /market
   new SlashCommandBuilder()
@@ -950,12 +1042,17 @@ const SLASH_COMMANDS = [
     .addSubcommand(s => s.setName('cikar').setDescription('Marketten rol çıkar').addRoleOption(o => o.setName('rol').setDescription('Rol').setRequired(true)))
     .addSubcommand(s => s.setName('liste').setDescription('Market rol listesi')),
 
-  // /oyunlar
+  // /oyunlar (çal artık ayrı, kısa üst düzey komut: /çal)
   new SlashCommandBuilder()
     .setName('oyunlar')
     .setDescription('Eğlence / oyun komutları')
-    .addSubcommand(s => s.setName('sanskutusu').setDescription('Şans kutusu aç (8 coin, günlük 5 hak)'))
-    .addSubcommand(s => s.setName('cal').setDescription('Birinin coinini çalmaya çalış').addUserOption(o => o.setName('hedef').setDescription('Hedef kullanıcı').setRequired(true))),
+    .addSubcommand(s => s.setName('sanskutusu').setDescription('Şans kutusu aç (8 coin, günlük 5 hak)')),
+
+  // /çal — kısa komut (eskiden /oyunlar cal)
+  new SlashCommandBuilder()
+    .setName('çal')
+    .setDescription('Birinin coinini çalmaya çalış')
+    .addUserOption(o => o.setName('hedef').setDescription('Hedef kullanıcı').setRequired(true)),
 
   // /xpboost (kalıcı)
   new SlashCommandBuilder()
@@ -966,7 +1063,7 @@ const SLASH_COMMANDS = [
   new SlashCommandBuilder()
     .setName('renk')
     .setDescription('İsim rengi rolü komutları')
-    .addSubcommand(s => s.setName('al').setDescription('Renk rolü satın al (50 coin, sadece 1 tane sahip olabilirsin)'))
+    .addSubcommand(s => s.setName('al').setDescription('Renk rolü satın al (400 coin, sadece 1 tane sahip olabilirsin)'))
     .addSubcommand(s => s.setName('liste').setDescription('Mevcut renk rollerini gör')),
 
   // /balik — balıkçılık
@@ -984,13 +1081,11 @@ const SLASH_COMMANDS = [
     .setDescription('Balık marketi')
     .addSubcommand(s => s.setName('liste').setDescription('Balık fiyat listesi'))
     .addSubcommand(s => s.setName('sat').setDescription('Balığını markete sat')
-      .addStringOption(o => o.setName('balik').setDescription('Balık türü').setRequired(true)
-        .addChoices(...FISH_TYPES.map(f => ({ name: `${f.emoji} ${f.name} (${f.value} coin)`, value: f.key }))))
+      .addStringOption(o => o.setName('balik').setDescription('Balık türü (yazmaya başla, öneriler çıkar)').setRequired(true).setAutocomplete(true))
       .addIntegerOption(o => o.setName('adet').setDescription('Adet').setRequired(true).setMinValue(1)))
     .addSubcommand(s => s.setName('oyuncuya-sat').setDescription('Balığını başka bir üyeye sat')
       .addUserOption(o => o.setName('hedef').setDescription('Alıcı').setRequired(true))
-      .addStringOption(o => o.setName('balik').setDescription('Balık türü').setRequired(true)
-        .addChoices(...FISH_TYPES.map(f => ({ name: `${f.emoji} ${f.name} (${f.value} coin)`, value: f.key }))))
+      .addStringOption(o => o.setName('balik').setDescription('Balık türü (yazmaya başla, öneriler çıkar)').setRequired(true).setAutocomplete(true))
       .addIntegerOption(o => o.setName('adet').setDescription('Adet').setRequired(true).setMinValue(1))
       .addIntegerOption(o => o.setName('fiyat').setDescription('Toplam fiyat (coin)').setRequired(true).setMinValue(1))),
 
@@ -1352,6 +1447,22 @@ client.on('messageCreate', async message => {
 client.on('interactionCreate', async interaction => {
   try {
 
+    // ── /balik-market SAT & OYUNCUYA-SAT — "balik" alanı için öneri listesi ──
+    // FISH_TYPES artık 32 tür içerdiğinden Discord'un 25 sabit seçenek (choices)
+    // limitini aşıyor; bu yüzden statik addChoices yerine autocomplete kullanılıyor.
+    if (interaction.isAutocomplete() && interaction.commandName === 'balik-market') {
+      const focused = interaction.options.getFocused(true);
+      if (focused.name === 'balik') {
+        const q = (focused.value || '').toLocaleLowerCase('tr');
+        const matches = FISH_TYPES
+          .filter(f => f.name.toLocaleLowerCase('tr').includes(q) || f.key.includes(q))
+          .slice(0, 25)
+          .map(f => ({ name: `${f.emoji} ${f.name} (${getFishValue(f.key)} coin)`, value: f.key }));
+        return interaction.respond(matches);
+      }
+      return interaction.respond([]);
+    }
+
     // ── SETUP PANELİ ─────────────────────────────────────────
     if (interaction.isChatInputCommand() && interaction.commandName === 'setup') {
       return sendSetupPanel(interaction);
@@ -1504,7 +1615,7 @@ client.on('interactionCreate', async interaction => {
               '`/yazioyunu baslat` — Yazı oyunu (günlük 4 ödül)',
               '`/yazioyunu bonus` — Günlük +15 coin',
               '`/oyunlar sanskutusu` — Şans kutusu (8 coin)',
-              '`/oyunlar cal` — Coinini çal',
+              '`/çal @hedef` — Coinini çal',
               '`/yirmibir bahis:` — Blackjack (botla, 2x / ~%0.1 ihtimalle 5x)',
               '`/atyarisi at: bahis:` — At yarışı (paylaşımlı, 2x / ~%0.1 ihtimalle 5x)',
             ].join('\n'),
@@ -1524,8 +1635,8 @@ client.on('interactionCreate', async interaction => {
             name: '💍 Evlilik',
             value: [
               '`/evlilik yuzuk-al` — Yüzük al (150 coin)',
-              '`/evlilik evlen` — Evlilik teklifi et',
-              '`/evlilik esim` — Eşini gör',
+              '`/evlen @kişi` — Evlilik teklifi et',
+              '`/esim` — Eşini gör',
               '`/evlilik bosan` — Boşan (130 coin)',
               '`/evlilik liste` — Tüm evlilikler',
               '`/evlilik ciftyazitura` — Evlilere özel oyun',
@@ -1540,7 +1651,7 @@ client.on('interactionCreate', async interaction => {
               '`/market esyalar` — Özel eşyalar (Kalkan, Geçici Boost)',
               '`/market esya-al` — Özel eşya satın al',
               '`/xpboost` — Kalıcı 1.5x boost (400 coin)',
-              '`/renk al` — İsim rengi rolü satın al (50 coin)',
+              '`/renk al` — İsim rengi rolü satın al (400 coin)',
               '`/renk liste` — Renk rollerini listele',
             ].join('\n'),
           },
@@ -2088,6 +2199,76 @@ client.on('interactionCreate', async interaction => {
     }
 
     // ─────────────────────────────────────────────────────────
+    //  /evlen — kısa komut (eskiden /evlilik evlen)
+    // ─────────────────────────────────────────────────────────
+    if (cmd === 'evlen') {
+      const target = interaction.options.getUser('hedef');
+      if (target.bot) return interaction.reply({ ephemeral: true, content: 'Botlarla evlenemezsin babuş 😅' });
+      if (target.id === uid) return interaction.reply({ ephemeral: true, content: 'Kendinle evlenemezsin… ama kendini sevmen güzel 😌' });
+      const now2 = Date.now();
+      const cdKey = `${gid}:${uid}`;
+      if ((now2 - (proposalCooldown.get(cdKey) || 0)) < 5 * 60 * 1000) {
+        return interaction.reply({ ephemeral: true, content: '⏳ Biraz bekle. 5 dakikada bir teklif edebilirsin.' });
+      }
+      if (!hasRing(gid, uid)) return interaction.reply({ ephemeral: true, content: '💍 Önce yüzük al: `/evlilik yuzuk-al` (**150 coin**)' });
+      if (getMarriage(gid, uid)) return interaction.reply({ ephemeral: true, content: 'Zaten evlisin babuş.' });
+      if (getMarriage(gid, target.id)) return interaction.reply({ ephemeral: true, content: 'Hedef kişi zaten evli görünüyor.' });
+      const accId = `macc_${uid}_${target.id}_${Date.now()}`;
+      const rejId = `mrej_${uid}_${target.id}_${Date.now()}`;
+      const row = new ActionRowBuilder().addComponents(
+        new ButtonBuilder().setCustomId(accId).setLabel('Kabul Et').setStyle(ButtonStyle.Success).setEmoji('💍'),
+        new ButtonBuilder().setCustomId(rejId).setLabel('Reddet').setStyle(ButtonStyle.Danger).setEmoji('❌'),
+      );
+      await interaction.reply({
+        content: `${target}, **${interaction.user.username}** sana **evlilik teklifi** ediyor! 💞`,
+        files: [pick(PROPOSAL_HAPPY_GIFS)],
+        components: [row],
+      });
+      const m2 = await interaction.fetchReply();
+      let resolved = false;
+      const coll = m2.createMessageComponentCollector({
+        time: 30000,
+        componentType: ComponentType.Button,
+        filter: i => (i.customId === accId || i.customId === rejId) && i.user.id === target.id,
+      });
+      coll.on('collect', async i => {
+        resolved = true;
+        proposalCooldown.set(cdKey, Date.now());
+        if (i.customId === rejId) {
+          await i.update({ content: `💔 ${target.username} teklifi **reddetti**.`, files: [pick(PROPOSAL_SAD_GIFS)], components: [] });
+          sendLog(gid, 'marriage', new EmbedBuilder().setTitle('💔 Evlilik Teklifi Reddedildi').setColor(0xED4245)
+            .addFields({ name: 'Teklif Eden', value: `<@${uid}>`, inline: true }, { name: 'Reddeden', value: `<@${target.id}>`, inline: true }).setTimestamp());
+        } else {
+          if (!hasRing(gid, uid) || getMarriage(gid, uid) || getMarriage(gid, target.id)) {
+            return i.update({ content: '⛔ Teklif geçersiz (durum değişti).', components: [] });
+          }
+          setMarriage(gid, uid, target.id);
+          consumeRing(gid, uid);
+          await i.update({ content: `💍 **${interaction.user.username}** ve **${target.username}** artık **EVLİ!** 🎉`, files: [pick(PROPOSAL_HAPPY_GIFS)], components: [] });
+          sendLog(gid, 'marriage', new EmbedBuilder().setTitle('💍 Yeni Evlilik!').setColor(0xFF73FA)
+            .addFields({ name: 'Eş 1', value: `<@${uid}>`, inline: true }, { name: 'Eş 2', value: `<@${target.id}>`, inline: true }, { name: 'Tarih', value: nowTR(), inline: true }).setTimestamp());
+        }
+      });
+      coll.on('end', async () => {
+        if (!resolved) {
+          proposalCooldown.set(cdKey, Date.now());
+          await m2.edit({ content: '⏰ Süre doldu, teklif geçersiz oldu.', components: [] }).catch(() => {});
+        }
+      });
+      return;
+    }
+
+    // ─────────────────────────────────────────────────────────
+    //  /esim — kısa komut (eskiden /evlilik esim)
+    // ─────────────────────────────────────────────────────────
+    if (cmd === 'esim') {
+      const m = getMarriage(gid, uid);
+      if (!m) return interaction.reply('Bekârsın babuş. Belki bugün değişir? `/evlen @kişi`');
+      const spouse = m.user1 === uid ? m.user2 : m.user1;
+      return interaction.reply(`💞 Eşin: <@${spouse}>\n📅 Evlilik tarihi: **${m.marriedAt}**`);
+    }
+
+    // ─────────────────────────────────────────────────────────
     //  /market
     // ─────────────────────────────────────────────────────────
     if (cmd === 'market') {
@@ -2116,7 +2297,7 @@ client.on('interactionCreate', async interaction => {
                 '💎 **XPBoost** (Kalıcı 1.5x) — 400 coin • `/xpboost`',
                 '🛡️ **Hırsızlık Kalkanı** (4 saat) — 45 coin • `/market esya-al esya:kalkan`',
                 '⚡ **Geçici XP Boost** (50 kullanım, 2x) — 80 coin • `/market esya-al esya:gecici_boost`',
-                '🎨 **İsim Rengi Rolü** — 50 coin • `/renk al`',
+                '🎨 **İsim Rengi Rolü** — 400 coin • `/renk al`',
                 '🎣 **Balıkçılık Şansı Boost** (100 kullanım) — 200 coin • `/balik boost-al`',
               ].join('\n'),
             }
@@ -2333,6 +2514,70 @@ client.on('interactionCreate', async interaction => {
         });
         return;
       }
+    }
+
+    // ─────────────────────────────────────────────────────────
+    //  /çal — kısa komut (eskiden /oyunlar cal)
+    // ─────────────────────────────────────────────────────────
+    if (cmd === 'çal') {
+      if (!isWithinIstanbulWindow()) {
+        return interaction.reply({ ephemeral: true, content: 'Bu saatlerde bu komutu kullanamazsın knk; uyuyan var, işe giden var, okula giden var. Haksızlık değil mi?' });
+      }
+      const calCh = getSetting(gid, 'cal_channel');
+      if (calCh && interaction.channelId !== calCh) {
+        return interaction.reply({ ephemeral: true, content: `⛔ Bu komutu sadece <#${calCh}> kanalında kullanabilirsin.` });
+      }
+      const victim = interaction.options.getUser('hedef');
+      if (victim.bot) return interaction.reply({ ephemeral: true, content: 'Botlardan çalamazsın 😅' });
+      if (victim.id === uid) return interaction.reply({ ephemeral: true, content: 'Kendinden çalamazsın 🙂' });
+      if (hasShield(gid, victim.id)) return interaction.reply({ ephemeral: true, content: `🛡️ ${victim.username} şu anda **Hırsızlık Kalkanı** ile korunuyor, çalamazsın.` });
+      const key = `${uid}:${victim.id}`;
+      if (activeSteals.has(key)) return interaction.reply({ ephemeral: true, content: 'Bu kullanıcıyla zaten aktif bir çalma denemen var, bekle.' });
+      if (getBalance(gid, victim.id).balance < 5) return interaction.reply({ ephemeral: true, content: 'Hedefin coin\'i yetersiz.' });
+      activeSteals.add(key);
+      const cancelId = `cancel_steal_${Date.now()}_${uid}`;
+      const row = new ActionRowBuilder().addComponents(
+        new ButtonBuilder().setCustomId(cancelId).setLabel('İptal Et (30s)').setStyle(ButtonStyle.Danger).setEmoji('⛔')
+      );
+      await interaction.reply({
+        content: `${victim}, **${interaction.user.username}** senden **5 coin** çalmaya çalışıyor! 30 saniye içinde butona basmazsan para gider 😈`,
+        files: [STEAL_START_GIF],
+        components: [row],
+      });
+      const m2 = await interaction.fetchReply();
+      let prevented = false;
+      const coll = m2.createMessageComponentCollector({
+        componentType: ComponentType.Button,
+        time: 30000,
+        filter: i => i.customId === cancelId && i.user.id === victim.id,
+      });
+      coll.on('collect', async i => {
+        prevented = true;
+        activeSteals.delete(key);
+        await i.update({ content: `🛡️ ${victim.username} çalmayı **iptal etti**! ${interaction.user.username} eli boş döndü.`, files: [STEAL_FAIL_GIF], components: [] });
+      });
+      coll.on('end', async () => {
+        if (prevented) return;
+        activeSteals.delete(key);
+        if (getBalance(gid, victim.id).balance < 5) return m2.edit({ content: '⚠️ Hedef zaten fakirleşmiş.', components: [] });
+        transfer(gid, victim.id, uid, 5);
+        await m2.edit({ content: `💰 **${interaction.user.username}**, **${victim.username}**'den **5 coin** çaldı!`, files: [STEAL_SUCCESS_GIF], components: [] });
+        stealUseCounter++;
+        if (stealUseCounter >= 50) {
+          stealUseCounter = 0;
+          if (calCh) {
+            const ch = await client.channels.fetch(calCh).catch(() => null);
+            if (ch?.isTextBased?.()) {
+              const fetched = await ch.messages.fetch({ limit: 100 }).catch(() => null);
+              if (fetched) {
+                const botMsgs = fetched.filter(m => m.author.id === client.user.id);
+                if (botMsgs.size) await ch.bulkDelete(botMsgs, true).catch(() => {});
+              }
+            }
+          }
+        }
+      });
+      return;
     }
 
     // ─────────────────────────────────────────────────────────
