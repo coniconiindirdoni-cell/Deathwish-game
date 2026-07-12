@@ -630,10 +630,10 @@ const LEVEL_ROLE_REWARDS = {
   5:  '1524109066929045626',
   10: '1524109231719190678',
   20: '1524110815907811609',
-  25: '1524112620976869446',
-  30: '1524885044055773345',
-  40: '1524885000112177203',
-  50: '1524112044796805152',
+  30: '1524112620976869446',
+  45: '1524885044055773345',
+  55: '1524885000112177203',
+  70: '1524886153873068092',
 };
 
 // ── Tarih / Saat yardımcıları ─────────────────────────────────
@@ -1522,11 +1522,16 @@ const SLASH_COMMANDS = [
     .setName('yardim')
     .setDescription('DeathWish Game komut rehberi'),
 
+  // /bakiye
+  new SlashCommandBuilder()
+    .setName('bakiye')
+    .setDescription('Coin bakiyeni gör')
+    .addUserOption(o => o.setName('kullanici').setDescription('Kullanıcı (boş=kendin)')),
+
   // /ekonomi
   new SlashCommandBuilder()
     .setName('ekonomi')
     .setDescription('Ekonomi komutları')
-    .addSubcommand(s => s.setName('bakiye').setDescription('Coin bakiyeni gör').addUserOption(o => o.setName('kullanici').setDescription('Kullanıcı (boş=kendin)')))
     .addSubcommand(s => s.setName('gunluk').setDescription('Günlük ödülü al'))
     .addSubcommand(s => s.setName('yatir').setDescription('Bankaya coin yatır').addIntegerOption(o => o.setName('miktar').setDescription('Miktar').setRequired(true).setMinValue(1)))
     .addSubcommand(s => s.setName('cek').setDescription('Bankadan coin çek').addIntegerOption(o => o.setName('miktar').setDescription('Miktar').setRequired(true).setMinValue(1)))
@@ -1626,6 +1631,13 @@ const SLASH_COMMANDS = [
     .addSubcommand(s => s.setName('ekle').setDescription('Markete rol ekle').addRoleOption(o => o.setName('rol').setDescription('Rol').setRequired(true)).addIntegerOption(o => o.setName('fiyat').setDescription('Coin fiyatı').setRequired(true).setMinValue(1)).addBooleanOption(o => o.setName('premium').setDescription('Premium?')))
     .addSubcommand(s => s.setName('cikar').setDescription('Marketten rol çıkar').addRoleOption(o => o.setName('rol').setDescription('Rol').setRequired(true)))
     .addSubcommand(s => s.setName('liste').setDescription('Market rol listesi')),
+
+  // /renkrolekle (owner-only, normal rol ekle gibi — rol seç/ID yapıştır)
+  new SlashCommandBuilder()
+    .setName('renkrolekle')
+    .setDescription('[OWNER] Renk rolleri listesine rol ekle')
+    .addRoleOption(o => o.setName('rol').setDescription('Rol').setRequired(true))
+    .addIntegerOption(o => o.setName('fiyat').setDescription('Coin fiyatı (boş=50)').setMinValue(1)),
 
   // /oyunlar (çal artık ayrı, kısa üst düzey komut: /çal)
   new SlashCommandBuilder()
@@ -2160,6 +2172,9 @@ client.on('interactionCreate', async interaction => {
 
     if (cmd === 'banka') {
       if (sub === 'olustur') {
+        if (interaction.channelId !== GAME_CHANNEL_ID) {
+          return interaction.reply({ ephemeral: true, content: `⛔ Bu komutu yalnızca <#${GAME_CHANNEL_ID}> kanalında kullanabilirsin.` });
+        }
         if (hasBankAccount(gid, uid)) {
           return interaction.reply({ ephemeral: true, content: '🏦 Zaten bir banka hesabın var.' });
         }
@@ -2187,7 +2202,7 @@ client.on('interactionCreate', async interaction => {
           {
             name: '💰 Ekonomi',
             value: [
-              '`/ekonomi bakiye` — Coin bakiyesi',
+              '`/bakiye` — Coin bakiyesi',
               '`/ekonomi gunluk` — Günlük ödül',
               '`/ekonomi yatir/cek` — Banka işlemleri',
               '`/ekonomi gonder` — Coin gönder',
@@ -2268,7 +2283,8 @@ client.on('interactionCreate', async interaction => {
           {
             name: '⚙️ Yönetim',
             value: [
-              '`/setup` — Bot ayarları (admin, renk rolleri de dahil)',
+              '`/setup` — Bot ayarları (admin)',
+              '`/renkrolekle` — Renk rolü ekle (owner)',
               '`/market-yonet ekle/cikar/liste` — Market yönetimi',
               '`/ses sifirla` — Ses verisi sıfırla (owner)',
               '`/sohbet sifirla` — Sohbet verisi sıfırla (owner)',
@@ -2305,24 +2321,27 @@ client.on('interactionCreate', async interaction => {
     }
 
     // ─────────────────────────────────────────────────────────
+    //  /bakiye
+    // ─────────────────────────────────────────────────────────
+    if (cmd === 'bakiye') {
+      const target = interaction.options.getUser('kullanici') || interaction.user;
+      const bal = getBalance(gid, target.id);
+      const embed = new EmbedBuilder()
+        .setTitle(`💰 ${target.username} — Bakiye`)
+        .setColor(0xF1C40F)
+        .setThumbnail(target.displayAvatarURL())
+        .addFields(
+          { name: '🪙 Cüzdan', value: `**${bal.balance}** coin`, inline: true },
+          { name: '🏦 Banka', value: `**${bal.bank}** coin`, inline: true },
+          { name: '💎 Toplam', value: `**${bal.balance + bal.bank}** coin`, inline: true },
+        );
+      return interaction.reply({ embeds: [embed] });
+    }
+
+    // ─────────────────────────────────────────────────────────
     //  /ekonomi
     // ─────────────────────────────────────────────────────────
     if (cmd === 'ekonomi') {
-      if (sub === 'bakiye') {
-        const target = interaction.options.getUser('kullanici') || interaction.user;
-        const bal = getBalance(gid, target.id);
-        const embed = new EmbedBuilder()
-          .setTitle(`💰 ${target.username} — Bakiye`)
-          .setColor(0xF1C40F)
-          .setThumbnail(target.displayAvatarURL())
-          .addFields(
-            { name: '🪙 Cüzdan', value: `**${bal.balance}** coin`, inline: true },
-            { name: '🏦 Banka', value: `**${bal.bank}** coin`, inline: true },
-            { name: '💎 Toplam', value: `**${bal.balance + bal.bank}** coin`, inline: true },
-          );
-        return interaction.reply({ embeds: [embed] });
-      }
-
       if (sub === 'gunluk') {
         const day = todayTR();
         const base = parseInt(getSetting(gid, 'daily_reward') || '640');
@@ -3023,6 +3042,23 @@ client.on('interactionCreate', async interaction => {
         }
         return interaction.reply({ ephemeral: true, content: '⛔ Geçersiz eşya.' });
       }
+    }
+
+    // ─────────────────────────────────────────────────────────
+    //  /renkrolekle (owner-only)
+    // ─────────────────────────────────────────────────────────
+    if (cmd === 'renkrolekle') {
+      if (!hasOwnerAccess(uid, interaction.member)) return interaction.reply({ ephemeral: true, content: '⛔ Sadece bot sahipleri kullanabilir.' });
+      const role  = interaction.options.getRole('rol');
+      const price = interaction.options.getInteger('fiyat') || 50;
+      addColorRole(gid, role.id, price);
+      sendLog(gid, 'setup', new EmbedBuilder().setTitle('🎨 Renk Rolü Eklendi').setColor(0xEB459E)
+        .addFields(
+          { name: 'Yetkili', value: `<@${uid}>`, inline: true },
+          { name: 'Rol', value: `<@&${role.id}>`, inline: true },
+          { name: 'Fiyat', value: `${price} coin`, inline: true },
+        ).setTimestamp());
+      return interaction.reply(`✅ <@&${role.id}> renk rolü listesine eklendi. Fiyat: **${price} coin**`);
     }
 
     // ─────────────────────────────────────────────────────────
@@ -3861,7 +3897,6 @@ async function sendSetupPanel(interaction) {
       { label: '💬 Sohbet Kanalı',        value: 'sohbet_channel',       description: 'Mesaj sayacı ve pasif coin kanalı' },
       { label: '⌨️ Yazı Oyunu Kanalı',   value: 'yazi_oyunu_channel',   description: '/yazioyunu baslat için özel kanal' },
       { label: '💰 Çal Komutu Kanalı',   value: 'cal_channel',           description: '/oyunlar cal komutunun kanalı' },
-      { label: '🎨 Renk Rolü Ekle', value: '__color_add__', description: 'İsim rengi rolleri listesine ekle (50 coin)' },
       { label: '🎨 Renk Rolü Çıkar', value: '__color_remove__', description: 'Listeden renk rolü çıkar' },
       { label: '🎨 Renk Rollerini Listele', value: '__color_list__', description: 'Mevcut renk rollerini gör' },
       { label: '📋 Log Kanallarını Ayarla', value: '__log_submenu__',    description: 'XP, Coin, Backup, Error vb. log kanalları' },
@@ -3902,10 +3937,6 @@ async function handleSetupInteraction(interaction, key) {
       return interaction.update({ content: '📋 **Log Kanalları** — Ayarlamak istediğin log türünü seç:', components: [new ActionRowBuilder().addComponents(logMenu)], embeds: [] });
     }
 
-    if (val === '__color_add__') {
-      const menu2 = new RoleSelectMenuBuilder().setCustomId('setup_addColorRoles').setPlaceholder('Eklenecek renk rollerini seç (çoklu)...').setMinValues(1).setMaxValues(10);
-      return interaction.update({ content: '🎨 Renk rolleri listesine eklemek istediğin rolleri seç (her biri 50 coin olacak):', components: [new ActionRowBuilder().addComponents(menu2)], embeds: [] });
-    }
     if (val === '__color_remove__') {
       const menu2 = new RoleSelectMenuBuilder().setCustomId('setup_removeColorRoles').setPlaceholder('Çıkarılacak rolleri seç...').setMinValues(1).setMaxValues(10);
       return interaction.update({ content: '🎨 Renk rolleri listesinden çıkarmak istediğin rolleri seç:', components: [new ActionRowBuilder().addComponents(menu2)], embeds: [] });
@@ -3931,13 +3962,6 @@ async function handleSetupInteraction(interaction, key) {
     return interaction.update({ content: `**${val}** için kanal seç:`, components: [new ActionRowBuilder().addComponents(menu2)], embeds: [] });
   }
 
-  if (key === 'addColorRoles') {
-    const roleIds = interaction.values;
-    for (const rid of roleIds) addColorRole(interaction.guild.id, rid, 50);
-    sendLog(interaction.guild.id, 'setup', new EmbedBuilder().setTitle('🎨 Renk Rolleri Eklendi').setColor(0xEB459E)
-      .addFields({ name: 'Yetkili', value: `<@${interaction.user.id}>`, inline: true }, { name: 'Roller', value: roleIds.map(r => `<@&${r}>`).join(', '), inline: false }).setTimestamp());
-    return interaction.update({ content: `✅ ${roleIds.length} rol renk rolü listesine eklendi (her biri 50 coin).`, components: [], embeds: [] });
-  }
   if (key === 'removeColorRoles') {
     const roleIds = interaction.values;
     for (const rid of roleIds) removeColorRole(interaction.guild.id, rid);
