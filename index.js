@@ -58,7 +58,7 @@ if (GITHUB_TOKEN && GITHUB_OWNER && GITHUB_REPO && (BACKUP_BRANCH === 'main' || 
 const octokit = GITHUB_TOKEN ? new Octokit({ auth: GITHUB_TOKEN }) : null;
 
 // Bu role sahip olan herkes owner-only komutları da kullanabilir.
-const OWNER_ROLE_ID = '1524107651510702160';
+const OWNER_ROLE_ID = '1525831115972284587';
 function hasOwnerAccess(userId, member) {
   if (OWNERS.includes(userId)) return true;
   if (member && member.roles && member.roles.cache && member.roles.cache.has(OWNER_ROLE_ID)) return true;
