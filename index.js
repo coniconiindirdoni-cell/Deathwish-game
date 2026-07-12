@@ -540,7 +540,7 @@ function addMarketRole(gid, rid, price, prem) { db.prepare('INSERT OR REPLACE IN
 function removeMarketRole(gid, rid)    { db.prepare('DELETE FROM market_roles WHERE guildId=? AND roleId=?').run(gid, rid); }
 
 function getLevel(gid, uid)            { return db.prepare('SELECT xp,level FROM level_data WHERE guildId=? AND userId=?').get(gid, uid) || { xp: 0, level: 0 }; }
-function addXp(gid, uid, amt)          { db.prepare('INSERT OR IGNORE INTO level_data(guildId,userId,xp,level)VALUES(?,?,0,0)').run(gid, uid); db.prepare('UPDATE level_data SET xp=xp+? WHERE guildId=? AND userId=?').run(amt, gid, uid); const d = getLevel(gid, uid); const needed = Math.round((d.level + 1) * 100 * 0.85); if (d.xp >= needed) { db.prepare('UPDATE level_data SET level=level+1,xp=xp-? WHERE guildId=? AND userId=?').run(needed, gid, uid); return { leveled: true, newLevel: d.level + 1, xpGained: amt }; } return { leveled: false, xpGained: amt }; }
+function addXp(gid, uid, amt)          { db.prepare('INSERT OR IGNORE INTO level_data(guildId,userId,xp,level)VALUES(?,?,0,0)').run(gid, uid); db.prepare('UPDATE level_data SET xp=xp+? WHERE guildId=? AND userId=?').run(amt, gid, uid); const d = getLevel(gid, uid); const needed = Math.round((d.level + 1) * 100 * 0.595); if (d.xp >= needed) { db.prepare('UPDATE level_data SET level=level+1,xp=xp-? WHERE guildId=? AND userId=?').run(needed, gid, uid); return { leveled: true, newLevel: d.level + 1, xpGained: amt }; } return { leveled: false, xpGained: amt }; }
 function topLevels(gid, n = 10)        { return db.prepare('SELECT userId,level,xp FROM level_data WHERE guildId=? ORDER BY level DESC,xp DESC LIMIT ?').all(gid, n); }
 
 // ── Yeni özellik yardımcıları ───────────────────────────────────
@@ -931,6 +931,7 @@ const proposalCooldown  = new Map();
 const voiceJoinTimes    = new Map();
 const voiceDailySec     = new Map();
 const voiceDailyClaimed = new Map();
+const voiceSystemPaused = new Set(); // guild id'leri — ses takibi kapalı olanlar
 let stealUseCounter     = 0;
 
 // Yeni özellikler için in-memory durumlar
@@ -1555,7 +1556,10 @@ const SLASH_COMMANDS = [
     .addSubcommand(s => s.setName('benim').setDescription('Kendi ses süren'))
     .addSubcommand(s => s.setName('siralama').setDescription('Ses süresi sıralaması'))
     .addSubcommand(s => s.setName('gorev').setDescription('Günlük ses görevi durumu'))
-    .addSubcommand(s => s.setName('sifirla').setDescription('[OWNER] Ses verilerini sıfırla')),
+    .addSubcommand(s => s.setName('sifirla').setDescription('[OWNER] Ses verilerini sıfırla'))
+    .addSubcommand(s => s.setName('kapat').setDescription('[OWNER] Ses takip sistemini durdur'))
+    .addSubcommand(s => s.setName('ac').setDescription('[OWNER] Ses takip sistemini başlat / mevcut kanalları tara'))
+    .addSubcommand(s => s.setName('yeniden-baslat').setDescription('[OWNER] Ses sistemini yeniden başlat (offline → online, mevcut üyeleri senkronize eder)')),
 
   // /sohbet — günlük mesaj görevi kaldırıldı, artık pasif "her 2 mesaj = 1 coin" sistemi var
   new SlashCommandBuilder()
@@ -1761,6 +1765,24 @@ client.once('ready', async () => {
     await rest.put(Routes.applicationCommands(client.user.id), { body: SLASH_COMMANDS });
     console.log(`✅ ${SLASH_COMMANDS.length} slash komutu kaydedildi.`);
   } catch (e) { console.error('⛔ Slash kayıt hatası:', e); }
+
+  // Bot yeniden başladığında o an seste olan herkesi voiceJoinTimes'a kaydet.
+  // Böylece bot restart sonrası devam eden oturumların süresi kaybolmaz.
+  try {
+    let toplam = 0;
+    for (const guild of client.guilds.cache.values()) {
+      for (const channel of guild.channels.cache.values()) {
+        if (channel.type !== 2) continue; // 2 = GuildVoice
+        for (const [memberId, member] of channel.members) {
+          if (member.user.bot) continue;
+          const key = `${guild.id}:${memberId}`;
+          voiceJoinTimes.set(key, Date.now());
+          toplam++;
+        }
+      }
+    }
+    if (toplam > 0) console.log(`🎙️ Başlangıç ses taraması: ${toplam} aktif üye senkronize edildi.`);
+  } catch (e) { console.error('⛔ Ses tarama hatası:', e); }
 });
 
 // Her 14 dakikada presence yenile
@@ -1783,6 +1805,7 @@ client.on('voiceStateUpdate', async (oldState, newState) => {
     const gid = guild?.id;
     const uid = newState.id || oldState.id;
     if (!gid || !uid) return;
+    if (voiceSystemPaused.has(gid)) return;
     const key = `${gid}:${uid}`;
     const was = oldState.channelId, now = newState.channelId;
     const day = todayTR();
@@ -1871,6 +1894,7 @@ setInterval(async () => {
   try {
     for (const [key, startedAt] of voiceJoinTimes.entries()) {
       const [gid, uid] = key.split(':');
+      if (voiceSystemPaused.has(gid)) continue;
       const guild = client.guilds.cache.get(gid);
       if (!guild) continue;
       const day = todayTR();
@@ -2579,6 +2603,104 @@ client.on('interactionCreate', async interaction => {
           if (k.startsWith(`${gid}:`)) voiceJoinTimes.delete(k);
         }
         return interaction.reply('🎙️ Ses verileri sıfırlandı!');
+      }
+
+      if (sub === 'kapat') {
+        if (!hasOwnerAccess(uid, interaction.member)) return interaction.reply({ ephemeral: true, content: '⛔ Sadece bot sahipleri kullanabilir.' });
+        // Bellekteki aktif süreleri DB'ye kaydet, sonra map'i temizle
+        const day = todayTR();
+        for (const [key, startedAt] of voiceJoinTimes.entries()) {
+          if (!key.startsWith(`${gid}:`)) continue;
+          const [, memberId] = key.split(':');
+          const diffSec = Math.max(0, Math.floor((Date.now() - startedAt) / 1000));
+          if (diffSec > 0) {
+            addVoiceTime(gid, memberId, diffSec);
+            const prev = voiceDailySec.get(`${key}:${day}`) || 0;
+            voiceDailySec.set(`${key}:${day}`, prev + diffSec);
+          }
+          voiceJoinTimes.delete(key);
+        }
+        voiceSystemPaused.add(gid);
+        sendLog(gid, 'voice', new EmbedBuilder()
+          .setTitle('🔴 Ses Sistemi — Kapatıldı')
+          .setColor(0xED4245)
+          .addFields({ name: 'Yetkili', value: `<@${uid}>` })
+          .setTimestamp()
+        );
+        return interaction.reply({ ephemeral: true, content: '🔴 Ses takip sistemi **kapatıldı**. Aktif süreler DB\'ye kaydedildi. Açmak için `/ses ac` kullan.' });
+      }
+
+      if (sub === 'ac') {
+        if (!hasOwnerAccess(uid, interaction.member)) return interaction.reply({ ephemeral: true, content: '⛔ Sadece bot sahipleri kullanabilir.' });
+        voiceSystemPaused.delete(gid);
+        // Mevcut ses kanallarındaki tüm üyeleri tara ve voiceJoinTimes'a ekle
+        const guild = interaction.guild;
+        let tarananUye = 0;
+        for (const channel of guild.channels.cache.values()) {
+          if (channel.type !== 2) continue; // 2 = GuildVoice
+          for (const [memberId, member] of channel.members) {
+            if (member.user.bot) continue;
+            const key = `${gid}:${memberId}`;
+            if (!voiceJoinTimes.has(key)) {
+              voiceJoinTimes.set(key, Date.now());
+              tarananUye++;
+            }
+          }
+        }
+        sendLog(gid, 'voice', new EmbedBuilder()
+          .setTitle('🟢 Ses Sistemi — Açıldı')
+          .setColor(0x57F287)
+          .addFields(
+            { name: 'Yetkili', value: `<@${uid}>`, inline: true },
+            { name: 'Senkronize Üye', value: `${tarananUye}`, inline: true },
+          )
+          .setTimestamp()
+        );
+        return interaction.reply({ ephemeral: true, content: `🟢 Ses takip sistemi **açıldı**. Şu an seste olan **${tarananUye}** üye senkronize edildi.` });
+      }
+
+      if (sub === 'yeniden-baslat') {
+        if (!hasOwnerAccess(uid, interaction.member)) return interaction.reply({ ephemeral: true, content: '⛔ Sadece bot sahipleri kullanabilir.' });
+        await interaction.deferReply({ ephemeral: true });
+        const day = todayTR();
+        // 1. Mevcut bellekteki süreleri DB'ye kaydet
+        for (const [key, startedAt] of voiceJoinTimes.entries()) {
+          if (!key.startsWith(`${gid}:`)) continue;
+          const [, memberId] = key.split(':');
+          const diffSec = Math.max(0, Math.floor((Date.now() - startedAt) / 1000));
+          if (diffSec > 0) {
+            addVoiceTime(gid, memberId, diffSec);
+            const prev = voiceDailySec.get(`${key}:${day}`) || 0;
+            voiceDailySec.set(`${key}:${day}`, prev + diffSec);
+          }
+          voiceJoinTimes.delete(key);
+        }
+        // 2. Sistemi kısa süre durdur, sonra yeniden aç
+        voiceSystemPaused.add(gid);
+        await new Promise(r => setTimeout(r, 500));
+        voiceSystemPaused.delete(gid);
+        // 3. Mevcut ses kanallarını tara
+        const guild = interaction.guild;
+        let tarananUye = 0;
+        for (const channel of guild.channels.cache.values()) {
+          if (channel.type !== 2) continue;
+          for (const [memberId, member] of channel.members) {
+            if (member.user.bot) continue;
+            const key = `${gid}:${memberId}`;
+            voiceJoinTimes.set(key, Date.now());
+            tarananUye++;
+          }
+        }
+        sendLog(gid, 'voice', new EmbedBuilder()
+          .setTitle('🔄 Ses Sistemi — Yeniden Başlatıldı')
+          .setColor(0xFEE75C)
+          .addFields(
+            { name: 'Yetkili', value: `<@${uid}>`, inline: true },
+            { name: 'Senkronize Üye', value: `${tarananUye}`, inline: true },
+          )
+          .setTimestamp()
+        );
+        return interaction.editReply(`🔄 Ses sistemi yeniden başlatıldı! Şu an seste olan **${tarananUye}** üye senkronize edildi. Sıralama ve süreler artık güncel.`);
       }
     }
 
