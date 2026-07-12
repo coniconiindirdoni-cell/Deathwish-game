@@ -553,7 +553,7 @@ function hasShield(gid, uid) {
 }
 function setShield(gid, uid, ms) { db.prepare('INSERT OR REPLACE INTO theft_shields(guildId,userId,expiresAt)VALUES(?,?,?)').run(gid, uid, Date.now() + ms); }
 
-// Geçici XP Boost — süreye değil kullanım hakkına dayanır (80 coin, 50 kullanım, 2x)
+// Geçici XP Boost — süreye değil kullanım hakkına dayanır (400 coin, 50 kullanım, 2x)
 function getTempBoostUses(gid, uid) { const r = db.prepare('SELECT usesLeft FROM temp_xp_boosts WHERE guildId=? AND userId=?').get(gid, uid); return r ? (r.usesLeft || 0) : 0; }
 function hasTempBoost(gid, uid) { return getTempBoostUses(gid, uid) > 0; }
 function addTempBoostUses(gid, uid, n) {
@@ -566,12 +566,12 @@ function consumeTempBoost(gid, uid) {
   return true;
 }
 
-// Kalıcı (1.5x) + geçici (2x) boostları birleştiren çarpan.
+// Kalıcı (2x) + geçici (2x) boostları birleştiren çarpan.
 // consume=true olduğunda (gerçek bir ödül verilirken) geçici boost hakkı 1 azalır.
 // Sadece durum göstermek için (ör. /voice durum) consume=false kullan.
 function getBoostMultiplier(gid, uid, consume = true) {
   let m = 1;
-  if (hasBoost(gid, uid)) m *= 1.5;
+  if (hasBoost(gid, uid)) m *= 2;
   if (hasTempBoost(gid, uid)) {
     m *= 2;
     if (consume) consumeTempBoost(gid, uid);
@@ -612,7 +612,7 @@ function getFishCount(gid, uid, key) { const r = db.prepare('SELECT count FROM f
 function removeFish(gid, uid, key, n) { const cur = getFishCount(gid, uid, key); if (cur < n) return false; db.prepare('UPDATE fish_inventory SET count=count-? WHERE guildId=? AND userId=? AND fishKey=?').run(n, gid, uid, key); return true; }
 function getInventory(gid, uid) { return db.prepare('SELECT fishKey,count FROM fish_inventory WHERE guildId=? AND userId=? AND count>0').all(gid, uid); }
 
-// Balıkçılık Şansı Boost — 200 coin, süre sınırı yok, 100 kullanım hakkı
+// Balıkçılık Şansı Boost — 2000 coin, süre sınırı yok, 100 kullanım hakkı
 function getFishBoostUses(gid, uid) { const r = db.prepare('SELECT usesLeft FROM fish_boosts WHERE guildId=? AND userId=?').get(gid, uid); return r ? r.usesLeft : 0; }
 function addFishBoostUses(gid, uid, n) {
   db.prepare('INSERT OR IGNORE INTO fish_boosts(guildId,userId,usesLeft)VALUES(?,?,0)').run(gid, uid);
@@ -1623,8 +1623,8 @@ const SLASH_COMMANDS = [
     .addSubcommand(s => s.setName('esyalar').setDescription('Özel eşyaları gör (Hırsızlık Kalkanı, Geçici XP Boost)'))
     .addSubcommand(s => s.setName('esya-al').setDescription('Özel eşya satın al').addStringOption(o => o.setName('esya').setDescription('Eşya').setRequired(true)
       .addChoices(
-        { name: '🛡️ Hırsızlık Kalkanı (45 coin, 4 saat)', value: 'kalkan' },
-        { name: '⚡ Geçici XP Boost (80 coin, 50 kullanım, 2x)', value: 'gecici_boost' },
+        { name: '🛡️ Hırsızlık Kalkanı (450 coin, 4 saat)', value: 'kalkan' },
+        { name: '⚡ Geçici XP Boost (400 coin, 50 kullanım, 2x)', value: 'gecici_boost' },
       ))),
 
   // /market-yonet (admin)
@@ -1658,13 +1658,13 @@ const SLASH_COMMANDS = [
   // /xpboost (kalıcı)
   new SlashCommandBuilder()
     .setName('xpboost')
-    .setDescription('Kalıcı 1.5x XPBoost satın al (400 coin)'),
+    .setDescription('Kalıcı 2x XPBoost satın al (4000 coin)'),
 
   // /renk — isim rengi rolleri
   new SlashCommandBuilder()
     .setName('renk')
     .setDescription('İsim rengi rolü komutları')
-    .addSubcommand(s => s.setName('al').setDescription('Renk rolü satın al (400 coin, sadece 1 tane sahip olabilirsin)'))
+    .addSubcommand(s => s.setName('al').setDescription('Renk rolü satın al (4000 coin, sadece 1 tane sahip olabilirsin)'))
     .addSubcommand(s => s.setName('liste').setDescription('Mevcut renk rollerini gör')),
 
   // /balik — balıkçılık
@@ -1673,7 +1673,7 @@ const SLASH_COMMANDS = [
     .setDescription('Balıkçılık komutları')
     .addSubcommand(s => s.setName('tut').setDescription('Balık tutmayı dene'))
     .addSubcommand(s => s.setName('envanter').setDescription('Balık envanterini gör'))
-    .addSubcommand(s => s.setName('boost-al').setDescription('Balıkçılık Şansı Boost satın al (200 coin, 100 kullanım)'))
+    .addSubcommand(s => s.setName('boost-al').setDescription('Balıkçılık Şansı Boost satın al (2000 coin, 100 kullanım)'))
     .addSubcommand(s => s.setName('durum').setDescription('Boost durumunu gör')),
 
   // /balik-market
@@ -2274,7 +2274,7 @@ client.on('interactionCreate', async interaction => {
             value: [
               '`/balik tut` — Balık tutmayı dene',
               '`/balik envanter` — Envanterini gör',
-              '`/balik boost-al` — Şans Boost (200 coin, 100 kullanım)',
+              '`/balik boost-al` — Şans Boost (2000 coin, 100 kullanım)',
               '`/balik-market liste` — Balık fiyat listesi',
               '`/balik-market sat` — Markete sat',
               '`/balik-market oyuncuya-sat` — Başka üyeye sat',
@@ -2299,8 +2299,8 @@ client.on('interactionCreate', async interaction => {
               '`/market iade <rolid>` — Rol iade et',
               '`/market esyalar` — Özel eşyalar (Kalkan, Geçici Boost)',
               '`/market esya-al` — Özel eşya satın al',
-              '`/xpboost` — Kalıcı 1.5x boost (400 coin)',
-              '`/renk al` — İsim rengi rolü satın al (400 coin)',
+              '`/xpboost` — Kalıcı 2x boost (4000 coin)',
+              '`/renk al` — İsim rengi rolü satın al (4000 coin)',
               '`/renk liste` — Renk rollerini listele',
             ].join('\n'),
           },
@@ -3048,24 +3048,15 @@ client.on('interactionCreate', async interaction => {
         const embed = new EmbedBuilder()
           .setTitle('🛒 Market')
           .setColor(0xE67E22)
-          .setDescription('Aynı anda en fazla **1** market rolü alabilirsin.\nSatın al: `/market al <rolid>` • İade: `/market iade <rolid>`')
           .addFields(
-            {
-              name: '🔒 Normal Roller',
-              value: normal.length ? normal.map(r => `<@&${r.roleId}> — \`${r.roleId}\` — **${r.price} coin** (iade: **${Math.floor(r.price / 2)}**)`).join('\n') : '_(boş)_',
-            },
-            {
-              name: '👑 Premium Roller',
-              value: premium.length ? premium.map(r => `<@&${r.roleId}> — \`${r.roleId}\` — **${r.price} coin** (iade: **${Math.floor(r.price / 2)}**)`).join('\n') : '_(boş)_',
-            },
             {
               name: '🎁 Eşyalar',
               value: [
                 '🎲 **Şans Kutusu** — 80 coin • `/oyunlar sanskutusu`',
                 '💍 **Evlilik Yüzüğü** — 1500 coin • `/evlilik yuzuk-al`',
-                '💎 **XPBoost** (Kalıcı 1.5x) — 4000 coin • `/xpboost`',
+                '💎 **XPBoost** (Kalıcı 2x) — 4000 coin • `/xpboost`',
                 '🛡️ **Hırsızlık Kalkanı** (4 saat) — 450 coin • `/market esya-al esya:kalkan`',
-                '⚡ **Geçici XP Boost** (50 kullanım, 2x) — 800 coin • `/market esya-al esya:gecici_boost`',
+                '⚡ **Geçici XP Boost** (50 kullanım, 2x) — 400 coin • `/market esya-al esya:gecici_boost`',
                 '🎨 **İsim Rengi Rolü** — 4000 coin • `/renk al`',
                 '🎣 **Balıkçılık Şansı Boost** (100 kullanım) — 2000 coin • `/balik boost-al`',
               ].join('\n'),
@@ -3135,7 +3126,7 @@ client.on('interactionCreate', async interaction => {
           .setColor(0xE67E22)
           .addFields(
             { name: '🛡️ Hırsızlık Kalkanı', value: '**450 coin** — 4 saat boyunca `/oyunlar cal` komutundan korur.\nSatın al: `/market esya-al esya:kalkan`' },
-            { name: '⚡ Geçici XP Boost', value: '**800 coin** — sonraki **50** coin/xp ödülünde **2 katı** kazanç sağlar.\nSatın al: `/market esya-al esya:gecici_boost`' },
+            { name: '⚡ Geçici XP Boost', value: '**400 coin** — sonraki 50 kullanımda **2 katı** kazanç sağlar.\nSatın al: `/market esya-al esya:gecici_boost`' },
           );
         return interaction.reply({ embeds: [embed] });
       }
@@ -3154,13 +3145,13 @@ client.on('interactionCreate', async interaction => {
         }
         if (esya === 'gecici_boost') {
           const bal = getBalance(gid, uid);
-          const price = 800;
+          const price = 400;
           if (bal.balance < price) return interaction.reply({ ephemeral: true, content: `⛔ Yetersiz coin! Gerekli: **${price}**, Bakiye: **${bal.balance}**` });
           addBalance(gid, uid, -price);
           addTempBoostUses(gid, uid, 50);
           sendLog(gid, 'market', new EmbedBuilder().setTitle('⚡ Geçici XP Boost Satın Alındı').setColor(0xE67E22)
             .addFields({ name: 'Kullanıcı', value: `<@${uid}>`, inline: true }).setTimestamp());
-          return interaction.reply(`⚡ **Geçici XP Boost (2x)** satın alındı! Sonraki **50** coin/xp ödülün 2 katı olacak. Kalan kullanım: **${getTempBoostUses(gid, uid)}**`);
+          return interaction.reply(`⚡ **Geçici XP Boost (2x)** satın alındı! Kalan kullanım: **${getTempBoostUses(gid, uid)}**`);
         }
         return interaction.reply({ ephemeral: true, content: '⛔ Geçersiz eşya.' });
       }
@@ -3370,12 +3361,12 @@ client.on('interactionCreate', async interaction => {
     //  /xpboost (kalıcı)
     // ─────────────────────────────────────────────────────────
     if (cmd === 'xpboost') {
-      if (hasBoost(gid, uid)) return interaction.reply({ ephemeral: true, content: '⚡ Zaten kalıcı **XPBoost (1.5x)** sahibisin babuş!' });
+      if (hasBoost(gid, uid)) return interaction.reply({ ephemeral: true, content: '⚡ Zaten kalıcı **XPBoost (2x)** sahibisin babuş!' });
       const bal = getBalance(gid, uid);
       if (bal.balance < 4000) return interaction.reply({ ephemeral: true, content: `⛔ Yetersiz coin! Gerekli: **4000**, Bakiye: **${bal.balance}**` });
       addBalance(gid, uid, -4000);
       setBoost(gid, uid);
-      return interaction.reply('✅ **Kalıcı XPBoost (1.5x)** satın alındı! 🔥 Artık görev ödüllerin 1.5x!');
+      return interaction.reply('✅ **Kalıcı XPBoost (2x)** satın alındı! 🔥 Artık görev ödüllerin 2x!');
     }
 
     // ─────────────────────────────────────────────────────────
