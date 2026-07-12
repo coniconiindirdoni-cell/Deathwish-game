@@ -916,8 +916,8 @@ function resolveFishCast(gid, uid, boosted) {
 
 // Blackjack / At Yarışı ortak ödül hesaplayıcı — %2x kazanç, ~%0.1 ihtimalle 5x
 function resolveWinAmount(bet) {
-  if (Math.random() < 0.001) return bet * 5;
-  return bet * 2;
+  if (Math.random() < 0.001) return bet * 8;
+  return bet * 4;
 }
 
 // ──────────────────────────────────────────────────────────────
