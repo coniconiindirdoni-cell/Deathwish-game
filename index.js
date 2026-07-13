@@ -1680,15 +1680,12 @@ const SLASH_COMMANDS = [
   new SlashCommandBuilder()
     .setName('balik-market')
     .setDescription('Balık marketi')
-    .addSubcommand(s => s.setName('liste').setDescription('Balık fiyat listesi'))
-    .addSubcommand(s => s.setName('sat').setDescription('Balığını markete sat')
-      .addStringOption(o => o.setName('balik').setDescription('Balık türü (yazmaya başla, öneriler çıkar)').setRequired(true).setAutocomplete(true))
-      .addIntegerOption(o => o.setName('adet').setDescription('Adet').setRequired(true).setMinValue(1)))
-    .addSubcommand(s => s.setName('oyuncuya-sat').setDescription('Balığını başka bir üyeye sat')
-      .addUserOption(o => o.setName('hedef').setDescription('Alıcı').setRequired(true))
-      .addStringOption(o => o.setName('balik').setDescription('Balık türü (yazmaya başla, öneriler çıkar)').setRequired(true).setAutocomplete(true))
-      .addIntegerOption(o => o.setName('adet').setDescription('Adet').setRequired(true).setMinValue(1))
-      .addIntegerOption(o => o.setName('fiyat').setDescription('Toplam fiyat (coin)').setRequired(true).setMinValue(1))),
+    .addSubcommand(s => s.setName('liste').setDescription('Balık fiyat listesi')),
+
+  // /balik-sat
+  new SlashCommandBuilder()
+    .setName('balik-sat')
+    .setDescription('Envanterindeki tüm balıkları markete sat'),
 
   // /yirmibir — blackjack
   new SlashCommandBuilder()
@@ -2075,22 +2072,6 @@ client.on('messageCreate', async message => {
 client.on('interactionCreate', async interaction => {
   try {
 
-    // ── /balik-market SAT & OYUNCUYA-SAT — "balik" alanı için öneri listesi ──
-    // FISH_TYPES artık 32 tür içerdiğinden Discord'un 25 sabit seçenek (choices)
-    // limitini aşıyor; bu yüzden statik addChoices yerine autocomplete kullanılıyor.
-    if (interaction.isAutocomplete() && interaction.commandName === 'balik-market') {
-      const focused = interaction.options.getFocused(true);
-      if (focused.name === 'balik') {
-        const q = (focused.value || '').toLocaleLowerCase('tr');
-        const matches = FISH_TYPES
-          .filter(f => f.name.toLocaleLowerCase('tr').includes(q) || f.key.includes(q))
-          .slice(0, 25)
-          .map(f => ({ name: `${f.emoji} ${f.name} (${getFishValue(f.key)} coin)`, value: f.key }));
-        return interaction.respond(matches);
-      }
-      return interaction.respond([]);
-    }
-
     // ── KANAL KISITLAMASI ────────────────────────────────────
     // Tüm slash komutları yalnızca GAME_CHANNEL_ID kanalında çalışır.
     // Ownerlar (OWNERS listesi veya OWNER_ROLE_ID rolü) her kanaldan kullanabilir.
@@ -2146,12 +2127,6 @@ client.on('interactionCreate', async interaction => {
       );
 
       return interaction.update({ content: `✅ <@&${roleId}> renk rolünü aldın! **-${cr.price}** coin. Bakiye: **${getBalance(gid2, ownerUid).balance}**`, components: [] });
-    }
-
-    // ── BALIK OYUNCUYA SATMA ONAY BUTONLARI ───────────────────
-    if (interaction.isButton()) {
-      const id0 = interaction.customId;
-      if (id0.startsWith('fishtrade_yes_') || id0.startsWith('fishtrade_no_')) return; // collector'da işleniyor
     }
 
     // ── SETUP SELECT MENÜ / BUTON ─────────────────────────────
@@ -2276,8 +2251,7 @@ client.on('interactionCreate', async interaction => {
               '`/balik envanter` — Envanterini gör',
               '`/balik boost-al` — Şans Boost (2000 coin, 100 kullanım)',
               '`/balik-market liste` — Balık fiyat listesi',
-              '`/balik-market sat` — Markete sat',
-              '`/balik-market oyuncuya-sat` — Başka üyeye sat',
+              '`/balik-sat` — Tüm balıkları markete sat',
             ].join('\n'),
           },
           {
@@ -3457,54 +3431,39 @@ client.on('interactionCreate', async interaction => {
           .setTitle('🐟 Balık Marketi — Güncel Fiyatlar')
           .setColor(0x1ABC9C)
           .setDescription(FISH_TYPES.map(f => `${f.emoji} **${f.name}** — **${getFishValue(f.key)} coin**`).join('\n'))
-          .setFooter({ text: 'Fiyatlar 6 saatte bir yenilenir • Satmak için: /balik-market sat • Üyeye satmak için: /balik-market oyuncuya-sat' });
+          .setFooter({ text: 'Fiyatlar 6 saatte bir yenilenir • Tüm balıklarını satmak için: /balik-sat' });
         return interaction.reply({ embeds: [embed] });
       }
+    }
 
-      if (sub === 'sat') {
-        const key = interaction.options.getString('balik');
-        const adet = interaction.options.getInteger('adet');
-        const fish = FISH_TYPES.find(f => f.key === key);
-        if (!fish) return interaction.reply({ ephemeral: true, content: '⛔ Geçersiz balık türü.' });
-        if (!removeFish(gid, uid, key, adet)) return interaction.reply({ ephemeral: true, content: '⛔ Envanterinde yeterli balık yok.' });
-        const total = getFishValue(key) * adet;
-        addBalance(gid, uid, total);
-        return interaction.reply(`✅ ${fish.emoji} **${adet}x ${fish.name}** sattın! **+${total} coin**. Bakiye: **${getBalance(gid, uid).balance}**`);
+    // ─────────────────────────────────────────────────────────
+    //  /balik-sat
+    // ─────────────────────────────────────────────────────────
+    if (cmd === 'balik-sat') {
+      const inv = getInventory(gid, uid);
+      if (!inv.length) return interaction.reply({ ephemeral: true, content: '🎒 Envanterinde satacak balık yok!' });
+      let total = 0;
+      const lines = [];
+      for (const row of inv) {
+        const fish = FISH_TYPES.find(f => f.key === row.fishKey);
+        if (!fish || row.count <= 0) continue;
+        const earned = getFishValue(row.fishKey) * row.count;
+        total += earned;
+        lines.push(`${fish.emoji} **${row.count}x ${fish.name}** → **${earned} coin**`);
+        db.prepare('UPDATE fish_inventory SET count=0 WHERE guildId=? AND userId=? AND fishKey=?').run(gid, uid, row.fishKey);
       }
-
-      if (sub === 'oyuncuya-sat') {
-        const target = interaction.options.getUser('hedef');
-        const key = interaction.options.getString('balik');
-        const adet = interaction.options.getInteger('adet');
-        const fiyat = interaction.options.getInteger('fiyat');
-        const fish = FISH_TYPES.find(f => f.key === key);
-        if (!fish) return interaction.reply({ ephemeral: true, content: '⛔ Geçersiz balık türü.' });
-        if (target.id === uid) return interaction.reply({ ephemeral: true, content: '⛔ Kendine satamazsın.' });
-        if (target.bot) return interaction.reply({ ephemeral: true, content: '⛔ Botlara satamazsın.' });
-        if (getFishCount(gid, uid, key) < adet) return interaction.reply({ ephemeral: true, content: '⛔ Yeterli balığın yok.' });
-        const yesId = `fishtrade_yes_${Date.now()}_${uid}_${target.id}`;
-        const noId  = `fishtrade_no_${Date.now()}_${uid}_${target.id}`;
-        const row = new ActionRowBuilder().addComponents(
-          new ButtonBuilder().setCustomId(yesId).setLabel('Satın Al').setStyle(ButtonStyle.Success).setEmoji('🐟'),
-          new ButtonBuilder().setCustomId(noId).setLabel('Reddet').setStyle(ButtonStyle.Danger).setEmoji('❌'),
-        );
-        await interaction.reply({ content: `${target}, **${interaction.user.username}** sana **${adet}x ${fish.emoji} ${fish.name}**'ı **${fiyat} coin** karşılığında satmak istiyor. Kabul ediyor musun?`, components: [row] });
-        const m2 = await interaction.fetchReply();
-        const coll = m2.createMessageComponentCollector({ componentType: ComponentType.Button, time: 30000, filter: i => (i.customId === yesId || i.customId === noId) && i.user.id === target.id });
-        coll.on('collect', async i => {
-          coll.stop();
-          if (i.customId === noId) return i.update({ content: '❌ Teklif reddedildi.', components: [] });
-          if (getBalance(gid, target.id).balance < fiyat) return i.update({ content: '⛔ Yeterli coin\'in yok.', components: [] });
-          if (getFishCount(gid, uid, key) < adet) return i.update({ content: '⛔ Satıcının artık yeterli balığı yok.', components: [] });
-          removeFish(gid, uid, key, adet);
-          addFish(gid, target.id, key, adet);
-          addBalance(gid, target.id, -fiyat);
-          addBalance(gid, uid, fiyat);
-          await i.update({ content: `✅ Takas tamam! <@${target.id}> **${adet}x ${fish.emoji} ${fish.name}** aldı, <@${uid}> **${fiyat} coin** kazandı.`, components: [] });
-        });
-        coll.on('end', (_, reason) => { if (reason === 'time') interaction.editReply({ content: '⏰ Süre doldu, teklif iptal oldu.', components: [] }).catch(() => {}); });
-        return;
-      }
+      if (total === 0) return interaction.reply({ ephemeral: true, content: '🎒 Envanterinde satacak balık yok!' });
+      addBalance(gid, uid, total);
+      const embed = new EmbedBuilder()
+        .setTitle('🐟 Balık Marketi — Tüm Balıklar Satıldı!')
+        .setColor(0x1ABC9C)
+        .setDescription(lines.join('\n'))
+        .addFields(
+          { name: '💰 Toplam Kazanç', value: `**+${total} coin**`, inline: true },
+          { name: '💳 Yeni Bakiye', value: `**${getBalance(gid, uid).balance} coin**`, inline: true }
+        )
+        .setTimestamp();
+      return interaction.reply({ embeds: [embed] });
     }
 
     // ─────────────────────────────────────────────────────────
