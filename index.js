@@ -3233,9 +3233,6 @@ client.on('interactionCreate', async interaction => {
       }
 
       if (sub === 'cal') {
-        if (!isWithinIstanbulWindow()) {
-          return interaction.reply({ ephemeral: true, content: 'Bu saatlerde bu komutu kullanamazsın knk; uyuyan var, işe giden var, okula giden var. Haksızlık değil mi?' });
-        }
         const calCh = getSetting(gid, 'cal_channel');
         if (calCh && interaction.channelId !== calCh) {
           return interaction.reply({ ephemeral: true, content: `⛔ Bu komutu sadece <#${calCh}> kanalında kullanabilirsin.` });
@@ -3297,9 +3294,6 @@ client.on('interactionCreate', async interaction => {
     //  /çal — kısa komut (eskiden /oyunlar cal)
     // ─────────────────────────────────────────────────────────
     if (cmd === 'çal') {
-      if (!isWithinIstanbulWindow()) {
-        return interaction.reply({ ephemeral: true, content: 'Bu saatlerde bu komutu kullanamazsın knk; uyuyan var, işe giden var, okula giden var. Haksızlık değil mi?' });
-      }
       const calCh = getSetting(gid, 'cal_channel');
       if (calCh && interaction.channelId !== calCh) {
         return interaction.reply({ ephemeral: true, content: `⛔ Bu komutu sadece <#${calCh}> kanalında kullanabilirsin.` });
