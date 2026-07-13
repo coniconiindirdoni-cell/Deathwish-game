@@ -163,6 +163,14 @@ function ensureSchema() {
       PRIMARY KEY(guildId, userId, ore)
     );
   `);
+
+  // Yemek sistemi kullanım bazlı hale getirildi — eski DB'lere yeni kolonlar ekleniyor
+  const miningCols = db.prepare("PRAGMA table_info(mining_data)").all().map(c => c.name);
+  if (!miningCols.includes('breadUses'))              db.exec('ALTER TABLE mining_data ADD COLUMN breadUses INTEGER DEFAULT 0');
+  if (!miningCols.includes('soupUses'))               db.exec('ALTER TABLE mining_data ADD COLUMN soupUses INTEGER DEFAULT 0');
+  if (!miningCols.includes('meatUses'))               db.exec('ALTER TABLE mining_data ADD COLUMN meatUses INTEGER DEFAULT 0');
+  if (!miningCols.includes('energyCapTier'))          db.exec('ALTER TABLE mining_data ADD COLUMN energyCapTier INTEGER DEFAULT 0');
+  if (!miningCols.includes('energyCapPurchasesInTier')) db.exec('ALTER TABLE mining_data ADD COLUMN energyCapPurchasesInTier INTEGER DEFAULT 0');
 }
 
 function initDatabase() {
@@ -961,9 +969,18 @@ const ORES = [
 ];
 
 const MINING_FOODS = [
-  { key: 'bread', name: 'Ekmek', emoji: '🍞', price: 50,  durationMs: 30 * 60 * 1000, desc: '30 dk tok kalır' },
-  { key: 'soup',  name: 'Çorba', emoji: '🍲', price: 100, durationMs: 60 * 60 * 1000, desc: '1 saat tok kalır' },
-  { key: 'meat',  name: 'Et',    emoji: '🥩', price: 300, durationMs: 3 * 60 * 60 * 1000, desc: '3 saat tok kalır' },
+  { key: 'bread', name: 'Ekmek', emoji: '🍞', price: 50,  uses: 20, desc: '20 kullanım hakkı verir' },
+  { key: 'soup',  name: 'Çorba', emoji: '🍲', price: 100, uses: 30, desc: '30 kullanım hakkı verir' },
+  { key: 'meat',  name: 'Et',    emoji: '🥩', price: 300, uses: 60, desc: '60 kullanım hakkı verir' },
+];
+
+// Enerji kapasitesi yükseltme tierleri — her alım +5 max enerji verir
+const ENERGY_CAP_TIERS = [
+  { price: 2000, maxPurchases: 10 },
+  { price: 2000, maxPurchases: 10 },
+  { price: 2000, maxPurchases: 10 },
+  { price: 2000, maxPurchases: 10 },
+  { price: 2000, maxPurchases: 10 },
 ];
 
 // Başlangıç: 2 işçi bedava
@@ -991,28 +1008,40 @@ function getMiningData(gid, uid) {
   let r = db.prepare('SELECT * FROM mining_data WHERE guildId=? AND userId=?').get(gid, uid);
   if (!r) {
     db.prepare(
-      `INSERT OR IGNORE INTO mining_data(guildId,userId,miners,miningLevel,miningXp,energyLevel,energyXp,energy,lastEnergyRegen,hungryUntil,workerTier,purchasesInTier,totalOresMined)
-       VALUES(?,?,2,1,0,1,0,20,?,0,0,0,0)`
+      `INSERT OR IGNORE INTO mining_data(guildId,userId,miners,miningLevel,miningXp,energyLevel,energyXp,energy,lastEnergyRegen,hungryUntil,workerTier,purchasesInTier,totalOresMined,breadUses,soupUses,meatUses,energyCapTier,energyCapPurchasesInTier)
+       VALUES(?,?,2,1,0,1,0,20,?,0,0,0,0,0,0,0,0,0)`
     ).run(gid, uid, Date.now());
     r = db.prepare('SELECT * FROM mining_data WHERE guildId=? AND userId=?').get(gid, uid);
   }
+  // Eski kayıtlarda yeni alanlar null gelebilir — varsayılan değer ata
+  r.breadUses               = r.breadUses               ?? 0;
+  r.soupUses                = r.soupUses                ?? 0;
+  r.meatUses                = r.meatUses                ?? 0;
+  r.energyCapTier           = r.energyCapTier           ?? 0;
+  r.energyCapPurchasesInTier = r.energyCapPurchasesInTier ?? 0;
   return r;
 }
 
 function saveMiningData(gid, uid, data) {
   db.prepare(
-    `UPDATE mining_data SET miners=?,miningLevel=?,miningXp=?,energyLevel=?,energyXp=?,energy=?,lastEnergyRegen=?,hungryUntil=?,workerTier=?,purchasesInTier=?,totalOresMined=?
+    `UPDATE mining_data SET miners=?,miningLevel=?,miningXp=?,energyLevel=?,energyXp=?,energy=?,lastEnergyRegen=?,hungryUntil=?,workerTier=?,purchasesInTier=?,totalOresMined=?,breadUses=?,soupUses=?,meatUses=?,energyCapTier=?,energyCapPurchasesInTier=?
      WHERE guildId=? AND userId=?`
   ).run(
     data.miners, data.miningLevel, data.miningXp,
     data.energyLevel, data.energyXp,
     data.energy, data.lastEnergyRegen, data.hungryUntil,
     data.workerTier, data.purchasesInTier, data.totalOresMined,
+    data.breadUses, data.soupUses, data.meatUses,
+    data.energyCapTier, data.energyCapPurchasesInTier,
     gid, uid
   );
 }
 
-function getMiningMaxEnergy(data)   { return 19 + data.energyLevel; } // Lv.1=20, Lv.2=21 …
+// Temel max enerji: Lv.1=20, Lv.2=21 … + enerji kapasitesi yükseltmesi (her alım +5)
+function getMiningMaxEnergy(data) {
+  const capBonus = (data.energyCapTier * 5 * 5) + (data.energyCapPurchasesInTier * 5);
+  return 19 + (data.energyLevel ?? 1) + capBonus;
+}
 function getMiningCapacity(level)   { return level >= 20 ? 5 : level >= 10 ? 3 : 2; }
 function getMiningXpNeeded(level)   { return level * 3; }
 function getEnergyXpNeeded(level)   { return level * 10; }
@@ -1129,11 +1158,21 @@ async function handleMineButton(interaction) {
       });
     }
 
-    // Açlık kontrolü: hungryUntil = -1 → aç, 0 → hiç yenilmedi (tok say), >0 → tarih kontrolü
-    const isHungry = data.hungryUntil === -1 || (data.hungryUntil > 0 && Date.now() >= data.hungryUntil);
+    // Açlık kontrolü: yiyecek kullanım hakkı kalmamışsa aç
+    const totalFoodUses = (data.breadUses || 0) + (data.soupUses || 0) + (data.meatUses || 0);
+    const isHungry = totalFoodUses <= 0;
     const effectiveSend = isHungry ? Math.max(1, Math.floor(sendCount / 2)) : sendCount;
 
     data.energy -= energyCost;
+
+    // Yiyecek tüket (önce ekmek, sonra çorba, sonra et)
+    if (!isHungry) {
+      if (data.breadUses > 0)      data.breadUses--;
+      else if (data.soupUses > 0)  data.soupUses--;
+      else if (data.meatUses > 0)  data.meatUses--;
+    }
+    const newTotalFoodUses = (data.breadUses || 0) + (data.soupUses || 0) + (data.meatUses || 0);
+    const justRanOut = !isHungry && newTotalFoodUses <= 0;
 
     // Maden çıkarma
     const results = [];
@@ -1150,16 +1189,14 @@ async function handleMineButton(interaction) {
       leveledUp = true;
     }
 
-    // Açlık şansı: %40 ihtimalle işçiler acıkır
-    let newlyHungry = false;
-    if (!isHungry && Math.random() < 0.1) { data.hungryUntil = -1; newlyHungry = true; }
-    else if (isHungry)                     { data.hungryUntil = -1; }
-
     saveMiningData(gid, uid, data);
 
     const rank     = getMiningRank(data.miningLevel);
     const maxEnergy = getMiningMaxEnergy(data);
     const oreLines  = results.map(o => `${o.emoji} ${o.name}`).join('\n') || '—';
+    const foodStr   = isHungry
+      ? '😫 Aç (0 kullanım)'
+      : `🍽️ Tok (${newTotalFoodUses} kullanım kaldı)`;
 
     const embed = new EmbedBuilder()
       .setTitle('⛏️ Madencilik Sonucu')
@@ -1170,11 +1207,12 @@ async function handleMineButton(interaction) {
         { name: '⚡ Kalan Enerji',         value: `**${data.energy}** / ${maxEnergy}`,                    inline: true },
         { name: '🏅 Rütbe / Seviye',       value: `${rank.emoji} **${rank.name}** Lv.${data.miningLevel}`, inline: true },
         { name: '📈 Madencilik XP',        value: `${data.miningXp} / ${getMiningXpNeeded(data.miningLevel)}`, inline: true },
+        { name: '🍽️ İşçi Durumu',        value: foodStr,                                                 inline: true },
       );
 
-    if (leveledUp)    embed.addFields({ name: '🎉 SEVİYE ATLADI!',    value: `Madencilik Lv.**${data.miningLevel}** oldun!`,              inline: false });
-    if (newlyHungry)  embed.addFields({ name: '🍽️ İşçiler Acıktı!',  value: 'Market\'ten yemek al, verimliliği koruyalım!',             inline: false });
-    if (isHungry)     embed.addFields({ name: '😫 İşçiler Aç!',       value: 'Açlık nedeniyle verimlilik %50 düştü! Market\'ten yemek al.', inline: false });
+    if (leveledUp)    embed.addFields({ name: '🎉 SEVİYE ATLADI!',    value: `Madencilik Lv.**${data.miningLevel}** oldun!`,                    inline: false });
+    if (justRanOut)   embed.addFields({ name: '🍽️ Yiyecek Bitti!',   value: 'Tüm yiyecek kullanımları tükendi! Marketten yenisini al.',       inline: false });
+    if (isHungry)     embed.addFields({ name: '😫 İşçiler Aç!',       value: 'Yiyecek yok — verimlilik %50 düştü! Marketten yemek al.',        inline: false });
 
     return interaction.reply({ ephemeral: true, embeds: [embed] });
   }
@@ -1198,7 +1236,7 @@ async function handleMineButton(interaction) {
         { name: '⚡ Enerji Seviyesi', value: `Lv.**${data.energyLevel}** (Max: ${maxEnergy})`,              inline: true },
         { name: '📈 Enerji XP',       value: `${data.energyXp} / ${getEnergyXpNeeded(data.energyLevel)}`,  inline: true },
       )
-      .setFooter({ text: '2 dk = +1 enerji otomatik | Market: 40 coin = 20 enerji' });
+      .setFooter({ text: '2 dk = +1 enerji otomatik | Market: 2 coin/enerji (tam doldurur) | 🔋 Kapasite: 2000 coin = +5 max enerji' });
 
     return interaction.reply({ ephemeral: true, embeds: [embed] });
   }
@@ -1267,6 +1305,13 @@ async function handleMineButton(interaction) {
     const maxEnergy   = getMiningMaxEnergy(data);
     const remaining   = allWorkersBought ? 0 : tier.maxPurchases - data.purchasesInTier;
 
+    // Enerji kapasitesi yükseltme bilgisi
+    const capTierIdx      = Math.min(data.energyCapTier, ENERGY_CAP_TIERS.length - 1);
+    const capTier         = ENERGY_CAP_TIERS[capTierIdx];
+    const allCapBought    = data.energyCapTier >= ENERGY_CAP_TIERS.length;
+    const capRemaining    = allCapBought ? 0 : capTier.maxPurchases - data.energyCapPurchasesInTier;
+    const totalFoodUses   = (data.breadUses || 0) + (data.soupUses || 0) + (data.meatUses || 0);
+
     const workerLines = allWorkersBought
       ? ['**👷 İşçi Satın Al**', '  ✅ Maksimum işçi sayısına ulaştın! (**13 işçi**)']
       : [
@@ -1277,28 +1322,41 @@ async function handleMineButton(interaction) {
           nextTier ? `  Sonraki tier: **${nextTier.price}** coin (Lv.${nextTier.minLevel} gerekli)` : '  📌 Bu son tier',
         ];
 
+    const capLines = allCapBought
+      ? ['**🔋 Enerji Kapasitesi** — ✅ Maksimum kapasiteye ulaştın! (+75 enerji)']
+      : [
+          `**🔋 Enerji Kapasitesi** — 2000 coin / +5 max enerji`,
+          `  Mevcut max: **${maxEnergy}** | Bu tier'dan kalan: **${capRemaining}** alım`,
+        ];
+
     const infoLines = [
       ...workerLines,
       '',
-      '**⚡ Enerji Satın Al** — 40 coin / 20 adet (20 adet = 40 coin)',
-      `  Mevcut: ${data.energy}/${maxEnergy}`,
+      `**⚡ Enerji Doldur** — 2 coin/enerji (tam doldurur)`,
+      `  Mevcut: ${data.energy}/${maxEnergy} | Eksik: ${maxEnergy - data.energy} enerji = ${(maxEnergy - data.energy) * 2} coin`,
       '',
-      '**🍞 Ekmek** — 50 coin (30 dk tok)',
-      '**🍲 Çorba** — 100 coin (1 saat tok)',
-      '**🥩 Et** — 300 coin (3 saat tok)',
+      ...capLines,
+      '',
+      '**🍞 Ekmek** — 50 coin (+20 kullanım hakkı)',
+      '**🍲 Çorba** — 100 coin (+30 kullanım hakkı)',
+      '**🥩 Et** — 300 coin (+60 kullanım hakkı)',
+      `  🍽️ Mevcut yiyecek kullanımı: **${totalFoodUses}**`,
       '',
       `💰 Bakiye: **${bal} coin**`,
     ].join('\n');
 
-    const row = new ActionRowBuilder().addComponents(
+    const row1 = new ActionRowBuilder().addComponents(
       new ButtonBuilder().setCustomId('mine_buy_worker').setLabel('👷 İşçi Al').setStyle(ButtonStyle.Primary).setDisabled(!canBuyWorker || bal < tier.price),
-      new ButtonBuilder().setCustomId('mine_buy_energy').setLabel('⚡ Enerji +20').setStyle(ButtonStyle.Secondary).setDisabled(bal < 40 || data.energy >= maxEnergy),
+      new ButtonBuilder().setCustomId('mine_buy_energy').setLabel('⚡ Enerji Doldur').setStyle(ButtonStyle.Secondary).setDisabled(data.energy >= maxEnergy || bal < (maxEnergy - data.energy) * 2),
+      new ButtonBuilder().setCustomId('mine_buy_energy_cap').setLabel('🔋 Kapasite +5').setStyle(ButtonStyle.Secondary).setDisabled(allCapBought || bal < 2000),
+    );
+    const row2 = new ActionRowBuilder().addComponents(
       new ButtonBuilder().setCustomId('mine_buy_bread').setLabel('🍞 Ekmek 50c').setStyle(ButtonStyle.Success).setDisabled(bal < 50),
       new ButtonBuilder().setCustomId('mine_buy_soup').setLabel('🍲 Çorba 100c').setStyle(ButtonStyle.Success).setDisabled(bal < 100),
       new ButtonBuilder().setCustomId('mine_buy_meat').setLabel('🥩 Et 300c').setStyle(ButtonStyle.Success).setDisabled(bal < 300),
     );
 
-    return interaction.reply({ ephemeral: true, content: infoLines, components: [row] });
+    return interaction.reply({ ephemeral: true, content: infoLines, components: [row1, row2] });
   }
 
   // ── 👷 İŞÇİ SATIN AL ─────────────────────────────────────
@@ -1344,23 +1402,24 @@ async function handleMineButton(interaction) {
     });
   }
 
-  // ── ⚡ ENERJİ SATIN AL ────────────────────────────────────
+  // ── ⚡ ENERJİ SATIN AL (tam doldurur) ───────────────────
   if (id === 'mine_buy_energy') {
     let data = getMiningData(gid, uid);
     data = regenEnergy(data);
     const maxEnergy = getMiningMaxEnergy(data);
     const bal       = getBalance(gid, uid).balance;
-    const cost      = 40; // 20 enerji = 40 coin
+    const missing   = maxEnergy - data.energy;
+    // Her eksik enerji başına 2 coin (40 coin = 20 enerji oranı korunur)
+    const cost      = missing * 2;
 
     if (data.energy >= maxEnergy) return interaction.reply({ ephemeral: true, content: `⚡ Enerji zaten dolu! (${data.energy}/${maxEnergy})` });
-    if (bal < cost)               return interaction.reply({ ephemeral: true, content: `❌ Yetersiz coin! 20 enerji = **40 coin**. Bakiye: **${bal}**` });
+    if (bal < cost)               return interaction.reply({ ephemeral: true, content: `❌ Yetersiz coin! Enerjini doldurmak için **${cost} coin** gerekli (${missing} enerji eksik). Bakiye: **${bal}**` });
 
     addBalance(gid, uid, -cost);
-    const added   = Math.min(20, maxEnergy - data.energy);
-    data.energy   = Math.min(maxEnergy, data.energy + 20);
+    data.energy = maxEnergy;
 
-    // Enerji XP
-    data.energyXp += 20;
+    // Enerji XP (doldurulan miktar kadar)
+    data.energyXp += missing;
     let energyLvlUp = false;
     while (data.energyXp >= getEnergyXpNeeded(data.energyLevel)) {
       data.energyXp -= getEnergyXpNeeded(data.energyLevel);
@@ -1370,9 +1429,42 @@ async function handleMineButton(interaction) {
 
     saveMiningData(gid, uid, data);
     const newMaxE = getMiningMaxEnergy(data);
-    let msg = `✅ **+${added}** enerji satın alındı! Mevcut: **${data.energy}/${newMaxE}**\n💰 Kalan: **${getBalance(gid, uid).balance}** coin`;
+    let msg = `✅ Enerji tam dolduruldu! **${data.energy}/${newMaxE}** ⚡\n💰 Harcanan: **${cost} coin** | Kalan: **${getBalance(gid, uid).balance} coin**`;
     if (energyLvlUp) msg += `\n🎉 **Enerji Lv.${data.energyLevel}!** Maksimum enerji **${newMaxE}** oldu!`;
     return interaction.reply({ ephemeral: true, content: msg });
+  }
+
+  // ── ⚡ ENERJİ KAPASİTESİ SATIN AL ───────────────────────
+  if (id === 'mine_buy_energy_cap') {
+    let data = getMiningData(gid, uid);
+    data = regenEnergy(data);
+    const bal = getBalance(gid, uid).balance;
+
+    if (data.energyCapTier >= ENERGY_CAP_TIERS.length)
+      return interaction.reply({ ephemeral: true, content: '✅ Zaten maksimum enerji kapasitesine ulaştın! (+75 enerji)' });
+
+    const capTierIdx = Math.min(data.energyCapTier, ENERGY_CAP_TIERS.length - 1);
+    const capTier    = ENERGY_CAP_TIERS[capTierIdx];
+
+    if (bal < capTier.price)
+      return interaction.reply({ ephemeral: true, content: `❌ Yetersiz coin! Enerji kapasitesi için **2000 coin** gerekli. Bakiye: **${bal}**` });
+
+    addBalance(gid, uid, -capTier.price);
+    data.energyCapPurchasesInTier++;
+
+    if (data.energyCapPurchasesInTier >= capTier.maxPurchases) {
+      data.energyCapTier++;
+      data.energyCapPurchasesInTier = 0;
+    }
+
+    saveMiningData(gid, uid, data);
+    const newMaxE = getMiningMaxEnergy(data);
+    const allDone = data.energyCapTier >= ENERGY_CAP_TIERS.length;
+
+    return interaction.reply({
+      ephemeral: true,
+      content: `✅ Enerji kapasitesi yükseltildi! Yeni max enerji: **${newMaxE}**\n💰 Kalan: **${getBalance(gid, uid).balance}** coin${allDone ? '\n🎉 Maksimum kapasiteye ulaştın!' : ''}`,
+    });
   }
 
   // ── 🍽️ YEMEK SATIN AL ────────────────────────────────────
@@ -1386,12 +1478,18 @@ async function handleMineButton(interaction) {
 
     let data = getMiningData(gid, uid);
     addBalance(gid, uid, -food.price);
-    data.hungryUntil = Date.now() + food.durationMs;
+
+    // Kullanım hakkı ekle (süre bazlı değil, kullanım bazlı)
+    if (food.key === 'bread') data.breadUses += food.uses;
+    else if (food.key === 'soup') data.soupUses += food.uses;
+    else if (food.key === 'meat') data.meatUses += food.uses;
+
+    const totalUses = (data.breadUses || 0) + (data.soupUses || 0) + (data.meatUses || 0);
     saveMiningData(gid, uid, data);
 
     return interaction.reply({
       ephemeral: true,
-      content: `✅ **${food.emoji} ${food.name}** satın alındı! İşçiler **${food.desc}**.\n💰 Kalan: **${getBalance(gid, uid).balance}** coin`,
+      content: `✅ **${food.emoji} ${food.name}** satın alındı! +**${food.uses}** kullanım hakkı kazandın.\n🍽️ Toplam yiyecek kullanımı: **${totalUses}**\n💰 Kalan: **${getBalance(gid, uid).balance}** coin`,
     });
   }
 
@@ -1416,7 +1514,8 @@ async function handleMineButton(interaction) {
           value: [
             '• Başlangıç: **20 enerji** | Her 2 dakikada **+1** otomatik yenilenir',
             '• Enerji XP kazanarak Enerji Level atla → max enerji **+1** artar',
-            '• Marketten **10 coin = 5 enerji** satın alabilirsin',
+            '• Marketten **2 coin/enerji** ile enerjini tamamen doldurabilirsin',
+            '• 🔋 **Enerji Kapasitesi**: 2000 coin = +5 max enerji (max 50 alım, +250 toplam)',
           ].join('\n'),
         },
         {
@@ -1429,12 +1528,14 @@ async function handleMineButton(interaction) {
           ].join('\n'),
         },
         {
-          name: '🍽️ Açlık Sistemi',
+          name: '🍽️ Yemek Sistemi',
           value: [
-            'İşçiler acıkınca verim yarıya düşer. Marketten yemek al:',
-            '• 🍞 **Ekmek** — 50 coin (30 dakika tok)',
-            '• 🍲 **Çorba** — 100 coin (1 saat tok)',
-            '• 🥩 **Et** — 300 coin (3 saat tok)',
+            'Yiyecek kullanımı bitince işçiler acıkır → verim yarıya düşer.',
+            'Her madene gönderimde **1 kullanım** tüketilir. Marketten al:',
+            '• 🍞 **Ekmek** — 50 coin → **+20 kullanım hakkı**',
+            '• 🍲 **Çorba** — 100 coin → **+30 kullanım hakkı**',
+            '• 🥩 **Et** — 300 coin → **+60 kullanım hakkı**',
+            '*(Tüketim sırası: ekmek → çorba → et)*',
           ].join('\n'),
         },
         {
@@ -1471,30 +1572,31 @@ async function handleMineButton(interaction) {
     const rank      = getMiningRank(data.miningLevel);
     const maxEnergy = getMiningMaxEnergy(data);
     const capacity  = getMiningCapacity(data.miningLevel);
-    const isHungry  = data.hungryUntil === -1 || (data.hungryUntil > 0 && Date.now() >= data.hungryUntil);
-    const hungryStr = data.hungryUntil <= 0 && data.hungryUntil !== -1
-      ? '✅ Tok (henüz yemek yenmedi)'
-      : isHungry
-        ? '😫 Aç — market\'ten yemek al!'
-        : `🍽️ Tok (${Math.ceil((data.hungryUntil - Date.now()) / 60000)} dk kaldı)`;
+    const totalFoodUses = (data.breadUses || 0) + (data.soupUses || 0) + (data.meatUses || 0);
+    const isHungry  = totalFoodUses <= 0;
+    const hungryStr = isHungry
+      ? '😫 Aç — marketten yemek al!'
+      : `🍽️ Tok (**${data.breadUses}** 🍞 + **${data.soupUses}** 🍲 + **${data.meatUses}** 🥩 = **${totalFoodUses}** kullanım)`;
 
     const tierIdx   = Math.min(data.workerTier, WORKER_TIERS.length - 1);
     const tier      = WORKER_TIERS[tierIdx];
+    const capTotalPurchases = data.energyCapTier * 5 + (data.energyCapPurchasesInTier || 0);
 
     const embed = new EmbedBuilder()
       .setTitle(`⛏️ ${interaction.user.username} — Madencilik Profili`)
       .setColor(rank.color)
       .setThumbnail(interaction.user.displayAvatarURL())
       .addFields(
-        { name: '🏅 Rütbe',           value: `${rank.emoji} **${rank.name}** Lv.${data.miningLevel}`, inline: true },
-        { name: '📈 Madencilik XP',    value: `${data.miningXp} / ${getMiningXpNeeded(data.miningLevel)}`,    inline: true },
-        { name: '👷 İşçi Sayısı',     value: `**${data.miners}** işçi`,                              inline: true },
-        { name: '⚡ Enerji',           value: `**${data.energy}** / ${maxEnergy}`,                   inline: true },
-        { name: '⚡ Enerji Seviyesi',  value: `Lv.**${data.energyLevel}** (${data.energyXp}/${getEnergyXpNeeded(data.energyLevel)} XP)`, inline: true },
-        { name: '🏭 Gezi Kapasitesi', value: `Gezi başına **${capacity}** maden`,                   inline: true },
-        { name: '🍽️ İşçi Durumu',   value: hungryStr,                                              inline: true },
-        { name: '📦 Toplam Maden',    value: `**${data.totalOresMined}** adet`,                     inline: true },
-        { name: '💰 Sonraki İşçi',    value: `**${tier.price}** coin (Lv.${tier.minLevel})`,        inline: true },
+        { name: '🏅 Rütbe',               value: `${rank.emoji} **${rank.name}** Lv.${data.miningLevel}`, inline: true },
+        { name: '📈 Madencilik XP',        value: `${data.miningXp} / ${getMiningXpNeeded(data.miningLevel)}`,    inline: true },
+        { name: '👷 İşçi Sayısı',         value: `**${data.miners}** işçi`,                              inline: true },
+        { name: '⚡ Enerji',               value: `**${data.energy}** / ${maxEnergy}`,                   inline: true },
+        { name: '⚡ Enerji Seviyesi',      value: `Lv.**${data.energyLevel}** (${data.energyXp}/${getEnergyXpNeeded(data.energyLevel)} XP)`, inline: true },
+        { name: '🔋 Enerji Kapasitesi',   value: `**${capTotalPurchases}/15** alım (+${capTotalPurchases * 5} max enerji)`, inline: true },
+        { name: '🏭 Gezi Kapasitesi',     value: `Gezi başına **${capacity}** maden`,                   inline: true },
+        { name: '🍽️ İşçi Durumu',       value: hungryStr,                                              inline: false },
+        { name: '📦 Toplam Maden',        value: `**${data.totalOresMined}** adet`,                     inline: true },
+        { name: '💰 Sonraki İşçi',        value: `**${tier.price}** coin (Lv.${tier.minLevel})`,        inline: true },
       )
       .setFooter({ text: 'Rütbeler: Bronze(Lv5) • Iron(Lv10) • Gold(Lv15) • Master(Lv20)' });
 
