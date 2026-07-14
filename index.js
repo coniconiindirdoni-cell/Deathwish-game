@@ -164,6 +164,33 @@ function ensureSchema() {
     );
   `);
 
+  // ── Odunculuk oyunu tabloları ──────────────────────────────
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS woodcutting_data (
+      guildId TEXT, userId TEXT,
+      lumberjacks INTEGER DEFAULT 2,
+      woodLevel INTEGER DEFAULT 1,
+      woodXp INTEGER DEFAULT 0,
+      energyLevel INTEGER DEFAULT 1,
+      energyXp INTEGER DEFAULT 0,
+      energy INTEGER DEFAULT 20,
+      lastEnergyRegen INTEGER DEFAULT 0,
+      workerTier INTEGER DEFAULT 0,
+      purchasesInTier INTEGER DEFAULT 0,
+      totalLogsCut INTEGER DEFAULT 0,
+      breadUses INTEGER DEFAULT 0,
+      soupUses INTEGER DEFAULT 0,
+      meatUses INTEGER DEFAULT 0,
+      energyCapTier INTEGER DEFAULT 0,
+      energyCapPurchasesInTier INTEGER DEFAULT 0,
+      PRIMARY KEY(guildId, userId)
+    );
+    CREATE TABLE IF NOT EXISTS woodcutting_inventory (
+      guildId TEXT, userId TEXT, wood TEXT, amount INTEGER DEFAULT 0,
+      PRIMARY KEY(guildId, userId, wood)
+    );
+  `);
+
   // Yemek sistemi kullanım bazlı hale getirildi — eski DB'lere yeni kolonlar ekleniyor
   const miningCols = db.prepare("PRAGMA table_info(mining_data)").all().map(c => c.name);
   if (!miningCols.includes('breadUses'))              db.exec('ALTER TABLE mining_data ADD COLUMN breadUses INTEGER DEFAULT 0');
@@ -597,7 +624,7 @@ function createBankAccount(gid, uid) {
 }
 
 // Komutlardan hangilerinin banka hesabı olmadan da çalışabileceği (yönetimsel/owner komutları)
-const BANK_EXEMPT_COMMANDS = new Set(['setup', 'yardim', 'banka', 'verikaydet', 'backuplist', 'veriyukle', 'backupsil', 'madencilik']);
+const BANK_EXEMPT_COMMANDS = new Set(['setup', 'yardim', 'banka', 'verikaydet', 'backuplist', 'veriyukle', 'backupsil', 'madencilik', 'odunculuk']);
 
 // İsim Rengi Rolleri (admin /setup üzerinden ekler, kullanıcı /renk al ile satın alır)
 function getColorRoles(gid)              { return db.prepare('SELECT * FROM color_roles WHERE guildId=?').all(gid); }
@@ -922,10 +949,10 @@ function resolveFishCast(gid, uid, boosted) {
   return { type: 'catch', fish: pickFish(boosted) };
 }
 
-// Blackjack / At Yarışı ortak ödül hesaplayıcı — %2x kazanç, ~%0.1 ihtimalle 5x
+// Blackjack / At Yarışı ortak ödül hesaplayıcı — 2x kazanç (bet kadar kâr)
 function resolveWinAmount(bet) {
-  if (Math.random() < 0.001) return bet * 8;
-  return bet * 4;
+  if (Math.random() < 0.001) return bet * 4;
+  return bet * 2;
 }
 
 // ──────────────────────────────────────────────────────────────
@@ -969,9 +996,9 @@ const ORES = [
 ];
 
 const MINING_FOODS = [
-  { key: 'bread', name: 'Ekmek', emoji: '🍞', price: 50,  uses: 20, desc: '20 kullanım hakkı verir' },
-  { key: 'soup',  name: 'Çorba', emoji: '🍲', price: 100, uses: 30, desc: '30 kullanım hakkı verir' },
-  { key: 'meat',  name: 'Et',    emoji: '🥩', price: 300, uses: 60, desc: '60 kullanım hakkı verir' },
+  { key: 'bread', name: 'Ekmek', emoji: '🍞', price: 50,  uses: 10, desc: '10 kullanım hakkı verir' },
+  { key: 'soup',  name: 'Çorba', emoji: '🍲', price: 100, uses: 20, desc: '20 kullanım hakkı verir' },
+  { key: 'meat',  name: 'Et',    emoji: '🥩', price: 300, uses: 40, desc: '40 kullanım hakkı verir' },
 ];
 
 // Enerji kapasitesi yükseltme tierleri — her alım +5 max enerji verir
@@ -1214,6 +1241,21 @@ async function handleMineButton(interaction) {
     if (justRanOut)   embed.addFields({ name: '🍽️ Yiyecek Bitti!',   value: 'Tüm yiyecek kullanımları tükendi! Marketten yenisini al.',       inline: false });
     if (isHungry)     embed.addFields({ name: '😫 İşçiler Aç!',       value: 'Yiyecek yok — verimlilik %50 düştü! Marketten yemek al.',        inline: false });
 
+    // ── Madencilik Lv.15: Rol ver + madencilik kanalına duyuru ─
+    if (leveledUp && data.miningLevel >= 15) {
+      const WOOD_UNLOCK_ROLE = '1526518698054123602';
+      try {
+        const member = interaction.member || await interaction.guild.members.fetch(uid).catch(() => null);
+        if (member && !member.roles.cache.has(WOOD_UNLOCK_ROLE)) {
+          await member.roles.add(WOOD_UNLOCK_ROLE).catch(() => {});
+          // DM ile bildirim
+          await member.send({
+            content: `🪓 **Tebrikler!** Madencilikte **Lv.15**'e ulaştın! <#${WOODCUTTING_CHANNEL_ID}> kanalı sana açıldı. 🎉`,
+          }).catch(() => {});
+        }
+      } catch (e) { /* rol verilemezse sessizce geç */ }
+    }
+
     return interaction.reply({ ephemeral: true, embeds: [embed] });
   }
 
@@ -1351,9 +1393,9 @@ async function handleMineButton(interaction) {
       new ButtonBuilder().setCustomId('mine_buy_energy_cap').setLabel('🔋 Kapasite +5').setStyle(ButtonStyle.Secondary).setDisabled(allCapBought || bal < 2000),
     );
     const row2 = new ActionRowBuilder().addComponents(
-      new ButtonBuilder().setCustomId('mine_buy_bread').setLabel('🍞 Ekmek 50c').setStyle(ButtonStyle.Success).setDisabled(bal < 50),
-      new ButtonBuilder().setCustomId('mine_buy_soup').setLabel('🍲 Çorba 100c').setStyle(ButtonStyle.Success).setDisabled(bal < 100),
-      new ButtonBuilder().setCustomId('mine_buy_meat').setLabel('🥩 Et 300c').setStyle(ButtonStyle.Success).setDisabled(bal < 300),
+      new ButtonBuilder().setCustomId('mine_buy_bread').setLabel('🍞 Ekmek 50c').setStyle(ButtonStyle.Success).setDisabled(bal < 50 || data.breadUses > 0),
+      new ButtonBuilder().setCustomId('mine_buy_soup').setLabel('🍲 Çorba 100c').setStyle(ButtonStyle.Success).setDisabled(bal < 100 || data.soupUses > 0),
+      new ButtonBuilder().setCustomId('mine_buy_meat').setLabel('🥩 Et 300c').setStyle(ButtonStyle.Success).setDisabled(bal < 300 || data.meatUses > 0),
     );
 
     return interaction.reply({ ephemeral: true, content: infoLines, components: [row1, row2] });
@@ -1477,6 +1519,12 @@ async function handleMineButton(interaction) {
       return interaction.reply({ ephemeral: true, content: `❌ Yetersiz coin! **${food.emoji} ${food.name}** için **${food.price} coin** gerekli. Bakiye: **${bal}**` });
 
     let data = getMiningData(gid, uid);
+
+    // Aynı yemek hakkı bitmeden tekrar alınamaz
+    const currentUses = food.key === 'bread' ? data.breadUses : food.key === 'soup' ? data.soupUses : data.meatUses;
+    if (currentUses > 0)
+      return interaction.reply({ ephemeral: true, content: `❌ **${food.emoji} ${food.name}** hakkın henüz bitmedi! (**${currentUses}** kullanım kaldı). Önce mevcut hakkını kullan.` });
+
     addBalance(gid, uid, -food.price);
 
     // Kullanım hakkı ekle (süre bazlı değil, kullanım bazlı)
@@ -1599,6 +1647,650 @@ async function handleMineButton(interaction) {
         { name: '💰 Sonraki İşçi',        value: `**${tier.price}** coin (Lv.${tier.minLevel})`,        inline: true },
       )
       .setFooter({ text: 'Rütbeler: Bronze(Lv5) • Iron(Lv10) • Gold(Lv15) • Master(Lv20)' });
+
+    return interaction.reply({ ephemeral: true, embeds: [embed] });
+  }
+}
+
+// ──────────────────────────────────────────────────────────────
+//  ODUNCULUK OYUNU SABİTLERİ & YARDIMCILARI
+// ──────────────────────────────────────────────────────────────
+const WOODCUTTING_CHANNEL_ID = '1526334843552796683';
+const WOOD_EMPTY_CHANCE = 0.10; // her işçi için %10 boş dönme şansı
+const WOOD_TRIP_COST    = 10;   // gezi başına işçi başına ödenen coin
+
+const WOODS = [
+  { key: 'pine',   name: 'Çam',         emoji: '🌲', value: 8,   weight: 30 },
+  { key: 'oak',    name: 'Meşe',        emoji: '🌳', value: 15,  weight: 25 },
+  { key: 'birch',  name: 'Huş',         emoji: '🪵', value: 25,  weight: 18 },
+  { key: 'maple',  name: 'Akçaağaç',    emoji: '🍁', value: 40,  weight: 12 },
+  { key: 'walnut', name: 'Ceviz',       emoji: '🌰', value: 65,  weight: 8  },
+  { key: 'cherry', name: 'Kiraz',       emoji: '🌸', value: 100, weight: 4  },
+  { key: 'ebony',  name: 'Abanoz',      emoji: '🖤', value: 180, weight: 2  },
+  { key: 'dragon', name: 'Ejder Ağacı', emoji: '🐉', value: 350, weight: 1  },
+];
+
+const WOOD_WORKER_TIERS = [
+  { price: 500,  minLevel: 1,  maxPurchases: 1 },
+  { price: 2000, minLevel: 10, maxPurchases: 5 },
+  { price: 4000, minLevel: 20, maxPurchases: 5 },
+];
+
+const WOOD_ENERGY_CAP_TIERS = [
+  { price: 2000, maxPurchases: 10 },
+  { price: 2000, maxPurchases: 10 },
+  { price: 2000, maxPurchases: 10 },
+  { price: 2000, maxPurchases: 10 },
+  { price: 2000, maxPurchases: 10 },
+];
+
+const WOOD_COOLDOWNS = new Map();
+function woodCooldownCheck(gid, uid) {
+  const key = `${gid}:${uid}`;
+  const last = WOOD_COOLDOWNS.get(key) || 0;
+  const remaining = 10000 - (Date.now() - last);
+  if (remaining > 0) return Math.ceil(remaining / 1000);
+  WOOD_COOLDOWNS.set(key, Date.now());
+  return 0;
+}
+
+function getWoodData(gid, uid) {
+  let r = db.prepare('SELECT * FROM woodcutting_data WHERE guildId=? AND userId=?').get(gid, uid);
+  if (!r) {
+    db.prepare(
+      `INSERT OR IGNORE INTO woodcutting_data(guildId,userId,lumberjacks,woodLevel,woodXp,energyLevel,energyXp,energy,lastEnergyRegen,workerTier,purchasesInTier,totalLogsCut,breadUses,soupUses,meatUses,energyCapTier,energyCapPurchasesInTier)
+       VALUES(?,?,2,1,0,1,0,20,?,0,0,0,0,0,0,0,0)`
+    ).run(gid, uid, Date.now());
+    r = db.prepare('SELECT * FROM woodcutting_data WHERE guildId=? AND userId=?').get(gid, uid);
+  }
+  r.breadUses                = r.breadUses                ?? 0;
+  r.soupUses                 = r.soupUses                 ?? 0;
+  r.meatUses                 = r.meatUses                 ?? 0;
+  r.energyCapTier            = r.energyCapTier            ?? 0;
+  r.energyCapPurchasesInTier = r.energyCapPurchasesInTier ?? 0;
+  return r;
+}
+
+function saveWoodData(gid, uid, data) {
+  db.prepare(
+    `UPDATE woodcutting_data SET lumberjacks=?,woodLevel=?,woodXp=?,energyLevel=?,energyXp=?,energy=?,lastEnergyRegen=?,workerTier=?,purchasesInTier=?,totalLogsCut=?,breadUses=?,soupUses=?,meatUses=?,energyCapTier=?,energyCapPurchasesInTier=?
+     WHERE guildId=? AND userId=?`
+  ).run(
+    data.lumberjacks, data.woodLevel, data.woodXp,
+    data.energyLevel, data.energyXp,
+    data.energy, data.lastEnergyRegen,
+    data.workerTier, data.purchasesInTier, data.totalLogsCut,
+    data.breadUses, data.soupUses, data.meatUses,
+    data.energyCapTier, data.energyCapPurchasesInTier,
+    gid, uid
+  );
+}
+
+function getWoodMaxEnergy(data) {
+  const capBonus = (data.energyCapTier * 10 * 5) + (data.energyCapPurchasesInTier * 5);
+  return 19 + (data.energyLevel ?? 1) + capBonus;
+}
+
+function getWoodXpNeeded(level)    { return level * 3; }
+function getWoodEnergyXpNeeded(lv) { return lv * 10; }
+
+function getWoodRank(level) {
+  if (level >= 20) return { name: 'Usta',     emoji: '👑', color: 0xE74C3C };
+  if (level >= 15) return { name: 'Kıdemli',  emoji: '🪓', color: 0xF1C40F };
+  if (level >= 10) return { name: 'Deneyimli',emoji: '⚙️', color: 0x95A5A6 };
+  if (level >= 5)  return { name: 'Çırak',    emoji: '🌿', color: 0x27AE60 };
+  return { name: 'Acemi', emoji: '🌱', color: 0x3498DB };
+}
+
+function regenWoodEnergy(data) {
+  const now = Date.now();
+  const elapsed = now - (data.lastEnergyRegen || now);
+  const regenCount = Math.floor(elapsed / (2 * 60 * 1000));
+  if (regenCount > 0) {
+    const maxE = getWoodMaxEnergy(data);
+    data.energy = Math.min(maxE, data.energy + regenCount);
+    data.lastEnergyRegen = (data.lastEnergyRegen || now) + regenCount * 2 * 60 * 1000;
+  }
+  return data;
+}
+
+function pickWood() {
+  const total = WOODS.reduce((a, w) => a + w.weight, 0);
+  let r = Math.random() * total;
+  for (const w of WOODS) { if (r < w.weight) return w; r -= w.weight; }
+  return WOODS[0];
+}
+
+function getWoodInventory(gid, uid) {
+  return db.prepare('SELECT * FROM woodcutting_inventory WHERE guildId=? AND userId=?').all(gid, uid);
+}
+function addWoodLog(gid, uid, woodKey, amount) {
+  db.prepare('INSERT OR IGNORE INTO woodcutting_inventory(guildId,userId,wood,amount)VALUES(?,?,?,0)').run(gid, uid, woodKey);
+  db.prepare('UPDATE woodcutting_inventory SET amount=amount+? WHERE guildId=? AND userId=? AND wood=?').run(amount, gid, uid, woodKey);
+}
+function clearWoodInventory(gid, uid) {
+  db.prepare('DELETE FROM woodcutting_inventory WHERE guildId=? AND userId=?').run(gid, uid);
+}
+function getWoodLeaderboard(gid, limit = 10) {
+  return db.prepare(
+    'SELECT userId,woodLevel,totalLogsCut FROM woodcutting_data WHERE guildId=? ORDER BY woodLevel DESC, totalLogsCut DESC LIMIT ?'
+  ).all(gid, limit);
+}
+
+function buildWoodPanel() {
+  const embed = new EmbedBuilder()
+    .setTitle('🪓 Odunculuk Oyunu')
+    .setColor(0x27AE60)
+    .setDescription(
+      '**Ormana oduncu gönder, odun kes, envanterini sat!**\n\n' +
+      '🔒 Tüm oyun verilerin yalnızca sana görünür.\n' +
+      '⏱️ Her eylem için **10 saniye** bekleme süresi var.\n' +
+      '⚡ Enerji her **2 dakikada bir** 1 adet yenilenir.\n' +
+      '💸 Her gezi için işçi başına **10 coin** ücret ödenir.\n' +
+      '🎲 Her oduncunun **%10 ihtimalle** eli boş dönme şansı var!\n' +
+      '🍽️ Oduncuların aç kalırsa verim düşer!'
+    )
+    .addFields(
+      { name: '🪓 Ormana Gönder', value: 'Oduncularını ormana yolla, odun kes',    inline: true },
+      { name: '⚡ Enerji',         value: 'Enerji durumunu kontrol et',              inline: true },
+      { name: '🎒 Envanter',       value: 'Kestiğin odunları gör',                  inline: true },
+      { name: '💰 Sat',            value: 'Tüm envanteri coin\'e çevir',            inline: true },
+      { name: '🛒 Market',         value: 'Oduncu, enerji ve yemek satın al',       inline: true },
+      { name: '📊 Profil',         value: 'Odunculuk istatistiklerini gör',         inline: true },
+    )
+    .setFooter({ text: 'Başlangıç: 2 oduncu | Rütbeler: Çırak(Lv5) • Deneyimli(Lv10) • Kıdemli(Lv15) • Usta(Lv20)' });
+
+  const row1 = new ActionRowBuilder().addComponents(
+    new ButtonBuilder().setCustomId('wood_chop').setLabel('🪓 Ormana Gönder').setStyle(ButtonStyle.Primary),
+    new ButtonBuilder().setCustomId('wood_energy').setLabel('⚡ Enerji').setStyle(ButtonStyle.Secondary),
+    new ButtonBuilder().setCustomId('wood_inventory').setLabel('🎒 Envanter').setStyle(ButtonStyle.Secondary),
+  );
+  const row2 = new ActionRowBuilder().addComponents(
+    new ButtonBuilder().setCustomId('wood_sell').setLabel('💰 Sat').setStyle(ButtonStyle.Success),
+    new ButtonBuilder().setCustomId('wood_market').setLabel('🛒 Market').setStyle(ButtonStyle.Secondary),
+    new ButtonBuilder().setCustomId('wood_profile').setLabel('📊 Profil').setStyle(ButtonStyle.Secondary),
+  );
+  const row3 = new ActionRowBuilder().addComponents(
+    new ButtonBuilder().setCustomId('wood_help').setLabel('📖 Nasıl Oynanır?').setStyle(ButtonStyle.Secondary),
+  );
+  return { embeds: [embed], components: [row1, row2, row3] };
+}
+
+async function handleWoodButton(interaction) {
+  const gid = interaction.guild?.id;
+  const uid = interaction.user.id;
+  if (!gid) return interaction.reply({ ephemeral: true, content: '⛔ Bu bir sunucu içinde kullanılabilir.' });
+
+  const cd = woodCooldownCheck(gid, uid);
+  if (cd > 0) return interaction.reply({ ephemeral: true, content: `⏳ **${cd}** saniye beklemelisin!` });
+
+  if (!hasBankAccount(gid, uid))
+    return interaction.reply({ ephemeral: true, content: '🏦 Önce `/banka olustur` ile hesap açman gerekiyor!' });
+
+  const id = interaction.customId;
+
+  // ── 🪓 ORMANA GÖNDER ───────────────────────────────────────
+  if (id === 'wood_chop') {
+    let data = getWoodData(gid, uid);
+    data = regenWoodEnergy(data);
+
+    const energyCost = data.lumberjacks;
+    if (data.energy < energyCost) {
+      saveWoodData(gid, uid, data);
+      const maxE = getWoodMaxEnergy(data);
+      const secToNext = Math.ceil((2 * 60 * 1000 - (Date.now() - data.lastEnergyRegen) % (2 * 60 * 1000)) / 1000);
+      return interaction.reply({
+        ephemeral: true,
+        content: `⚡ Yeterli enerji yok!\nGerekli: **${energyCost}**, Mevcut: **${data.energy}/${maxE}**\n⏱️ Sonraki yenilenme: **${secToNext}s** | 🛒 Marketten de alabilirsin.`,
+      });
+    }
+
+    // Gezi ücreti kontrolü
+    const tripCost = data.lumberjacks * WOOD_TRIP_COST;
+    const bal = getBalance(gid, uid).balance;
+    if (bal < tripCost) {
+      return interaction.reply({
+        ephemeral: true,
+        content: `💸 Gezi ücreti ödenemedi!\n**${data.lumberjacks}** oduncu × **${WOOD_TRIP_COST} coin** = **${tripCost} coin** gerekli. Bakiye: **${bal} coin**`,
+      });
+    }
+    addBalance(gid, uid, -tripCost);
+
+    data.energy -= energyCost;
+
+    // Açlık kontrolü
+    const totalFoodUses = (data.breadUses || 0) + (data.soupUses || 0) + (data.meatUses || 0);
+    const isHungry = totalFoodUses <= 0;
+
+    // Her oduncu için ayrı %10 boş dönme şansı
+    const results = [];
+    const emptyWorkers = [];
+    for (let i = 0; i < data.lumberjacks; i++) {
+      if (Math.random() < WOOD_EMPTY_CHANCE) {
+        emptyWorkers.push(i + 1);
+      } else {
+        const w = pickWood();
+        results.push(w);
+      }
+    }
+
+    // Açlık durumunda efektif sonuçlar yarıya düşer
+    const effectiveResults = isHungry ? results.slice(0, Math.max(1, Math.floor(results.length / 2))) : results;
+
+    for (const w of effectiveResults) addWoodLog(gid, uid, w.key, 1);
+    data.totalLogsCut += effectiveResults.length;
+
+    // Odunculuk XP
+    data.woodXp += effectiveResults.length;
+    let leveledUp = false;
+    while (data.woodXp >= getWoodXpNeeded(data.woodLevel)) {
+      data.woodXp -= getWoodXpNeeded(data.woodLevel);
+      data.woodLevel++;
+      leveledUp = true;
+    }
+
+    // Yiyecek tüket
+    if (!isHungry) {
+      if (data.breadUses > 0)      data.breadUses--;
+      else if (data.soupUses > 0)  data.soupUses--;
+      else if (data.meatUses > 0)  data.meatUses--;
+    }
+    const newTotalFoodUses = (data.breadUses || 0) + (data.soupUses || 0) + (data.meatUses || 0);
+    const justRanOut = !isHungry && newTotalFoodUses <= 0;
+
+    saveWoodData(gid, uid, data);
+
+    const rank = getWoodRank(data.woodLevel);
+    const maxEnergy = getWoodMaxEnergy(data);
+    const woodLines = effectiveResults.length
+      ? effectiveResults.map(w => `${w.emoji} ${w.name}`).join('\n')
+      : '❌ Hiçbir oduncu odun getiremedi!';
+    const emptyStr = emptyWorkers.length ? `\n🎲 Boş dönen oduncu: **${emptyWorkers.length}** kişi` : '';
+    const foodStr = isHungry ? '😫 Aç (0 kullanım)' : `🍽️ Tok (${newTotalFoodUses} kullanım kaldı)`;
+
+    const embed = new EmbedBuilder()
+      .setTitle('🪓 Odunculuk Sonucu')
+      .setColor(rank.color)
+      .addFields(
+        { name: '🌲 Kesilen Odunlar',     value: woodLines,                                                   inline: true },
+        { name: '👷 Oduncu / Boş Dönen', value: `**${data.lumberjacks}** oduncu${emptyStr}`,                  inline: true },
+        { name: '⚡ Kalan Enerji',         value: `**${data.energy}** / ${maxEnergy}`,                        inline: true },
+        { name: '🏅 Rütbe / Seviye',       value: `${rank.emoji} **${rank.name}** Lv.${data.woodLevel}`,      inline: true },
+        { name: '📈 Odunculuk XP',         value: `${data.woodXp} / ${getWoodXpNeeded(data.woodLevel)}`,      inline: true },
+        { name: '🍽️ Oduncu Durumu',      value: foodStr,                                                     inline: true },
+        { name: '💸 Ödenen Ücret',        value: `**-${tripCost} coin**`,                                     inline: true },
+      );
+
+    if (leveledUp)   embed.addFields({ name: '🎉 SEVİYE ATLADI!',   value: `Odunculuk Lv.**${data.woodLevel}** oldun!`,                    inline: false });
+    if (justRanOut)  embed.addFields({ name: '🍽️ Yiyecek Bitti!',  value: 'Tüm yiyecek kullanımları tükendi! Marketten yenisini al.',      inline: false });
+    if (isHungry)    embed.addFields({ name: '😫 Oduncular Aç!',    value: 'Yiyecek yok — verimlilik %50 düştü! Marketten yemek al.',       inline: false });
+
+    return interaction.reply({ ephemeral: true, embeds: [embed] });
+  }
+
+  // ── ⚡ ENERJİ ───────────────────────────────────────────────
+  if (id === 'wood_energy') {
+    let data = getWoodData(gid, uid);
+    data = regenWoodEnergy(data);
+    saveWoodData(gid, uid, data);
+
+    const maxEnergy = getWoodMaxEnergy(data);
+    const msToNext  = 2 * 60 * 1000 - (Date.now() - data.lastEnergyRegen) % (2 * 60 * 1000);
+    const secToNext = Math.ceil(msToNext / 1000);
+
+    const embed = new EmbedBuilder()
+      .setTitle('⚡ Enerji Durumu — Odunculuk')
+      .setColor(0xF39C12)
+      .addFields(
+        { name: '⚡ Mevcut Enerji',     value: `**${data.energy}** / ${maxEnergy}`,                              inline: true },
+        { name: '⏱️ Sonraki Yenilenme', value: `**${secToNext}** saniye`,                                       inline: true },
+        { name: '⚡ Enerji Seviyesi',   value: `Lv.**${data.energyLevel}** (Max: ${maxEnergy})`,                 inline: true },
+        { name: '📈 Enerji XP',         value: `${data.energyXp} / ${getWoodEnergyXpNeeded(data.energyLevel)}`, inline: true },
+      )
+      .setFooter({ text: '2 dk = +1 enerji otomatik | Market: 2 coin/enerji (tam doldurur) | 🔋 Kapasite: 2000 coin = +5 max enerji' });
+
+    return interaction.reply({ ephemeral: true, embeds: [embed] });
+  }
+
+  // ── 🎒 ENVANTER ─────────────────────────────────────────────
+  if (id === 'wood_inventory') {
+    const inv = getWoodInventory(gid, uid).filter(r => r.amount > 0);
+    if (!inv.length) return interaction.reply({ ephemeral: true, content: '🎒 Envanterin boş! Ormana oduncu gönder.' });
+
+    let totalValue = 0;
+    const lines = inv.map(r => {
+      const w = WOODS.find(x => x.key === r.wood);
+      if (!w) return null;
+      const val = w.value * r.amount;
+      totalValue += val;
+      return `${w.emoji} **${w.name}** × ${r.amount} — ${val} coin`;
+    }).filter(Boolean);
+
+    const embed = new EmbedBuilder()
+      .setTitle('🎒 Odunculuk Envanteri')
+      .setColor(0x27AE60)
+      .setDescription(lines.join('\n'))
+      .addFields({ name: '💰 Toplam Değer', value: `**${totalValue} coin**`, inline: true })
+      .setFooter({ text: 'Satmak için "Sat" düğmesine bas' });
+
+    return interaction.reply({ ephemeral: true, embeds: [embed] });
+  }
+
+  // ── 💰 SAT ──────────────────────────────────────────────────
+  if (id === 'wood_sell') {
+    const inv = getWoodInventory(gid, uid).filter(r => r.amount > 0);
+    if (!inv.length) return interaction.reply({ ephemeral: true, content: '🎒 Satacak odun yok! Önce ormana gönder.' });
+
+    let totalValue = 0;
+    const lines = [];
+    for (const r of inv) {
+      const w = WOODS.find(x => x.key === r.wood);
+      if (!w) continue;
+      const earned = w.value * r.amount;
+      totalValue += earned;
+      lines.push(`${w.emoji} ${w.name} × ${r.amount} = ${earned} coin`);
+    }
+    clearWoodInventory(gid, uid);
+    addBalance(gid, uid, totalValue);
+
+    const embed = new EmbedBuilder()
+      .setTitle('💰 Odunlar Satıldı!')
+      .setColor(0x2ECC71)
+      .setDescription(lines.join('\n'))
+      .addFields(
+        { name: '💰 Kazanılan',    value: `**+${totalValue} coin**`,                        inline: true },
+        { name: '💳 Yeni Bakiye', value: `**${getBalance(gid, uid).balance} coin**`,        inline: true },
+      );
+
+    return interaction.reply({ ephemeral: true, embeds: [embed] });
+  }
+
+  // ── 🛒 MARKET ───────────────────────────────────────────────
+  if (id === 'wood_market') {
+    let data = getWoodData(gid, uid);
+    data = regenWoodEnergy(data);
+    const bal         = getBalance(gid, uid).balance;
+    const tierIdx     = Math.min(data.workerTier, WOOD_WORKER_TIERS.length - 1);
+    const tier        = WOOD_WORKER_TIERS[tierIdx];
+    const nextTier    = WOOD_WORKER_TIERS[tierIdx + 1] || null;
+    const allWorkersBought = data.workerTier >= WOOD_WORKER_TIERS.length;
+    const canBuyWorker = !allWorkersBought && data.woodLevel >= tier.minLevel;
+    const maxEnergy   = getWoodMaxEnergy(data);
+    const remaining   = allWorkersBought ? 0 : tier.maxPurchases - data.purchasesInTier;
+
+    const capTierIdx   = Math.min(data.energyCapTier, WOOD_ENERGY_CAP_TIERS.length - 1);
+    const capTier      = WOOD_ENERGY_CAP_TIERS[capTierIdx];
+    const allCapBought = data.energyCapTier >= WOOD_ENERGY_CAP_TIERS.length;
+    const capRemaining = allCapBought ? 0 : capTier.maxPurchases - data.energyCapPurchasesInTier;
+    const totalFoodUses = (data.breadUses || 0) + (data.soupUses || 0) + (data.meatUses || 0);
+    const missing      = maxEnergy - data.energy;
+
+    const workerLines = allWorkersBought
+      ? ['**👷 Oduncu Satın Al**', '  ✅ Maksimum oduncu sayısına ulaştın! (**13 oduncu**)']
+      : [
+          '**👷 Oduncu Satın Al**',
+          `  Fiyat: **${tier.price} coin** | Mevcut: **${data.lumberjacks}** oduncu`,
+          canBuyWorker ? `  ✅ Seviye yeterli (Lv.${data.woodLevel})` : `  ❌ Gereken seviye: Lv.${tier.minLevel}`,
+          `  Bu tier'dan kalan: **${remaining}** alım`,
+          nextTier ? `  Sonraki tier: **${nextTier.price}** coin (Lv.${nextTier.minLevel} gerekli)` : '  📌 Bu son tier',
+        ];
+
+    const capLines = allCapBought
+      ? ['**🔋 Enerji Kapasitesi** — ✅ Maksimum kapasiteye ulaştın! (+250 enerji)']
+      : [
+          `**🔋 Enerji Kapasitesi** — 2000 coin / +5 max enerji`,
+          `  Mevcut max: **${maxEnergy}** | Bu tier'dan kalan: **${capRemaining}** alım`,
+        ];
+
+    const infoLines = [
+      ...workerLines,
+      '',
+      `**⚡ Enerji Doldur** — 2 coin/enerji (tam doldurur)`,
+      `  Mevcut: ${data.energy}/${maxEnergy} | Eksik: ${missing} enerji = ${missing * 2} coin`,
+      '',
+      ...capLines,
+      '',
+      '**🍞 Ekmek** — 50 coin (+10 kullanım hakkı)',
+      '**🍲 Çorba** — 100 coin (+20 kullanım hakkı)',
+      '**🥩 Et** — 300 coin (+40 kullanım hakkı)',
+      `  🍽️ Mevcut yiyecek kullanımı: **${totalFoodUses}**`,
+      '',
+      `💰 Bakiye: **${bal} coin**`,
+    ].join('\n');
+
+    const row1 = new ActionRowBuilder().addComponents(
+      new ButtonBuilder().setCustomId('wood_buy_worker').setLabel('👷 Oduncu Al').setStyle(ButtonStyle.Primary).setDisabled(!canBuyWorker || bal < tier.price),
+      new ButtonBuilder().setCustomId('wood_buy_energy').setLabel('⚡ Enerji Doldur').setStyle(ButtonStyle.Secondary).setDisabled(data.energy >= maxEnergy || bal < missing * 2),
+      new ButtonBuilder().setCustomId('wood_buy_energy_cap').setLabel('🔋 Kapasite +5').setStyle(ButtonStyle.Secondary).setDisabled(allCapBought || bal < 2000),
+    );
+    const row2 = new ActionRowBuilder().addComponents(
+      new ButtonBuilder().setCustomId('wood_buy_bread').setLabel('🍞 Ekmek 50c').setStyle(ButtonStyle.Success).setDisabled(bal < 50 || data.breadUses > 0),
+      new ButtonBuilder().setCustomId('wood_buy_soup').setLabel('🍲 Çorba 100c').setStyle(ButtonStyle.Success).setDisabled(bal < 100 || data.soupUses > 0),
+      new ButtonBuilder().setCustomId('wood_buy_meat').setLabel('🥩 Et 300c').setStyle(ButtonStyle.Success).setDisabled(bal < 300 || data.meatUses > 0),
+    );
+
+    return interaction.reply({ ephemeral: true, content: infoLines, components: [row1, row2] });
+  }
+
+  // ── 👷 ODUNCU SATIN AL ────────────────────────────────────
+  if (id === 'wood_buy_worker') {
+    let data = getWoodData(gid, uid);
+    data = regenWoodEnergy(data);
+
+    if (data.workerTier >= WOOD_WORKER_TIERS.length)
+      return interaction.reply({ ephemeral: true, content: '✅ Zaten maksimum oduncu sayısına ulaştın! (**13 oduncu**)' });
+
+    const tierIdx = Math.min(data.workerTier, WOOD_WORKER_TIERS.length - 1);
+    const tier    = WOOD_WORKER_TIERS[tierIdx];
+    const bal     = getBalance(gid, uid).balance;
+
+    if (data.woodLevel < tier.minLevel)
+      return interaction.reply({ ephemeral: true, content: `❌ Oduncu almak için Odunculuk Lv.**${tier.minLevel}** gerekiyor! (Şu an: Lv.${data.woodLevel})` });
+    if (bal < tier.price)
+      return interaction.reply({ ephemeral: true, content: `❌ Yetersiz coin! Gerekli: **${tier.price}**, Bakiye: **${bal}**` });
+
+    addBalance(gid, uid, -tier.price);
+    data.lumberjacks++;
+    data.purchasesInTier++;
+
+    if (data.purchasesInTier >= tier.maxPurchases) {
+      data.workerTier++;
+      data.purchasesInTier = 0;
+    }
+
+    saveWoodData(gid, uid, data);
+    const newBal = getBalance(gid, uid).balance;
+    const allDone = data.workerTier >= WOOD_WORKER_TIERS.length;
+    const nextInfo = allDone
+      ? '✅ Maksimum oduncu sayısına ulaştın! (13/13)'
+      : (() => {
+          const nt = WOOD_WORKER_TIERS[data.workerTier];
+          return `📌 Sonraki oduncu: **${nt.price}** coin (Lv.${nt.minLevel} gerekli)`;
+        })();
+
+    return interaction.reply({
+      ephemeral: true,
+      content: `✅ Yeni oduncu alındı! Toplam: **${data.lumberjacks}**\n💰 Kalan: **${newBal}** coin\n${nextInfo}`,
+    });
+  }
+
+  // ── ⚡ ENERJİ SATIN AL (tam doldurur) ────────────────────
+  if (id === 'wood_buy_energy') {
+    let data = getWoodData(gid, uid);
+    data = regenWoodEnergy(data);
+    const maxEnergy = getWoodMaxEnergy(data);
+    const bal       = getBalance(gid, uid).balance;
+    const missing   = maxEnergy - data.energy;
+    const cost      = missing * 2;
+
+    if (data.energy >= maxEnergy) return interaction.reply({ ephemeral: true, content: `⚡ Enerji zaten dolu! (${data.energy}/${maxEnergy})` });
+    if (bal < cost)               return interaction.reply({ ephemeral: true, content: `❌ Yetersiz coin! Enerjini doldurmak için **${cost} coin** gerekli (${missing} enerji eksik). Bakiye: **${bal}**` });
+
+    addBalance(gid, uid, -cost);
+    data.energy = maxEnergy;
+
+    data.energyXp += missing;
+    let energyLvlUp = false;
+    while (data.energyXp >= getWoodEnergyXpNeeded(data.energyLevel)) {
+      data.energyXp -= getWoodEnergyXpNeeded(data.energyLevel);
+      data.energyLevel++;
+      energyLvlUp = true;
+    }
+
+    saveWoodData(gid, uid, data);
+    const newMaxE = getWoodMaxEnergy(data);
+    let msg = `✅ Enerji tam dolduruldu! **${data.energy}/${newMaxE}** ⚡\n💰 Harcanan: **${cost} coin** | Kalan: **${getBalance(gid, uid).balance} coin**`;
+    if (energyLvlUp) msg += `\n🎉 **Enerji Lv.${data.energyLevel}!** Maksimum enerji **${newMaxE}** oldu!`;
+    return interaction.reply({ ephemeral: true, content: msg });
+  }
+
+  // ── 🔋 ENERJİ KAPASİTESİ SATIN AL ───────────────────────
+  if (id === 'wood_buy_energy_cap') {
+    let data = getWoodData(gid, uid);
+    data = regenWoodEnergy(data);
+    const bal = getBalance(gid, uid).balance;
+
+    if (data.energyCapTier >= WOOD_ENERGY_CAP_TIERS.length)
+      return interaction.reply({ ephemeral: true, content: '✅ Zaten maksimum enerji kapasitesine ulaştın!' });
+
+    if (bal < 2000)
+      return interaction.reply({ ephemeral: true, content: `❌ Yetersiz coin! Enerji kapasitesi için **2000 coin** gerekli. Bakiye: **${bal}**` });
+
+    addBalance(gid, uid, -2000);
+    data.energyCapPurchasesInTier++;
+    if (data.energyCapPurchasesInTier >= WOOD_ENERGY_CAP_TIERS[data.energyCapTier].maxPurchases) {
+      data.energyCapTier++;
+      data.energyCapPurchasesInTier = 0;
+    }
+
+    saveWoodData(gid, uid, data);
+    const newMaxE = getWoodMaxEnergy(data);
+    const allDone = data.energyCapTier >= WOOD_ENERGY_CAP_TIERS.length;
+    return interaction.reply({
+      ephemeral: true,
+      content: `✅ Enerji kapasitesi yükseltildi! Yeni max enerji: **${newMaxE}**\n💰 Kalan: **${getBalance(gid, uid).balance}** coin${allDone ? '\n🎉 Maksimum kapasiteye ulaştın!' : ''}`,
+    });
+  }
+
+  // ── 🍽️ YEMEK SATIN AL ────────────────────────────────────
+  if (id === 'wood_buy_bread' || id === 'wood_buy_soup' || id === 'wood_buy_meat') {
+    const foodMap  = { wood_buy_bread: 'bread', wood_buy_soup: 'soup', wood_buy_meat: 'meat' };
+    const food     = MINING_FOODS.find(f => f.key === foodMap[id]);
+    const bal      = getBalance(gid, uid).balance;
+
+    if (bal < food.price)
+      return interaction.reply({ ephemeral: true, content: `❌ Yetersiz coin! **${food.emoji} ${food.name}** için **${food.price} coin** gerekli. Bakiye: **${bal}**` });
+
+    let data = getWoodData(gid, uid);
+    const currentUses = food.key === 'bread' ? data.breadUses : food.key === 'soup' ? data.soupUses : data.meatUses;
+    if (currentUses > 0)
+      return interaction.reply({ ephemeral: true, content: `❌ **${food.emoji} ${food.name}** hakkın henüz bitmedi! (**${currentUses}** kullanım kaldı).` });
+
+    addBalance(gid, uid, -food.price);
+    if (food.key === 'bread') data.breadUses += food.uses;
+    else if (food.key === 'soup') data.soupUses += food.uses;
+    else if (food.key === 'meat') data.meatUses += food.uses;
+
+    const totalUses = (data.breadUses || 0) + (data.soupUses || 0) + (data.meatUses || 0);
+    saveWoodData(gid, uid, data);
+    return interaction.reply({
+      ephemeral: true,
+      content: `✅ **${food.emoji} ${food.name}** satın alındı! +**${food.uses}** kullanım hakkı.\n🍽️ Toplam: **${totalUses}** kullanım\n💰 Kalan: **${getBalance(gid, uid).balance}** coin`,
+    });
+  }
+
+  // ── 📖 NASIL OYNANIR? ────────────────────────────────────
+  if (id === 'wood_help') {
+    const embed = new EmbedBuilder()
+      .setTitle('📖 Odunculuk — Nasıl Oynanır?')
+      .setColor(0x27AE60)
+      .addFields(
+        {
+          name: '🪓 Ormana Gönder',
+          value: [
+            'Oduncularını ormana yollar, odun kesersin.',
+            '• Her gezi **işçi başına 1 enerji** harcar',
+            '• Her gezide işçi başına **10 coin** ücret ödenir',
+            '• Her oduncunun **%10 ihtimalle** eli boş dönme şansı var',
+            '• Aç oduncuların verimi **%50 düşer**',
+          ].join('\n'),
+        },
+        {
+          name: '⚡ Enerji',
+          value: [
+            '• Başlangıç: **20 enerji** | Her 2 dakikada **+1** otomatik yenilenir',
+            '• Enerji XP kazanarak Enerji Level atla → max enerji **+1** artar',
+            '• Marketten **2 coin/enerji** ile enerjini tamamen doldurabilirsin',
+            '• 🔋 **Enerji Kapasitesi**: 2000 coin = +5 max enerji (max 50 alım)',
+          ].join('\n'),
+        },
+        {
+          name: '👷 Oduncu Sistemi',
+          value: [
+            '• **Başlangıç:** 2 oduncu (bedava)',
+            '• **1. alım:** 500 coin (Lv.1 gerekli) → 3 oduncu',
+            '• **2-6. alım:** 2000 coin her biri (Lv.10 gerekli) → 8 oduncu',
+            '• **7-11. alım:** 4000 coin her biri (Lv.20 gerekli) → **max 13 oduncu**',
+          ].join('\n'),
+        },
+        {
+          name: '🍽️ Yemek Sistemi',
+          value: [
+            'Yiyecek kullanımı bitince oduncular acıkır → verim yarıya düşer.',
+            '• 🍞 **Ekmek** — 50 coin → **+10 kullanım hakkı**',
+            '• 🍲 **Çorba** — 100 coin → **+20 kullanım hakkı**',
+            '• 🥩 **Et** — 300 coin → **+40 kullanım hakkı**',
+          ].join('\n'),
+        },
+        {
+          name: '🌲 Odun Değerleri',
+          value: [
+            '`Çam` **8** 🪙 | `Meşe` **15** 🪙 | `Huş` **25** 🪙 | `Akçaağaç` **40** 🪙',
+            '`Ceviz` **65** 🪙 | `Kiraz` **100** 🪙 | `Abanoz` **180** 🪙 | `Ejder Ağacı` **350** 🪙',
+          ].join('\n'),
+        },
+        {
+          name: '🏅 Rütbeler',
+          value: '🌱 Acemi (Lv.1) → 🌿 Çırak (Lv.5) → ⚙️ Deneyimli (Lv.10)\n🪓 Kıdemli (Lv.15) → 👑 Usta (Lv.20)',
+        },
+      )
+      .setFooter({ text: '/odunculuk siralama — Sunucu sıralamasını gör' });
+    return interaction.reply({ ephemeral: true, embeds: [embed] });
+  }
+
+  // ── 📊 PROFİL ────────────────────────────────────────────
+  if (id === 'wood_profile') {
+    let data = getWoodData(gid, uid);
+    data = regenWoodEnergy(data);
+    saveWoodData(gid, uid, data);
+
+    const rank      = getWoodRank(data.woodLevel);
+    const maxEnergy = getWoodMaxEnergy(data);
+    const totalFoodUses = (data.breadUses || 0) + (data.soupUses || 0) + (data.meatUses || 0);
+    const isHungry  = totalFoodUses <= 0;
+    const hungryStr = isHungry
+      ? '😫 Aç — marketten yemek al!'
+      : `🍽️ Tok (**${data.breadUses}** 🍞 + **${data.soupUses}** 🍲 + **${data.meatUses}** 🥩 = **${totalFoodUses}** kullanım)`;
+    const capTotalPurchases = data.energyCapTier * 10 + (data.energyCapPurchasesInTier || 0);
+    const tierIdx   = Math.min(data.workerTier, WOOD_WORKER_TIERS.length - 1);
+    const tier      = WOOD_WORKER_TIERS[tierIdx];
+
+    const embed = new EmbedBuilder()
+      .setTitle(`🪓 ${interaction.user.username} — Odunculuk Profili`)
+      .setColor(rank.color)
+      .setThumbnail(interaction.user.displayAvatarURL())
+      .addFields(
+        { name: '🏅 Rütbe',               value: `${rank.emoji} **${rank.name}** Lv.${data.woodLevel}`,                         inline: true },
+        { name: '📈 Odunculuk XP',         value: `${data.woodXp} / ${getWoodXpNeeded(data.woodLevel)}`,                         inline: true },
+        { name: '👷 Oduncu Sayısı',        value: `**${data.lumberjacks}** oduncu`,                                              inline: true },
+        { name: '⚡ Enerji',               value: `**${data.energy}** / ${maxEnergy}`,                                           inline: true },
+        { name: '⚡ Enerji Seviyesi',      value: `Lv.**${data.energyLevel}** (${data.energyXp}/${getWoodEnergyXpNeeded(data.energyLevel)} XP)`, inline: true },
+        { name: '🔋 Enerji Kapasitesi',   value: `**${capTotalPurchases}/50** alım (+${capTotalPurchases * 5} max enerji)`,      inline: true },
+        { name: '🍽️ Oduncu Durumu',      value: hungryStr,                                                                      inline: false },
+        { name: '📦 Toplam Odun',          value: `**${data.totalLogsCut}** adet`,                                               inline: true },
+        { name: '💰 Sonraki Oduncu',       value: data.workerTier < WOOD_WORKER_TIERS.length ? `**${tier.price}** coin (Lv.${tier.minLevel})` : '✅ Maks', inline: true },
+      )
+      .setFooter({ text: 'Rütbeler: Çırak(Lv5) • Deneyimli(Lv10) • Kıdemli(Lv15) • Usta(Lv20)' });
 
     return interaction.reply({ ephemeral: true, embeds: [embed] });
   }
@@ -1789,9 +2481,9 @@ const SLASH_COMMANDS = [
     .setName('balik-sat')
     .setDescription('Envanterindeki tüm balıkları markete sat'),
 
-  // /yirmibir — blackjack
+  // /blackjack — blackjack (21)
   new SlashCommandBuilder()
-    .setName('yirmibir')
+    .setName('blackjack')
     .setDescription('Blackjack (21) oyna — botla')
     .addIntegerOption(o => o.setName('bahis').setDescription('Bahis miktarı').setRequired(true).setMinValue(1)),
 
@@ -1836,6 +2528,13 @@ const SLASH_COMMANDS = [
     .setDescription('Madencilik oyunu komutları')
     .addSubcommand(s => s.setName('panel').setDescription('[OWNER] Madencilik panelini kanala gönder'))
     .addSubcommand(s => s.setName('siralama').setDescription('Madencilik sıralamasını gör')),
+
+  // /odunculuk
+  new SlashCommandBuilder()
+    .setName('odunculuk')
+    .setDescription('Odunculuk oyunu komutları')
+    .addSubcommand(s => s.setName('panel').setDescription('[OWNER] Odunculuk panelini kanala gönder'))
+    .addSubcommand(s => s.setName('siralama').setDescription('Odunculuk sıralamasını gör')),
 
 ].map(c => c.toJSON());
 
@@ -2252,6 +2951,11 @@ client.on('interactionCreate', async interaction => {
       return handleMineButton(interaction);
     }
 
+    // ── ODUNCULUK BUTONLARI ───────────────────────────────────
+    if (interaction.isButton() && interaction.customId.startsWith('wood_')) {
+      return handleWoodButton(interaction);
+    }
+
     if (!interaction.isChatInputCommand()) return;
     const gid = interaction.guild?.id;
     const uid = interaction.user.id;
@@ -2342,7 +3046,7 @@ client.on('interactionCreate', async interaction => {
               '`/yazioyunu bonus` — Günlük +120 coin',
               '`/oyunlar sanskutusu` — Şans kutusu (8 coin)',
               '`/çal @hedef` — Coinini çal',
-              '`/yirmibir bahis:` — Blackjack (botla, 2x / ~%0.1 ihtimalle 5x)',
+              '`/blackjack bahis:` — Blackjack (botla, 2x / ~%0.1 ihtimalle 4x)',
               '`/atyarisi at: bahis:` — At yarışı (paylaşımlı, 2x / ~%0.1 ihtimalle 5x)',
             ].join('\n'),
           },
@@ -3569,9 +4273,9 @@ client.on('interactionCreate', async interaction => {
     }
 
     // ─────────────────────────────────────────────────────────
-    //  /yirmibir — blackjack
+    //  /blackjack
     // ─────────────────────────────────────────────────────────
-    if (cmd === 'yirmibir') {
+    if (cmd === 'blackjack') {
       const bet = interaction.options.getInteger('bahis');
       const bkey = `${gid}:${uid}`;
       if (activeBlackjack.has(bkey)) return interaction.reply({ ephemeral: true, content: '⛔ Zaten aktif bir blackjack elin var.' });
@@ -3661,7 +4365,7 @@ client.on('interactionCreate', async interaction => {
           } catch (err) {
             activeBlackjack.delete(bkey);
             addBalance(gid, uid, bet);
-            sendErrorLog(gid, '/yirmibir (collect)', err);
+            sendErrorLog(gid, '/blackjack (collect)', err);
             m2.edit({ content: '⛔ Bir hata oluştu, el iptal edildi ve bahsin iade edildi.', components: [] }).catch(() => {});
           }
         });
@@ -3676,7 +4380,7 @@ client.on('interactionCreate', async interaction => {
       } catch (err) {
         activeBlackjack.delete(bkey);
         if (betCharged) addBalance(gid, uid, bet);
-        sendErrorLog(gid, '/yirmibir', err);
+        sendErrorLog(gid, '/blackjack', err);
         try {
           if (!interaction.replied && !interaction.deferred) {
             await interaction.reply({ ephemeral: true, content: '⛔ Bir hata oluştu, bahsin iade edildi.' });
@@ -3786,6 +4490,34 @@ client.on('interactionCreate', async interaction => {
           .setColor(0x8B4513)
           .setDescription(lines.join('\n'))
           .setFooter({ text: 'Rütbeler: Bronze(Lv5) • Iron(Lv10) • Gold(Lv15) • Master(Lv20)' });
+        return interaction.reply({ ephemeral: true, embeds: [embed] });
+      }
+    }
+
+    // ─────────────────────────────────────────────────────────
+    //  /odunculuk
+    // ─────────────────────────────────────────────────────────
+    if (cmd === 'odunculuk') {
+      if (sub === 'panel') {
+        if (!hasOwnerAccess(uid, interaction.member)) return interaction.reply({ ephemeral: true, content: '⛔ Sadece bot sahipleri kullanabilir.' });
+        const woodCh = await client.channels.fetch(WOODCUTTING_CHANNEL_ID).catch(() => null);
+        if (!woodCh?.isTextBased()) return interaction.reply({ ephemeral: true, content: `⛔ Odunculuk kanalı bulunamadı (<#${WOODCUTTING_CHANNEL_ID}>).` });
+        await woodCh.send(buildWoodPanel());
+        return interaction.reply({ ephemeral: true, content: `✅ Odunculuk paneli <#${WOODCUTTING_CHANNEL_ID}> kanalına gönderildi!` });
+      }
+
+      if (sub === 'siralama') {
+        const rows = getWoodLeaderboard(gid);
+        if (!rows.length) return interaction.reply({ ephemeral: true, content: '🪓 Henüz kimse odunculuk yapmamış!' });
+        const lines = rows.map((r, i) => {
+          const rank = getWoodRank(r.woodLevel);
+          return `**${i + 1}.** <@${r.userId}> — ${rank.emoji} **${rank.name}** Lv.${r.woodLevel} (${r.totalLogsCut} odun)`;
+        });
+        const embed = new EmbedBuilder()
+          .setTitle('🪓 Odunculuk Sıralaması')
+          .setColor(0x27AE60)
+          .setDescription(lines.join('\n'))
+          .setFooter({ text: 'Rütbeler: Çırak(Lv5) • Deneyimli(Lv10) • Kıdemli(Lv15) • Usta(Lv20)' });
         return interaction.reply({ ephemeral: true, embeds: [embed] });
       }
     }
