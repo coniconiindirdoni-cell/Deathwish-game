@@ -1,4 +1,4 @@
-// ╔══════════════════════════════════════════════════════════════╗
+ant// ╔══════════════════════════════════════════════════════════════╗
 // ║         DeathWish Game Bot — TEK DOSYA                      ║
 // ║  Özellikler: Seviye/XP, Ekonomi, Ses Takibi, Sohbet,       ║
 // ║  Yazı Oyunu, Market, Evlilik, Balıkçılık, Blackjack,        ║
@@ -100,6 +100,7 @@ function ensureSchema() {
     CREATE TABLE IF NOT EXISTS daily_claims (guildId TEXT, userId TEXT, date TEXT, claimType TEXT, PRIMARY KEY(guildId,userId,date,claimType));
     CREATE TABLE IF NOT EXISTS daily_counts (guildId TEXT, userId TEXT, date TEXT, claimType TEXT, count INTEGER DEFAULT 0, PRIMARY KEY(guildId,userId,date,claimType));
     CREATE TABLE IF NOT EXISTS xp_boosts (guildId TEXT, userId TEXT, PRIMARY KEY(guildId,userId));
+    CREATE TABLE IF NOT EXISTS coin_boosts (guildId TEXT, userId TEXT, PRIMARY KEY(guildId,userId));
     CREATE TABLE IF NOT EXISTS message_counts (guildId TEXT, channelId TEXT, userId TEXT, date TEXT, count INTEGER DEFAULT 0, PRIMARY KEY(guildId,channelId,userId,date));
     CREATE TABLE IF NOT EXISTS market_roles (guildId TEXT, roleId TEXT, price INTEGER, isPremium INTEGER DEFAULT 0, PRIMARY KEY(guildId,roleId));
     CREATE TABLE IF NOT EXISTS level_data (guildId TEXT, userId TEXT, xp INTEGER DEFAULT 0, level INTEGER DEFAULT 0, PRIMARY KEY(guildId,userId));
@@ -198,6 +199,42 @@ function ensureSchema() {
   if (!miningCols.includes('meatUses'))               db.exec('ALTER TABLE mining_data ADD COLUMN meatUses INTEGER DEFAULT 0');
   if (!miningCols.includes('energyCapTier'))          db.exec('ALTER TABLE mining_data ADD COLUMN energyCapTier INTEGER DEFAULT 0');
   if (!miningCols.includes('energyCapPurchasesInTier')) db.exec('ALTER TABLE mining_data ADD COLUMN energyCapPurchasesInTier INTEGER DEFAULT 0');
+
+  // ── Yeni sistemler: Pet, Antika, Kraliyet, Mülk ────────────
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS pets (
+      guildId TEXT, userId TEXT, petKey TEXT, level INTEGER DEFAULT 1,
+      PRIMARY KEY(guildId, userId, petKey)
+    );
+    CREATE TABLE IF NOT EXISTS active_pet (
+      guildId TEXT, userId TEXT, petKey TEXT,
+      PRIMARY KEY(guildId, userId)
+    );
+    CREATE TABLE IF NOT EXISTS antique_inventory (
+      guildId TEXT, userId TEXT, antiqueKey TEXT, count INTEGER DEFAULT 0,
+      PRIMARY KEY(guildId, userId, antiqueKey)
+    );
+    CREATE TABLE IF NOT EXISTS active_antique (
+      guildId TEXT, userId TEXT, antiqueKey TEXT,
+      PRIMARY KEY(guildId, userId)
+    );
+    CREATE TABLE IF NOT EXISTS antique_upgrades (
+      guildId TEXT, userId TEXT, antiqueKey TEXT, upgradeLevel INTEGER DEFAULT 0,
+      PRIMARY KEY(guildId, userId, antiqueKey)
+    );
+    CREATE TABLE IF NOT EXISTS royal_items (
+      guildId TEXT, itemKey TEXT, ownerId TEXT, price INTEGER DEFAULT 2000,
+      PRIMARY KEY(guildId, itemKey)
+    );
+    CREATE TABLE IF NOT EXISTS properties (
+      guildId TEXT, userId TEXT, houseLevel INTEGER DEFAULT 0, carLevel INTEGER DEFAULT 0,
+      PRIMARY KEY(guildId, userId)
+    );
+    CREATE TABLE IF NOT EXISTS daily_antique_market (
+      guildId TEXT, date TEXT, antique1 TEXT, antique2 TEXT,
+      PRIMARY KEY(guildId, date)
+    );
+  `);
 }
 
 function initDatabase() {
@@ -564,6 +601,8 @@ function incDailyCount(gid, uid, date, type, n = 1) { db.prepare('INSERT OR IGNO
 
 function hasBoost(gid, uid)            { return !!db.prepare('SELECT 1 FROM xp_boosts WHERE guildId=? AND userId=?').get(gid, uid); }
 function setBoost(gid, uid)            { db.prepare('INSERT OR IGNORE INTO xp_boosts(guildId,userId)VALUES(?,?)').run(gid, uid); }
+function hasCoinBoost(gid, uid)        { return !!db.prepare('SELECT 1 FROM coin_boosts WHERE guildId=? AND userId=?').get(gid, uid); }
+function setCoinBoost(gid, uid)        { db.prepare('INSERT OR IGNORE INTO coin_boosts(guildId,userId)VALUES(?,?)').run(gid, uid); }
 
 function addMsgCount(gid, cid, uid, date) { db.prepare('INSERT OR IGNORE INTO message_counts(guildId,channelId,userId,date,count)VALUES(?,?,?,?,0)').run(gid, cid, uid, date); db.prepare('UPDATE message_counts SET count=count+1 WHERE guildId=? AND channelId=? AND userId=? AND date=?').run(gid, cid, uid, date); }
 function getMsgCount(gid, cid, uid, date) { const r = db.prepare('SELECT count FROM message_counts WHERE guildId=? AND channelId=? AND userId=? AND date=?').get(gid, cid, uid, date); return r ? r.count : 0; }
@@ -575,11 +614,29 @@ function addMarketRole(gid, rid, price, prem) { db.prepare('INSERT OR REPLACE IN
 function removeMarketRole(gid, rid)    { db.prepare('DELETE FROM market_roles WHERE guildId=? AND roleId=?').run(gid, rid); }
 
 function getLevel(gid, uid)            { return db.prepare('SELECT xp,level FROM level_data WHERE guildId=? AND userId=?').get(gid, uid) || { xp: 0, level: 0 }; }
-function addXp(gid, uid, amt)          { db.prepare('INSERT OR IGNORE INTO level_data(guildId,userId,xp,level)VALUES(?,?,0,0)').run(gid, uid); db.prepare('UPDATE level_data SET xp=xp+? WHERE guildId=? AND userId=?').run(amt, gid, uid); const d = getLevel(gid, uid); const needed = Math.round((d.level + 1) * 100 * 0.595); if (d.xp >= needed) { db.prepare('UPDATE level_data SET level=level+1,xp=xp-? WHERE guildId=? AND userId=?').run(needed, gid, uid); return { leveled: true, newLevel: d.level + 1, xpGained: amt }; } return { leveled: false, xpGained: amt }; }
+function addXp(gid, uid, amt) {
+  db.prepare('INSERT OR IGNORE INTO level_data(guildId,userId,xp,level)VALUES(?,?,0,0)').run(gid, uid);
+  const d = getLevel(gid, uid);
+  if (d.level >= NORMAL_MAX_LEVEL) return { leveled: false, xpGained: 0, coinReward: 0 };
+  db.prepare('UPDATE level_data SET xp=xp+? WHERE guildId=? AND userId=?').run(amt, gid, uid);
+  const d2 = getLevel(gid, uid);
+  const needed = Math.round((d2.level + 1) * 100 * 0.7809375);
+  if (d2.xp >= needed && d2.level < NORMAL_MAX_LEVEL) {
+    const newLevel = d2.level + 1;
+    db.prepare('UPDATE level_data SET level=level+1,xp=xp-? WHERE guildId=? AND userId=?').run(needed, gid, uid);
+    const coinReward = getLevelUpCoinReward(newLevel);
+    addBalance(gid, uid, coinReward);
+    if (newLevel >= NORMAL_MAX_LEVEL) {
+      db.prepare('UPDATE level_data SET xp=0 WHERE guildId=? AND userId=?').run(gid, uid);
+    }
+    return { leveled: true, newLevel, xpGained: amt, coinReward };
+  }
+  return { leveled: false, xpGained: amt, coinReward: 0 };
+}
 function topLevels(gid, n = 10)        { return db.prepare('SELECT userId,level,xp FROM level_data WHERE guildId=? ORDER BY level DESC,xp DESC LIMIT ?').all(gid, n); }
 
 // ── Yeni özellik yardımcıları ───────────────────────────────────
-// Hırsızlık Kalkanı (45 coin, 4 saat, /oyunlar cal komutundan korur)
+// Hırsızlık Kalkanı (450 coin, 4 saat, /oyunlar cal komutundan korur)
 function hasShield(gid, uid) {
   const r = db.prepare('SELECT expiresAt FROM theft_shields WHERE guildId=? AND userId=?').get(gid, uid);
   if (!r) return false;
@@ -601,13 +658,13 @@ function consumeTempBoost(gid, uid) {
   return true;
 }
 
-// Kalıcı (2x) + geçici (2x) boostları birleştiren çarpan.
-// consume=true olduğunda (gerçek bir ödül verilirken) geçici boost hakkı 1 azalır.
-// Sadece durum göstermek için (ör. /voice durum) consume=false kullan.
+// Ses ödülleri için kullanılan genel çarpan (kalıcı boost 1.5x).
+// Kalıcı XP Boost günlük ve coin ödüllerini ETKİLEMEZ — bunlar için
+// getTotalCoinBonusPct / getTotalDailyBonusPct kullanılır.
 function getBoostMultiplier(gid, uid, consume = true) {
   let m = 1;
-  if (hasBoost(gid, uid)) m *= 2;
-  if (hasTempBoost(gid, uid)) {
+  if (hasBoost(gid, uid)) m *= 1.5;
+  else if (hasTempBoost(gid, uid)) {
     m *= 2;
     if (consume) consumeTempBoost(gid, uid);
   }
@@ -624,14 +681,14 @@ function createBankAccount(gid, uid) {
 }
 
 // Komutlardan hangilerinin banka hesabı olmadan da çalışabileceği (yönetimsel/owner komutları)
-const BANK_EXEMPT_COMMANDS = new Set(['setup', 'yardim', 'banka', 'verikaydet', 'backuplist', 'veriyukle', 'backupsil', 'madencilik', 'odunculuk']);
+const BANK_EXEMPT_COMMANDS = new Set(['setup', 'yardim', 'banka', 'verikaydet', 'backuplist', 'veriyukle', 'backupsil', 'madencilik', 'odunculuk', 'hakkimda', 'siralama', 'mulk-siralama']);
 
 // İsim Rengi Rolleri (admin /setup üzerinden ekler, kullanıcı /renk al ile satın alır)
 function getColorRoles(gid)              { return db.prepare('SELECT * FROM color_roles WHERE guildId=?').all(gid); }
 function addColorRole(gid, rid, price = 4000) { db.prepare('INSERT OR REPLACE INTO color_roles(guildId,roleId,price)VALUES(?,?,?)').run(gid, rid, price); }
 function removeColorRole(gid, rid)       { db.prepare('DELETE FROM color_roles WHERE guildId=? AND roleId=?').run(gid, rid); }
 
-// Sohbet — her 2 mesajda 1 coin (pasif, otomatik, günlük görev sistemi yerine)
+// Sohbet — her 2 mesajda 8 coin (pasif, otomatik, günlük görev sistemi yerine)
 function incChatCoinCounter(gid, uid) {
   db.prepare('INSERT OR IGNORE INTO chat_coin_counter(guildId,userId,count)VALUES(?,?,0)').run(gid, uid);
   db.prepare('UPDATE chat_coin_counter SET count=count+1 WHERE guildId=? AND userId=?').run(gid, uid);
@@ -670,6 +727,180 @@ const LEVEL_ROLE_REWARDS = {
   55: '1524885000112177203',
   70: '1524886153873068092',
 };
+
+// Normal seviye sistemi max seviyesi
+const NORMAL_MAX_LEVEL = 100;
+
+// Seviye atlandığında verilecek coin ödülü
+function getLevelUpCoinReward(level) {
+  if (level >= 40) return 700;
+  if (level >= 30) return 500;
+  if (level >= 20) return 300;
+  if (level >= 10) return 200;
+  return 100;
+}
+
+// ──────────────────────────────────────────────────────────────
+//  ANTİKA SİSTEMİ
+// ──────────────────────────────────────────────────────────────
+const ANTIQUES = [
+  // Normal antikalar (7 adet) — 4600 coin, +5% XP, +5% Coin
+  { key: 'vaz',      name: 'Eski Vazo',       emoji: '🏺', rarity: 'normal',   price: 4600,  xpBonus: 5,  coinBonus: 5,  dailyBonus: 0  },
+  { key: 'saat',     name: 'Eskitme Saat',    emoji: '⏰', rarity: 'normal',   price: 4600,  xpBonus: 5,  coinBonus: 5,  dailyBonus: 0  },
+  { key: 'tablo',    name: 'Antika Tablo',    emoji: '🖼️', rarity: 'normal',   price: 4600,  xpBonus: 5,  coinBonus: 5,  dailyBonus: 0  },
+  { key: 'radyo',    name: 'Eski Radyo',      emoji: '📻', rarity: 'normal',   price: 4600,  xpBonus: 5,  coinBonus: 5,  dailyBonus: 0  },
+  { key: 'kazan',    name: 'Bakır Kazan',     emoji: '🫕', rarity: 'normal',   price: 4600,  xpBonus: 5,  coinBonus: 5,  dailyBonus: 0  },
+  { key: 'anahtar',  name: 'Eski Anahtar',    emoji: '🗝️', rarity: 'normal',   price: 4600,  xpBonus: 5,  coinBonus: 5,  dailyBonus: 0  },
+  { key: 'heykel',   name: 'Taş Heykel',      emoji: '🗿', rarity: 'normal',   price: 4600,  xpBonus: 5,  coinBonus: 5,  dailyBonus: 0  },
+  // Nadir antikalar (5 adet, %5 çıkma şansı) — 10000 coin, +10% XP, +10% Coin
+  { key: 'samdan',   name: 'Gümüş Şamdan',   emoji: '🕯️', rarity: 'uncommon', price: 10000, xpBonus: 10, coinBonus: 10, dailyBonus: 0  },
+  { key: 'kilic',    name: 'Osmanlı Kılıcı',  emoji: '⚔️', rarity: 'uncommon', price: 10000, xpBonus: 10, coinBonus: 10, dailyBonus: 0  },
+  { key: 'pipo',     name: 'Antika Pipo',     emoji: '🪈', rarity: 'uncommon', price: 10000, xpBonus: 10, coinBonus: 10, dailyBonus: 0  },
+  { key: 'kristal',  name: 'Kristal Top',     emoji: '🔮', rarity: 'uncommon', price: 10000, xpBonus: 10, coinBonus: 10, dailyBonus: 0  },
+  { key: 'yazma',    name: 'Eski Yazma',      emoji: '📜', rarity: 'uncommon', price: 10000, xpBonus: 10, coinBonus: 10, dailyBonus: 0  },
+  // Çok nadir antikalar (3 adet, %1 çıkma şansı) — 22500 coin, +20% XP, +20% Coin, +10% Günlük
+  { key: 'madalyon', name: 'Altın Madalyon',  emoji: '🏅', rarity: 'rare',     price: 22500, xpBonus: 20, coinBonus: 20, dailyBonus: 10 },
+  { key: 'bros',     name: 'Elmas Broş',      emoji: '💎', rarity: 'rare',     price: 22500, xpBonus: 20, coinBonus: 20, dailyBonus: 10 },
+  { key: 'asa',      name: 'Kutsal Asa',      emoji: '🪄', rarity: 'rare',     price: 22500, xpBonus: 20, coinBonus: 20, dailyBonus: 10 },
+];
+
+// Günlük antika marketi ağırlıkları
+const ANTIQUE_WEIGHTS = { normal: 94 / 7, uncommon: 5 / 5, rare: 1 / 3 };
+
+function pickDailyAntique(exclude = []) {
+  const pool = ANTIQUES.filter(a => !exclude.includes(a.key));
+  const totalW = pool.reduce((s, a) => s + ANTIQUE_WEIGHTS[a.rarity], 0);
+  let r = Math.random() * totalW;
+  for (const a of pool) { r -= ANTIQUE_WEIGHTS[a.rarity]; if (r <= 0) return a; }
+  return pool[0];
+}
+function getDailyAntiqueMarket(gid) {
+  const date = todayTR();
+  const row = db.prepare('SELECT antique1, antique2 FROM daily_antique_market WHERE guildId=? AND date=?').get(gid, date);
+  if (row) return [ANTIQUES.find(a => a.key === row.antique1), ANTIQUES.find(a => a.key === row.antique2)].filter(Boolean);
+  const a1 = pickDailyAntique(); const a2 = pickDailyAntique([a1.key]);
+  db.prepare('INSERT OR REPLACE INTO daily_antique_market(guildId,date,antique1,antique2)VALUES(?,?,?,?)').run(gid, date, a1.key, a2.key);
+  return [a1, a2];
+}
+function getAntiqueInventory(gid, uid) {
+  return db.prepare('SELECT antiqueKey, count FROM antique_inventory WHERE guildId=? AND userId=? AND count>0').all(gid, uid);
+}
+function addAntique(gid, uid, key) {
+  db.prepare('INSERT OR IGNORE INTO antique_inventory(guildId,userId,antiqueKey,count)VALUES(?,?,?,0)').run(gid, uid, key);
+  db.prepare('UPDATE antique_inventory SET count=count+1 WHERE guildId=? AND userId=? AND antiqueKey=?').run(gid, uid, key);
+}
+function getActiveAntique(gid, uid) {
+  const r = db.prepare('SELECT antiqueKey FROM active_antique WHERE guildId=? AND userId=?').get(gid, uid);
+  return r ? (ANTIQUES.find(a => a.key === r.antiqueKey) || null) : null;
+}
+function setActiveAntique(gid, uid, key) { db.prepare('INSERT OR REPLACE INTO active_antique(guildId,userId,antiqueKey)VALUES(?,?,?)').run(gid, uid, key); }
+function clearActiveAntique(gid, uid)    { db.prepare('DELETE FROM active_antique WHERE guildId=? AND userId=?').run(gid, uid); }
+function getAntiqueUpgradeLevel(gid, uid, key) {
+  const r = db.prepare('SELECT upgradeLevel FROM antique_upgrades WHERE guildId=? AND userId=? AND antiqueKey=?').get(gid, uid, key);
+  return r ? r.upgradeLevel : 0;
+}
+function setAntiqueUpgradeLevel(gid, uid, key, level) {
+  db.prepare('INSERT OR REPLACE INTO antique_upgrades(guildId,userId,antiqueKey,upgradeLevel)VALUES(?,?,?,?)').run(gid, uid, key, level);
+}
+function getAntiqueWithUpgrade(gid, uid) {
+  const a = getActiveAntique(gid, uid);
+  if (!a) return null;
+  const upg = getAntiqueUpgradeLevel(gid, uid, a.key);
+  return { ...a, xpBonus: a.xpBonus + upg * 5, coinBonus: a.coinBonus + upg * 5, dailyBonus: a.dailyBonus + upg * 5, upgradeLevel: upg };
+}
+function getAntiqueXpBonus(gid, uid)     { const a = getAntiqueWithUpgrade(gid, uid); return a ? a.xpBonus : 0; }
+function getAntiqueCoinBonus(gid, uid)   { const a = getAntiqueWithUpgrade(gid, uid); return a ? a.coinBonus : 0; }
+function getAntiqueDailyBonus(gid, uid)  { const a = getAntiqueWithUpgrade(gid, uid); return a ? a.dailyBonus : 0; }
+
+// ──────────────────────────────────────────────────────────────
+//  KRALİYET SİSTEMİ
+// ──────────────────────────────────────────────────────────────
+const ROYAL_ITEMS = [
+  { key: 'kral_taci',    name: 'Kral Tacı',          emoji: '👑' },
+  { key: 'kralice_taci', name: 'Kraliçe Tacı',        emoji: '👑' },
+  { key: 'pelerin',      name: 'Kraliyet Pelerini',   emoji: '🧥' },
+  { key: 'mucevher',     name: 'Kraliyet Mücevheri',  emoji: '💎' },
+];
+function getRoyalItem(gid, itemKey) {
+  return db.prepare('SELECT ownerId, price FROM royal_items WHERE guildId=? AND itemKey=?').get(gid, itemKey) || { ownerId: null, price: 2000 };
+}
+function buyRoyalItem(gid, itemKey, buyerId) {
+  const cur = getRoyalItem(gid, itemKey);
+  db.prepare('INSERT OR REPLACE INTO royal_items(guildId,itemKey,ownerId,price)VALUES(?,?,?,?)').run(gid, itemKey, buyerId, cur.price + 1000);
+  return { prevOwner: cur.ownerId, price: cur.price };
+}
+function getUserRoyalItems(gid, uid) {
+  return ROYAL_ITEMS.filter(ri => { const r = db.prepare('SELECT ownerId FROM royal_items WHERE guildId=? AND itemKey=?').get(gid, ri.key); return r && r.ownerId === uid; });
+}
+
+// ──────────────────────────────────────────────────────────────
+//  MÜLK SİSTEMİ
+// ──────────────────────────────────────────────────────────────
+const PROPERTY_MAX_LEVEL = 15;
+const PROPERTY_COST = 5000;
+function getProperties(gid, uid) {
+  return db.prepare('SELECT houseLevel, carLevel FROM properties WHERE guildId=? AND userId=?').get(gid, uid) || { houseLevel: 0, carLevel: 0 };
+}
+function saveProperties(gid, uid, houseLevel, carLevel) {
+  db.prepare('INSERT OR IGNORE INTO properties(guildId,userId,houseLevel,carLevel)VALUES(?,?,0,0)').run(gid, uid);
+  db.prepare('UPDATE properties SET houseLevel=?, carLevel=? WHERE guildId=? AND userId=?').run(houseLevel, carLevel, gid, uid);
+}
+function getPropertyLeaderboard(gid) {
+  return db.prepare('SELECT userId, houseLevel, carLevel FROM properties WHERE guildId=? ORDER BY (houseLevel+carLevel) DESC LIMIT 10').all(gid);
+}
+
+// ──────────────────────────────────────────────────────────────
+//  PET SİSTEMİ
+// ──────────────────────────────────────────────────────────────
+const PETS = [
+  { key: 'kedi',   name: 'Kedi',   emoji: '🐱', price: 4500, bonusType: 'xp',    bonusBase: 10 },
+  { key: 'kopek',  name: 'Köpek',  emoji: '🐶', price: 4500, bonusType: 'coin',  bonusBase: 10 },
+  { key: 'baykus', name: 'Baykuş', emoji: '🦉', price: 6300, bonusType: 'daily', bonusBase: 10 },
+];
+const PET_UPGRADE_COSTS = [0, 2000, 2500, 3000, 3500]; // Lv1→Lv2=2000, …, Lv4→Lv5=3500
+const PET_MAX_LEVEL = 5;
+const PET_BONUS_PER_LEVEL = 4; // her seviyede +4%
+
+function getPetBonusByLevel(petDef, level) { return petDef.bonusBase + (level - 1) * PET_BONUS_PER_LEVEL; }
+function getPetRows(gid, uid) { return db.prepare('SELECT petKey, level FROM pets WHERE guildId=? AND userId=?').all(gid, uid); }
+function hasPet(gid, uid, petKey) { return !!db.prepare('SELECT 1 FROM pets WHERE guildId=? AND userId=? AND petKey=?').get(gid, uid, petKey); }
+function buyPet(gid, uid, petKey) { db.prepare('INSERT OR IGNORE INTO pets(guildId,userId,petKey,level)VALUES(?,?,?,1)').run(gid, uid, petKey); }
+function getPetLevel(gid, uid, petKey) { const r = db.prepare('SELECT level FROM pets WHERE guildId=? AND userId=? AND petKey=?').get(gid, uid, petKey); return r ? r.level : 0; }
+function upgradePet(gid, uid, petKey) { db.prepare('UPDATE pets SET level=level+1 WHERE guildId=? AND userId=? AND petKey=?').run(gid, uid, petKey); }
+function getActivePet(gid, uid) {
+  const r = db.prepare('SELECT petKey FROM active_pet WHERE guildId=? AND userId=?').get(gid, uid);
+  if (!r) return null;
+  const def = PETS.find(p => p.key === r.petKey); if (!def) return null;
+  const lv = getPetLevel(gid, uid, r.petKey);
+  return { ...def, level: lv };
+}
+function setActivePet(gid, uid, petKey) { db.prepare('INSERT OR REPLACE INTO active_pet(guildId,userId,petKey)VALUES(?,?,?)').run(gid, uid, petKey); }
+function clearActivePet(gid, uid)        { db.prepare('DELETE FROM active_pet WHERE guildId=? AND userId=?').run(gid, uid); }
+function getPetXpBonus(gid, uid)    { const p = getActivePet(gid, uid); return (p && p.bonusType === 'xp')    ? getPetBonusByLevel(p, p.level) : 0; }
+function getPetCoinBonus(gid, uid)  { const p = getActivePet(gid, uid); return (p && p.bonusType === 'coin')  ? getPetBonusByLevel(p, p.level) : 0; }
+function getPetDailyBonus(gid, uid) { const p = getActivePet(gid, uid); return (p && p.bonusType === 'daily') ? getPetBonusByLevel(p, p.level) : 0; }
+
+// ──────────────────────────────────────────────────────────────
+//  ÇAPRAZ BOOST HESAPLAMA
+// ──────────────────────────────────────────────────────────────
+// XP çarpanı — YALNIZCA normal seviye sistemi, madencilik XP'sini etkilemez
+function getXpMultiplier(gid, uid, consume = true) {
+  let m = 1.0;
+  if (hasBoost(gid, uid)) {
+    m *= 1.5; // Kalıcı XP Boost artık 1.5x
+  } else if (hasTempBoost(gid, uid)) {
+    m *= 2.0;
+    if (consume) consumeTempBoost(gid, uid);
+  }
+  m += (getAntiqueXpBonus(gid, uid) + getPetXpBonus(gid, uid)) / 100;
+  return m;
+}
+
+// Coin bonus % (chat coin, madencilik satışı vb.)
+function getTotalCoinBonusPct(gid, uid) { return getAntiqueCoinBonus(gid, uid) + getPetCoinBonus(gid, uid) + (hasCoinBoost(gid, uid) ? 50 : 0); }
+
+// Günlük ödül bonus % (yalnızca %1 antika + baykuş pet)
+function getTotalDailyBonusPct(gid, uid) { return getAntiqueDailyBonus(gid, uid) + getPetDailyBonus(gid, uid); }
 
 // ── Tarih / Saat yardımcıları ─────────────────────────────────
 function todayTR()    { return new Date().toLocaleDateString('tr-TR', { timeZone: 'Europe/Istanbul' }).split('.').reverse().join('-'); }
@@ -964,8 +1195,7 @@ const dailyTypingWins   = new Map();
 const activeSteals      = new Set();
 const proposalCooldown  = new Map();
 const voiceJoinTimes    = new Map();
-const voiceDailySec     = new Map();
-const voiceDailyClaimed = new Map();
+// (voiceDailySec ve voiceDailyClaimed kaldırıldı — tier sistemi yerine çıkışta dakika başına 2 coin ödeniyor)
 const voiceSystemPaused = new Set(); // guild id'leri — ses takibi kapalı olanlar
 let stealUseCounter     = 0;
 
@@ -1069,15 +1299,23 @@ function getMiningMaxEnergy(data) {
   const capBonus = (data.energyCapTier * 5 * 5) + (data.energyCapPurchasesInTier * 5);
   return 19 + (data.energyLevel ?? 1) + capBonus;
 }
-function getMiningCapacity(level)   { return level >= 20 ? 5 : level >= 10 ? 3 : 2; }
+function getMiningCapacity(level)   { return level >= 40 ? 8 : level >= 30 ? 7 : level >= 20 ? 5 : level >= 10 ? 3 : 2; }
 function getMiningXpNeeded(level)   { return level * 3; }
 function getEnergyXpNeeded(level)   { return level * 10; }
 
+const MINING_MAX_LEVEL = 50;
+
 function getMiningRank(level) {
-  if (level >= 20) return { name: 'Master', emoji: '👑', color: 0xE74C3C };
-  if (level >= 15) return { name: 'Gold',   emoji: '🥇', color: 0xF1C40F };
-  if (level >= 10) return { name: 'Iron',   emoji: '⚙️', color: 0x95A5A6 };
-  if (level >= 5)  return { name: 'Bronze', emoji: '🥉', color: 0xCD7F32 };
+  if (level >= 50) return { name: 'Challenger', emoji: '🔥', color: 0xFF0000 };
+  if (level >= 45) return { name: 'Legendary',  emoji: '⭐', color: 0xFF6B00 };
+  if (level >= 40) return { name: 'Grandmaster',emoji: '🏆', color: 0x9B59B6 };
+  if (level >= 35) return { name: 'Diamond',    emoji: '💎', color: 0x00BFFF };
+  if (level >= 30) return { name: 'Emerald',    emoji: '💚', color: 0x2ECC71 };
+  if (level >= 25) return { name: 'Platinum',   emoji: '🔮', color: 0x1ABC9C };
+  if (level >= 20) return { name: 'Master',     emoji: '👑', color: 0xE74C3C };
+  if (level >= 15) return { name: 'Gold',       emoji: '🥇', color: 0xF1C40F };
+  if (level >= 10) return { name: 'Iron',       emoji: '⚙️', color: 0x95A5A6 };
+  if (level >= 5)  return { name: 'Bronze',     emoji: '🥉', color: 0xCD7F32 };
   return { name: 'Beginner', emoji: '⛏️', color: 0x3498DB };
 }
 
@@ -1135,7 +1373,7 @@ function buildMiningPanel() {
       { name: '🛒 Market',         value: 'İşçi, enerji ve yemek satın al',       inline: true },
       { name: '📊 Profil',         value: 'Madencilik istatistiklerini gör',      inline: true },
     )
-    .setFooter({ text: 'Başlangıç: 2 işçi | Rütbeler: Bronze(Lv5) • Iron(Lv10) • Gold(Lv15) • Master(Lv20)' });
+    .setFooter({ text: 'Başlangıç: 2 işçi | Rütbeler: Bronze(Lv5) • Iron(Lv10) • Gold(Lv15) • Master(Lv20) • Platinum(Lv25) • Emerald(Lv30) • Diamond(Lv35) • Grandmaster(Lv40) • Legendary(Lv45) • Challenger(Lv50)' });
 
   const row1 = new ActionRowBuilder().addComponents(
     new ButtonBuilder().setCustomId('mine_dig').setLabel('⛏️ Madene Gönder').setStyle(ButtonStyle.Primary),
@@ -1207,13 +1445,19 @@ async function handleMineButton(interaction) {
     for (const ore of results) addMiningOre(gid, uid, ore.key, 1);
     data.totalOresMined += effectiveSend;
 
-    // Madencilik XP
-    data.miningXp += effectiveSend;
+    // Madencilik XP (maks seviye: 50 — Challenger)
     let leveledUp = false;
-    while (data.miningXp >= getMiningXpNeeded(data.miningLevel)) {
-      data.miningXp -= getMiningXpNeeded(data.miningLevel);
-      data.miningLevel++;
-      leveledUp = true;
+    if (data.miningLevel < MINING_MAX_LEVEL) {
+      data.miningXp += effectiveSend;
+      while (data.miningXp >= getMiningXpNeeded(data.miningLevel) && data.miningLevel < MINING_MAX_LEVEL) {
+        data.miningXp -= getMiningXpNeeded(data.miningLevel);
+        data.miningLevel++;
+        leveledUp = true;
+      }
+      // Maks seviyeye ulaşıldıysa XP'yi sıfırla
+      if (data.miningLevel >= MINING_MAX_LEVEL) {
+        data.miningXp = 0;
+      }
     }
 
     saveMiningData(gid, uid, data);
@@ -1232,12 +1476,13 @@ async function handleMineButton(interaction) {
         { name: '🏭 Çıkarılan Madenler',  value: oreLines,                                               inline: true },
         { name: '👷 Gönderilen İşçi',     value: `**${effectiveSend}** / ${data.miners}${isHungry ? ' *(aç 😫)*' : ''}`, inline: true },
         { name: '⚡ Kalan Enerji',         value: `**${data.energy}** / ${maxEnergy}`,                    inline: true },
-        { name: '🏅 Rütbe / Seviye',       value: `${rank.emoji} **${rank.name}** Lv.${data.miningLevel}`, inline: true },
-        { name: '📈 Madencilik XP',        value: `${data.miningXp} / ${getMiningXpNeeded(data.miningLevel)}`, inline: true },
+        { name: '🏅 Rütbe / Seviye',       value: `${rank.emoji} **${rank.name}** Lv.${data.miningLevel}${data.miningLevel >= MINING_MAX_LEVEL ? ' 🔥 MAX' : ''}`, inline: true },
+        { name: '📈 Madencilik XP',        value: data.miningLevel >= MINING_MAX_LEVEL ? '**MAX SEVİYE** 🔥' : `${data.miningXp} / ${getMiningXpNeeded(data.miningLevel)}`, inline: true },
         { name: '🍽️ İşçi Durumu',        value: foodStr,                                                 inline: true },
       );
 
-    if (leveledUp)    embed.addFields({ name: '🎉 SEVİYE ATLADI!',    value: `Madencilik Lv.**${data.miningLevel}** oldun!`,                    inline: false });
+    if (leveledUp && data.miningLevel < MINING_MAX_LEVEL) embed.addFields({ name: '🎉 SEVİYE ATLADI!', value: `Madencilik Lv.**${data.miningLevel}** oldun! ${getMiningRank(data.miningLevel).emoji} **${getMiningRank(data.miningLevel).name}**`, inline: false });
+    if (leveledUp && data.miningLevel >= MINING_MAX_LEVEL) embed.addFields({ name: '🏆 MAKSİMUM SEVİYE!', value: `🔥 **Challenger** oldun! Lv.50 — Madenciliğin zirvesine ulaştın! Artık XP kazanımı durdu.`, inline: false });
     if (justRanOut)   embed.addFields({ name: '🍽️ Yiyecek Bitti!',   value: 'Tüm yiyecek kullanımları tükendi! Marketten yenisini al.',       inline: false });
     if (isHungry)     embed.addFields({ name: '😫 İşçiler Aç!',       value: 'Yiyecek yok — verimlilik %50 düştü! Marketten yemek al.',        inline: false });
 
@@ -1322,13 +1567,17 @@ async function handleMineButton(interaction) {
       lines.push(`${ore.emoji} ${ore.name} × ${r.amount} = ${earned} coin`);
     }
     clearMiningInventory(gid, uid);
-    addBalance(gid, uid, totalValue);
+    // Madencilik satış değeri %25 azaltıldı
+    const mineCoinsRaw = Math.floor(totalValue * 0.75);
+    const mineBonus    = getTotalCoinBonusPct(gid, uid);
+    const mineEarned   = Math.round(mineCoinsRaw * (1 + mineBonus / 100));
+    addBalance(gid, uid, mineEarned);
 
     const embed = new EmbedBuilder()
       .setTitle('💰 Madenler Satıldı!')
       .setColor(0x2ECC71)
       .setDescription(lines.join('\n'))
-      .addFields({ name: '💰 Kazanılan', value: `**+${totalValue} coin**`, inline: true },
+      .addFields({ name: '💰 Kazanılan', value: `**+${mineEarned} coin**${mineBonus > 0 ? ` (+%${mineBonus} coin bonusu)` : ''}`, inline: true },
                  { name: '💳 Yeni Bakiye', value: `**${getBalance(gid, uid).balance} coin**`, inline: true });
 
     return interaction.reply({ ephemeral: true, embeds: [embed] });
@@ -1596,10 +1845,12 @@ async function handleMineButton(interaction) {
           ].join('\n'),
         },
         {
-          name: '🏅 Rütbeler',
+          name: '🏅 Rütbeler (Her 5 seviyede yeni rütbe)',
           value: [
-            '⛏️ Beginner (Lv.1) → 🥉 Bronze (Lv.5) → ⚙️ Iron (Lv.10)',
-            '🥇 Gold (Lv.15) → 👑 Master (Lv.20)',
+            '⛏️ Beginner(Lv1) → 🥉 Bronze(Lv5) → ⚙️ Iron(Lv10) → 🥇 Gold(Lv15)',
+            '👑 Master(Lv20) → 🔮 Platinum(Lv25) → 💚 Emerald(Lv30)',
+            '💎 Diamond(Lv35) → 🏆 Grandmaster(Lv40) → ⭐ Legendary(Lv45)',
+            '🔥 **Challenger (Lv.50 — MAKSİMUM)**',
           ].join('\n'),
         },
         {
@@ -1635,8 +1886,8 @@ async function handleMineButton(interaction) {
       .setColor(rank.color)
       .setThumbnail(interaction.user.displayAvatarURL())
       .addFields(
-        { name: '🏅 Rütbe',               value: `${rank.emoji} **${rank.name}** Lv.${data.miningLevel}`, inline: true },
-        { name: '📈 Madencilik XP',        value: `${data.miningXp} / ${getMiningXpNeeded(data.miningLevel)}`,    inline: true },
+        { name: '🏅 Rütbe',               value: `${rank.emoji} **${rank.name}** Lv.${data.miningLevel}${data.miningLevel >= MINING_MAX_LEVEL ? ' 🔥 MAX' : ''}`, inline: true },
+        { name: '📈 Madencilik XP',        value: data.miningLevel >= MINING_MAX_LEVEL ? '**MAX SEVİYE** 🔥 — XP kazanımı durdu' : `${data.miningXp} / ${getMiningXpNeeded(data.miningLevel)}`, inline: true },
         { name: '👷 İşçi Sayısı',         value: `**${data.miners}** işçi`,                              inline: true },
         { name: '⚡ Enerji',               value: `**${data.energy}** / ${maxEnergy}`,                   inline: true },
         { name: '⚡ Enerji Seviyesi',      value: `Lv.**${data.energyLevel}** (${data.energyXp}/${getEnergyXpNeeded(data.energyLevel)} XP)`, inline: true },
@@ -1646,7 +1897,7 @@ async function handleMineButton(interaction) {
         { name: '📦 Toplam Maden',        value: `**${data.totalOresMined}** adet`,                     inline: true },
         { name: '💰 Sonraki İşçi',        value: `**${tier.price}** coin (Lv.${tier.minLevel})`,        inline: true },
       )
-      .setFooter({ text: 'Rütbeler: Bronze(Lv5) • Iron(Lv10) • Gold(Lv15) • Master(Lv20)' });
+      .setFooter({ text: 'Rütbeler: Bronze(Lv5) • Iron(Lv10) • Gold(Lv15) • Master(Lv20) • Platinum(Lv25) • Emerald(Lv30) • Diamond(Lv35) • Grandmaster(Lv40) • Legendary(Lv45) • 🔥Challenger(Lv50)' });
 
     return interaction.reply({ ephemeral: true, embeds: [embed] });
   }
@@ -1991,15 +2242,19 @@ async function handleWoodButton(interaction) {
       lines.push(`${w.emoji} ${w.name} × ${r.amount} = ${earned} coin`);
     }
     clearWoodInventory(gid, uid);
-    addBalance(gid, uid, totalValue);
+    // Odunculuk satış değeri %15 azaltıldı
+    const woodCoinsRaw = Math.floor(totalValue * 0.85);
+    const woodBonus    = getTotalCoinBonusPct(gid, uid);
+    const woodEarned   = Math.round(woodCoinsRaw * (1 + woodBonus / 100));
+    addBalance(gid, uid, woodEarned);
 
     const embed = new EmbedBuilder()
       .setTitle('💰 Odunlar Satıldı!')
       .setColor(0x2ECC71)
       .setDescription(lines.join('\n'))
       .addFields(
-        { name: '💰 Kazanılan',    value: `**+${totalValue} coin**`,                        inline: true },
-        { name: '💳 Yeni Bakiye', value: `**${getBalance(gid, uid).balance} coin**`,        inline: true },
+        { name: '💰 Kazanılan',    value: `**+${woodEarned} coin**${woodBonus > 0 ? ` (+%${woodBonus} coin bonusu)` : ''}`, inline: true },
+        { name: '💳 Yeni Bakiye', value: `**${getBalance(gid, uid).balance} coin**`,                                         inline: true },
       );
 
     return interaction.reply({ ephemeral: true, embeds: [embed] });
@@ -2335,27 +2590,22 @@ const SLASH_COMMANDS = [
     .addSubcommand(s => s.setName('ver').setDescription('[OWNER] Kullanıcıya coin ver').addUserOption(o => o.setName('hedef').setDescription('Hedef').setRequired(true)).addIntegerOption(o => o.setName('miktar').setDescription('Miktar').setRequired(true).setMinValue(1)))
     .addSubcommand(s => s.setName('al').setDescription('[OWNER] Kullanıcıdan coin al').addUserOption(o => o.setName('hedef').setDescription('Hedef').setRequired(true)).addIntegerOption(o => o.setName('miktar').setDescription('Miktar').setRequired(true).setMinValue(1))),
 
-  // /xp
+  // /xp — artık sadece owner ver komutu; /hakkimda ve /siralama ayrı komutlardır
   new SlashCommandBuilder()
     .setName('xp')
-    .setDescription('XP ve seviye komutları')
-    .addSubcommand(s => s.setName('seviye').setDescription('Seviye bilgisi').addUserOption(o => o.setName('hedef').setDescription('Kullanıcı (boş=kendin)')))
-    .addSubcommand(s => s.setName('siralama').setDescription('Seviye sıralaması'))
+    .setDescription('XP komutları (yönetici)')
     .addSubcommand(s => s.setName('ver').setDescription('[OWNER] Kullanıcıya XP ver').addUserOption(o => o.setName('hedef').setDescription('Hedef').setRequired(true)).addIntegerOption(o => o.setName('miktar').setDescription('Miktar').setRequired(true).setMinValue(1))),
 
   // /ses
   new SlashCommandBuilder()
     .setName('ses')
     .setDescription('Ses süresi komutları')
-    .addSubcommand(s => s.setName('benim').setDescription('Kendi ses süren'))
-    .addSubcommand(s => s.setName('siralama').setDescription('Ses süresi sıralaması'))
-    .addSubcommand(s => s.setName('gorev').setDescription('Günlük ses görevi durumu'))
     .addSubcommand(s => s.setName('sifirla').setDescription('[OWNER] Ses verilerini sıfırla'))
     .addSubcommand(s => s.setName('kapat').setDescription('[OWNER] Ses takip sistemini durdur'))
     .addSubcommand(s => s.setName('ac').setDescription('[OWNER] Ses takip sistemini başlat / mevcut kanalları tara'))
     .addSubcommand(s => s.setName('yeniden-baslat').setDescription('[OWNER] Ses sistemini yeniden başlat (offline → online, mevcut üyeleri senkronize eder)')),
 
-  // /sohbet — günlük mesaj görevi kaldırıldı, artık pasif "her 2 mesaj = 1 coin" sistemi var
+  // /sohbet — günlük mesaj görevi kaldırıldı, artık pasif "her 2 mesaj = 8 coin" sistemi var
   new SlashCommandBuilder()
     .setName('sohbet')
     .setDescription('Sohbet mesaj sayacı komutları')
@@ -2390,9 +2640,9 @@ const SLASH_COMMANDS = [
   new SlashCommandBuilder()
     .setName('evlilik')
     .setDescription('Evlilik komutları')
-    .addSubcommand(s => s.setName('yuzuk-al').setDescription('Evlilik yüzüğü satın al (150 coin)'))
+    .addSubcommand(s => s.setName('yuzuk-al').setDescription('Evlilik yüzüğü satın al (1500 coin)'))
     .addSubcommand(s => s.setName('yuzugum').setDescription('Yüzük durumunu gör'))
-    .addSubcommand(s => s.setName('bosan').setDescription('Eşinden boşan (50 coin ücret + 80 coin nafaka)'))
+    .addSubcommand(s => s.setName('bosan').setDescription('Eşinden boşan (500 coin ücret + 800 coin nafaka = 1300 coin)'))
     .addSubcommand(s => s.setName('liste').setDescription('Tüm evlilik listesi'))
     .addSubcommand(s => s.setName('ciftyazitura').setDescription('Evlilere özel çift yazı tura (günlük 10 kez)').addStringOption(o => o.setName('secim').setDescription('yazı veya tura').setRequired(true).addChoices({ name: 'yazı', value: 'yazı' }, { name: 'tura', value: 'tura' }))),
 
@@ -2411,14 +2661,25 @@ const SLASH_COMMANDS = [
   new SlashCommandBuilder()
     .setName('market')
     .setDescription('Market komutları')
-    .addSubcommand(s => s.setName('liste').setDescription('Market listesi'))
+    .addSubcommand(s => s.setName('liste').setDescription('Market listesi (roller)'))
     .addSubcommand(s => s.setName('al').setDescription('Marketten rol satın al').addStringOption(o => o.setName('rolid').setDescription('Rol ID\'si').setRequired(true)))
     .addSubcommand(s => s.setName('iade').setDescription('Marketten aldığın rolü iade et').addStringOption(o => o.setName('rolid').setDescription('Rol ID\'si').setRequired(true)))
-    .addSubcommand(s => s.setName('esyalar').setDescription('Özel eşyaları gör (Hırsızlık Kalkanı, Geçici XP Boost)'))
+    .addSubcommand(s => s.setName('esyalar').setDescription('Özel eşyaları gör (Kalkan, XP Boost, Pet, Antika, Kraliyet)'))
     .addSubcommand(s => s.setName('esya-al').setDescription('Özel eşya satın al').addStringOption(o => o.setName('esya').setDescription('Eşya').setRequired(true)
       .addChoices(
         { name: '🛡️ Hırsızlık Kalkanı (450 coin, 4 saat)', value: 'kalkan' },
-        { name: '⚡ Geçici XP Boost (400 coin, 50 kullanım, 2x)', value: 'gecici_boost' },
+        { name: '⚡ Geçici XP Boost (400 coin, 50 kullanım, 2x — kalıcı boost yoksa)', value: 'gecici_boost' },
+        { name: '💰 Kalıcı Coin Boost (5000 coin, 1.5x coin)', value: 'coinboost' },
+      )))
+    .addSubcommand(s => s.setName('antikalar').setDescription('Günlük antika marketi (her gün 2 yeni antika)'))
+    .addSubcommand(s => s.setName('antika-al').setDescription('Günlük marketten antika satın al').addStringOption(o => o.setName('antika').setDescription('Antika anahtarı').setRequired(true)))
+    .addSubcommand(s => s.setName('kraliyet').setDescription('Kraliyet eşyaları marketi'))
+    .addSubcommand(s => s.setName('kraliyet-al').setDescription('Kraliyet eşyası satın al').addStringOption(o => o.setName('esya').setDescription('Eşya').setRequired(true)
+      .addChoices(
+        { name: '👑 Kral Tacı', value: 'kral_taci' },
+        { name: '👑 Kraliçe Tacı', value: 'kralice_taci' },
+        { name: '🧥 Kraliyet Pelerini', value: 'pelerin' },
+        { name: '💎 Kraliyet Mücevheri', value: 'mucevher' },
       ))),
 
   // /market-yonet (admin)
@@ -2429,6 +2690,65 @@ const SLASH_COMMANDS = [
     .addSubcommand(s => s.setName('ekle').setDescription('Markete rol ekle').addRoleOption(o => o.setName('rol').setDescription('Rol').setRequired(true)).addIntegerOption(o => o.setName('fiyat').setDescription('Coin fiyatı').setRequired(true).setMinValue(1)).addBooleanOption(o => o.setName('premium').setDescription('Premium?')))
     .addSubcommand(s => s.setName('cikar').setDescription('Marketten rol çıkar').addRoleOption(o => o.setName('rol').setDescription('Rol').setRequired(true)))
     .addSubcommand(s => s.setName('liste').setDescription('Market rol listesi')),
+
+  // /hakkimda — profil komutu (eski /xp seviye yerine)
+  new SlashCommandBuilder()
+    .setName('hakkimda')
+    .setDescription('Profil bilgilerini gör (seviye, antika, pet, mülk, kraliyet)')
+    .addUserOption(o => o.setName('hedef').setDescription('Kullanıcı (boş=kendin)')),
+
+  // /siralama — seviye sıralaması (eski /xp siralama yerine)
+  new SlashCommandBuilder()
+    .setName('siralama')
+    .setDescription('Seviye sıralamasını gör (kraliyet unvan sahipleri dahil)'),
+
+  // /mulk — mülk sistemi (Ev & Araba)
+  new SlashCommandBuilder()
+    .setName('mulk')
+    .setDescription('Mülk (Ev🏠 / Araba🚗) komutları')
+    .addSubcommand(s => s.setName('bilgi').setDescription('Mülk bilgilerini gör').addUserOption(o => o.setName('hedef').setDescription('Kullanıcı (boş=kendin)')))
+    .addSubcommand(s => s.setName('ev-al').setDescription('Ev satın al (5000 coin)'))
+    .addSubcommand(s => s.setName('araba-al').setDescription('Araba satın al (5000 coin)')),
+
+  // /mulk-siralama
+  new SlashCommandBuilder()
+    .setName('mulk-siralama')
+    .setDescription('Mülk sıralamasını gör'),
+
+  // /pet — hayvan dostları sistemi
+  new SlashCommandBuilder()
+    .setName('pet')
+    .setDescription('Pet (hayvan) komutları')
+    .addSubcommand(s => s.setName('bilgi').setDescription('Petlerini gör').addUserOption(o => o.setName('hedef').setDescription('Kullanıcı (boş=kendin)')))
+    .addSubcommand(s => s.setName('al').setDescription('Pet satın al')
+      .addStringOption(o => o.setName('pet').setDescription('Pet').setRequired(true)
+        .addChoices(
+          { name: '🐱 Kedi (4500 coin, +%10 XP)', value: 'kedi' },
+          { name: '🐶 Köpek (4500 coin, +%10 Coin)', value: 'kopek' },
+          { name: '🦉 Baykuş (6300 coin, +%10 Günlük)', value: 'baykus' },
+        )))
+    .addSubcommand(s => s.setName('aktif').setDescription('Aktif peti ayarla (sadece 1 aktif olabilir)')
+      .addStringOption(o => o.setName('pet').setDescription('Aktifleştirmek istediğin pet').setRequired(true)
+        .addChoices(
+          { name: '🐱 Kedi', value: 'kedi' },
+          { name: '🐶 Köpek', value: 'kopek' },
+          { name: '🦉 Baykuş', value: 'baykus' },
+          { name: '🚫 Aktif peti kaldır', value: 'none' },
+        ))),
+
+  // /antika — antika koleksiyon sistemi
+  new SlashCommandBuilder()
+    .setName('antika')
+    .setDescription('Antika koleksiyon komutları')
+    .addSubcommand(s => s.setName('envanter').setDescription('Antika envanterini gör'))
+    .addSubcommand(s => s.setName('aktif-et').setDescription('Aktif antika ayarla')
+      .addStringOption(o => o.setName('anahtar').setDescription('Antika anahtarı (envanter\'de gösterilir)').setRequired(true)))
+    .addSubcommand(s => s.setName('kaldir').setDescription('Aktif antikayı kaldır')),
+
+  // /yukselt — tek panel'den her şeyi yükselt
+  new SlashCommandBuilder()
+    .setName('yukselt')
+    .setDescription('Ev, Araba, Pet veya Antika yükselt — hepsini tek panelden'),
 
   // /renkrolekle (owner-only, normal rol ekle gibi — rol seç/ID yapıştır)
   new SlashCommandBuilder()
@@ -2441,7 +2761,7 @@ const SLASH_COMMANDS = [
   new SlashCommandBuilder()
     .setName('oyunlar')
     .setDescription('Eğlence / oyun komutları')
-    .addSubcommand(s => s.setName('sanskutusu').setDescription('Şans kutusu aç (8 coin, günlük 5 hak)')),
+    .addSubcommand(s => s.setName('sanskutusu').setDescription('Şans kutusu aç (80 coin, günlük 5 hak)')),
 
   // /çal — kısa komut (eskiden /oyunlar cal)
   new SlashCommandBuilder()
@@ -2452,7 +2772,7 @@ const SLASH_COMMANDS = [
   // /xpboost (kalıcı)
   new SlashCommandBuilder()
     .setName('xpboost')
-    .setDescription('Kalıcı 2x XPBoost satın al (4000 coin)'),
+    .setDescription('Kalıcı 1.5x XPBoost satın al (4000 coin)'),
 
   // /renk — isim rengi rolleri
   new SlashCommandBuilder()
@@ -2591,11 +2911,7 @@ setInterval(() => {
 // ──────────────────────────────────────────────────────────────
 //  SES TAKİBİ + GÜNLÜK SES GÖREVİ
 // ──────────────────────────────────────────────────────────────
-const VOICE_TIERS = [
-  { needSec: 3600, reward: 160, label: '60 dk → +160 coin' },
-  { needSec: 1800, reward: 80,  label: '30 dk → +80 coin'  },
-  { needSec:  600, reward: 40,  label: '10 dk → +40 coin'  },
-];
+// Ses sistemi: dakika başına 2 coin (çıkışta ödenir)
 
 client.on('voiceStateUpdate', async (oldState, newState) => {
   try {
@@ -2615,9 +2931,22 @@ client.on('voiceStateUpdate', async (oldState, newState) => {
         const diffSec = Math.max(0, Math.floor((Date.now() - start) / 1000));
         addVoiceTime(gid, uid, diffSec);
         voiceJoinTimes.delete(key);
-        const prev = voiceDailySec.get(`${key}:${day}`) || 0;
-        voiceDailySec.set(`${key}:${day}`, prev + diffSec);
-        await checkVoiceReward(guild, uid, prev + diffSec, day);
+        // Dakika başına 2 coin öde
+        const minutes = Math.floor(diffSec / 60);
+        if (minutes > 0 && hasBankAccount(gid, uid)) {
+          const coinEarned = minutes * 2;
+          addBalance(gid, uid, coinEarned);
+          sendLog(gid, 'coin', new EmbedBuilder()
+            .setTitle('💰 Coin — Ses Kanalı')
+            .setColor(0xF1C40F)
+            .addFields(
+              { name: 'Kullanıcı', value: `<@${uid}>`, inline: true },
+              { name: 'Ödül', value: `+${coinEarned} coin`, inline: true },
+              { name: 'Süre', value: `${minutes} dk`, inline: true },
+            )
+            .setTimestamp()
+          );
+        }
       }
     }
     // Katılış
@@ -2654,54 +2983,9 @@ client.on('voiceStateUpdate', async (oldState, newState) => {
   }
 });
 
-async function checkVoiceReward(guild, uid, totalSec, day) {
-  const gid = guild.id;
-  if (!hasBankAccount(gid, uid)) return; // banka hesabı yoksa ses ödülü de birikmesin
-  const claimKey = `${gid}:${uid}:${day}`;
-  if (voiceDailyClaimed.get(claimKey)) return;
-  const tier = VOICE_TIERS.find(t => totalSec >= t.needSec);
-  if (!tier) return;
-  const boost = getBoostMultiplier(gid, uid);
-  const reward = Math.round(tier.reward * boost);
-  addBalance(gid, uid, reward);
-  voiceDailyClaimed.set(claimKey, true);
+// (checkVoiceReward kaldırıldı — ses ödülü artık voiceStateUpdate çıkışında dakika başına 2 coin olarak ödeniyor)
 
-  // Coin log
-  sendLog(gid, 'coin', new EmbedBuilder()
-    .setTitle('💰 Coin — Ses Görevi Ödülü')
-    .setColor(0xF1C40F)
-    .addFields(
-      { name: 'Kullanıcı', value: `<@${uid}>`, inline: true },
-      { name: 'Ödül', value: `+${reward} coin`, inline: true },
-      { name: 'Tier', value: tier.label, inline: true },
-    )
-    .setTimestamp()
-  );
-
-  const voiceLogCh = getSetting(gid, 'log_voice_channel');
-  if (voiceLogCh) {
-    const ch = guild.channels.cache.get(voiceLogCh);
-    if (ch?.isTextBased?.()) {
-      ch.send(`🎧 <@${uid}> günlük ses görevini tamamladı! **+${reward} coin** (${tier.label}${boost > 1 ? ' • Boost 🔥' : ''})`).catch(() => {});
-    }
-  }
-}
-
-// Aktif ses oturumlarını 30 saniyede bir kontrol et
-setInterval(async () => {
-  try {
-    for (const [key, startedAt] of voiceJoinTimes.entries()) {
-      const [gid, uid] = key.split(':');
-      if (voiceSystemPaused.has(gid)) continue;
-      const guild = client.guilds.cache.get(gid);
-      if (!guild) continue;
-      const day = todayTR();
-      const base = voiceDailySec.get(`${key}:${day}`) || 0;
-      const live = Math.max(0, Math.floor((Date.now() - startedAt) / 1000));
-      await checkVoiceReward(guild, uid, base + live, day);
-    }
-  } catch {}
-}, 30_000);
+// (30 saniyelik ses kontrol interval kaldırıldı — ödül artık çıkışta dakika başına 2 coin olarak ödeniyor)
 
 // ──────────────────────────────────────────────────────────────
 //  HATA LOG YARDIMCISI (tüm try/catch'lerde kullanılır)
@@ -2767,7 +3051,9 @@ client.on('messageCreate', async message => {
   // Not: XP kazanma ve seviye atlayınca verilen rol, banka hesabı olmasa
   // da çalışır — sadece coin ile ilgili sistemler banka hesabı istiyor.
   try {
-    const xpGained = Math.round((Math.floor(Math.random() * 5) + 1) * 1.15);
+    const xpMult  = getXpMultiplier(gid, uid, true);
+    const xpBase  = 2;
+    const xpGained = Math.max(1, Math.round(xpBase * xpMult));
     const result = addXp(gid, uid, xpGained);
 
     // XP Log
@@ -2785,7 +3071,8 @@ client.on('messageCreate', async message => {
     if (result.leveled) {
       const lvlCh = getSetting(gid, 'level_channel');
       const ch = lvlCh ? message.guild.channels.cache.get(lvlCh) : message.channel;
-      if (ch) ch.send(`🎉 <@${uid}> seviye atladı! Yeni seviye: **${result.newLevel}** 🏆`).catch(() => {});
+      const coinMsg = result.coinReward ? ` +**${result.coinReward} coin** seviye ödülü! 💰` : '';
+      if (ch) ch.send(`🎉 <@${uid}> seviye atladı! Yeni seviye: **${result.newLevel}** 🏆${coinMsg}`).catch(() => {});
 
       // Level Log
       sendLog(gid, 'level', new EmbedBuilder()
@@ -2810,15 +3097,15 @@ client.on('messageCreate', async message => {
     }
   } catch {}
 
-  // ── SOHBET MESAJ SAYACI + PASİF COIN (her 2 mesaj = 1 coin) ─
+  // ── SOHBET MESAJ SAYACI + PASİF COIN (her 2 mesaj = 8 coin) ─
   // Coin ödülü banka hesabı ister — hesabı yoksa mesaj sayılır ama coin verilmez.
   const sohbetCh = getSetting(gid, 'sohbet_channel');
   if (sohbetCh && cid === sohbetCh && hasBankAccount(gid, uid)) {
     addMsgCount(gid, cid, uid, todayTR());
     const total = incChatCoinCounter(gid, uid);
     if (total % 2 === 0) {
-      const mult = getBoostMultiplier(gid, uid);
-      const reward = Math.max(1, Math.round(10 * mult));
+      const coinBonusPct = getTotalCoinBonusPct(gid, uid);
+      const reward = Math.max(1, Math.round(8 * (1 + coinBonusPct / 100)));
       addBalance(gid, uid, reward);
       sendLog(gid, 'coin', new EmbedBuilder()
         .setTitle('💰 Coin — Sohbet (pasif)')
@@ -3017,23 +3304,21 @@ client.on('interactionCreate', async interaction => {
           {
             name: '📊 Seviye / XP',
             value: [
-              '`/xp seviye` — Seviye bilgisi',
-              '`/xp siralama` — Seviye sıralaması',
+              '`/hakkimda` — Profil (seviye, antika, pet, mülk, kraliyet)',
+              '`/siralama` — Seviye sıralaması (kraliyet dahil)',
             ].join('\n'),
           },
           {
             name: '🎙️ Ses Takibi',
             value: [
-              '`/ses benim` — Kendi ses süren',
-              '`/ses siralama` — Ses sıralaması',
-              '`/ses gorev` — Günlük ses görevi',
+              '`/ses` — Ses kanalında her dakika **2 coin** kazanırsın (otomatik)',
             ].join('\n'),
           },
           {
             name: '💬 Sohbet',
             value: [
               '`/sohbet siralama` — Bugünkü mesaj liderleri',
-              '`/sohbet durum` — Pasif coin kazanımı (her 2 mesaj = 10 coin)',
+              '`/sohbet durum` — Pasif coin kazanımı (her 2 mesaj = 8 coin)',
             ].join('\n'),
           },
           {
@@ -3044,7 +3329,7 @@ client.on('interactionCreate', async interaction => {
               '`/zar bonus` — Günlük +120 coin',
               '`/yazioyunu baslat` — Yazı oyunu (günlük 4 ödül)',
               '`/yazioyunu bonus` — Günlük +120 coin',
-              '`/oyunlar sanskutusu` — Şans kutusu (8 coin)',
+              '`/oyunlar sanskutusu` — Şans kutusu (80 coin)',
               '`/çal @hedef` — Coinini çal',
               '`/blackjack bahis:` — Blackjack (botla, 2x / ~%0.1 ihtimalle 4x)',
               '`/atyarisi at: bahis:` — At yarışı (paylaşımlı, 2x / ~%0.1 ihtimalle 5x)',
@@ -3063,10 +3348,10 @@ client.on('interactionCreate', async interaction => {
           {
             name: '💍 Evlilik',
             value: [
-              '`/evlilik yuzuk-al` — Yüzük al (150 coin)',
+              '`/evlilik yuzuk-al` — Yüzük al (1500 coin)',
               '`/evlen @kişi` — Evlilik teklifi et',
               '`/esim` — Eşini gör',
-              '`/evlilik bosan` — Boşan (130 coin)',
+              '`/evlilik bosan` — Boşan (1300 coin)',
               '`/evlilik liste` — Tüm evlilikler',
               '`/evlilik ciftyazitura` — Evlilere özel oyun',
             ].join('\n'),
@@ -3074,14 +3359,21 @@ client.on('interactionCreate', async interaction => {
           {
             name: '🛒 Market',
             value: [
-              '`/market liste` — Market listesi',
-              '`/market al <rolid>` — Rol satın al',
-              '`/market iade <rolid>` — Rol iade et',
-              '`/market esyalar` — Özel eşyalar (Kalkan, Geçici Boost)',
-              '`/market esya-al` — Özel eşya satın al',
-              '`/xpboost` — Kalıcı 2x boost (4000 coin)',
-              '`/renk al` — İsim rengi rolü satın al (4000 coin)',
-              '`/renk liste` — Renk rollerini listele',
+              '`/market liste` — Rol listesi',
+              '`/market al/iade` — Rol satın al / iade et',
+              '`/market esyalar` — Özel eşyalar (Kalkan, Boost, Pet, Antika)',
+              '`/market esya-al` — Kalkan / Geçici XP Boost satın al',
+              '`/market antikalar` — Günlük antika marketi',
+              '`/market antika-al` — Antika satın al',
+              '`/market kraliyet` — Kraliyet eşyaları marketi',
+              '`/market kraliyet-al` — Kraliyet eşyası satın al',
+              '`/xpboost` — Kalıcı 1.5x XP Boost (4000 coin)',
+              '`/pet al/gelistir/aktif/bilgi` — Pet sistemi',
+              '`/antika envanter/aktif-et/kaldir` — Antika sistemi',
+              '`/mulk ev-al/araba-al` — Mülk satın al',
+              '`/yukselt` — Ev, Araba, Pet, Antika yükselt (tek panel)',
+              '`/mulk-siralama` — Mülk sıralaması',
+              '`/renk al` — İsim rengi rolü (4000 coin)',
             ].join('\n'),
           },
           {
@@ -3116,11 +3408,11 @@ client.on('interactionCreate', async interaction => {
               '`📊 Profil` — Madencilik profilini gör',
               '',
               '**Maden değerleri:** Kömür/Bakır=1🪙 • Demir/Gümüş/Çelik=2🪙 • Altın=3🪙 • Linyit=5🪙 • Elmas=7🪙 • Uranyum=10🪙',
-              '**Rütbeler:** ⛏️Beginner → 🥉Bronze(Lv5) → ⚙️Iron(Lv10) → 🥇Gold(Lv15) → 👑Master(Lv20)',
+              '**Rütbeler (Maks: Lv50):** ⛏️Beginner → 🥉Bronze(5) → ⚙️Iron(10) → 🥇Gold(15) → 👑Master(20) → 🔮Platinum(25) → 💚Emerald(30) → 💎Diamond(35) → 🏆Grandmaster(40) → ⭐Legendary(45) → 🔥Challenger(50)',
             ].join('\n'),
           }
         )
-        .setFooter({ text: 'XP mesaj yazarak otomatik kazanılır • Her 2 mesajda 10 coin otomatik verilir' });
+        .setFooter({ text: 'XP mesaj yazarak otomatik kazanılır • Her 2 mesajda 8 coin otomatik verilir' });
       return interaction.reply({ embeds: [embed], ephemeral: true });
     }
 
@@ -3151,8 +3443,8 @@ client.on('interactionCreate', async interaction => {
         const base = parseInt(getSetting(gid, 'daily_reward') || '640');
         if (hasClaimed(gid, uid, day, 'daily')) return interaction.reply({ ephemeral: true, content: '⛔ Bugün zaten aldın. Yarın tekrar gel!' });
         setClaimed(gid, uid, day, 'daily');
-        const boost = getBoostMultiplier(gid, uid);
-        const reward = Math.floor(base * boost);
+        const dailyBonusPct = getTotalDailyBonusPct(gid, uid);
+        const reward = Math.floor(base * (1 + dailyBonusPct / 100));
         addBalance(gid, uid, reward);
 
         sendLog(gid, 'coin', new EmbedBuilder()
@@ -3165,7 +3457,7 @@ client.on('interactionCreate', async interaction => {
           .setTimestamp()
         );
 
-        return interaction.reply(`✅ Günlük **+${reward} coin** aldın! ${boost > 1 ? '(Boost 🔥)' : ''}\n💰 Bakiye: **${getBalance(gid, uid).balance}**`);
+        return interaction.reply(`✅ Günlük **+${reward} coin** aldın! ${dailyBonusPct > 0 ? `(+%${dailyBonusPct} bonus 🔥)` : ''}\n💰 Bakiye: **${getBalance(gid, uid).balance}**`);
       }
 
       if (sub === 'yatir') {
@@ -3272,7 +3564,7 @@ client.on('interactionCreate', async interaction => {
       if (sub === 'seviye') {
         const target = interaction.options.getUser('hedef') || interaction.user;
         const lvl = getLevel(gid, target.id);
-        const needed = Math.round((lvl.level + 1) * 100 * 0.85);
+        const needed = Math.round((lvl.level + 1) * 100 * 0.8925);
         const embed = new EmbedBuilder()
           .setTitle(`📊 ${target.username} — Seviye`)
           .setColor(0x57F287)
@@ -3340,42 +3632,6 @@ client.on('interactionCreate', async interaction => {
     //  /ses
     // ─────────────────────────────────────────────────────────
     if (cmd === 'ses') {
-      if (sub === 'benim') {
-        const key = `${gid}:${uid}`;
-        let secs = getVoiceTime(gid, uid);
-        if (voiceJoinTimes.has(key)) secs += Math.max(0, Math.floor((Date.now() - voiceJoinTimes.get(key)) / 1000));
-        return interaction.reply(`🎧 **${interaction.user.username}** — Toplam ses süresi: **${fmtVoice(secs)}**`);
-      }
-
-      if (sub === 'siralama') {
-        const top = topVoice(gid, 10);
-        if (!top.length) return interaction.reply('Ses kanalları bomboş... yankı bile yok 😴');
-        const embed = new EmbedBuilder()
-          .setTitle('🎙️ Ses Süresi Sıralaması')
-          .setColor(0xEB459E)
-          .setDescription(top.map((r, i) => `**${i + 1}.** <@${r.userId}> — ${fmtVoice(r.totalSeconds)}`).join('\n'));
-        return interaction.reply({ embeds: [embed] });
-      }
-
-      if (sub === 'gorev') {
-        const key = `${gid}:${uid}`;
-        const day = todayTR();
-        const base = voiceDailySec.get(`${key}:${day}`) || 0;
-        let total = base;
-        if (voiceJoinTimes.has(key)) total += Math.max(0, Math.floor((Date.now() - voiceJoinTimes.get(key)) / 1000));
-        const claimed = voiceDailyClaimed.get(`${key}:${day}`);
-        const embed = new EmbedBuilder()
-          .setTitle('🎧 Günlük Ses Görevi')
-          .setColor(0xEB459E)
-          .addFields(
-            { name: '⏱️ Bugünkü Süre', value: `**${fmtMin(total)}**`, inline: true },
-            { name: '📊 Durum', value: claimed ? '✅ Ödül alındı' : '🕒 Devam ediyor', inline: true },
-            { name: '🔥 Boost', value: `${getBoostMultiplier(gid, uid, false)}x`, inline: true },
-            { name: '🎯 Eşikler', value: VOICE_TIERS.map(t => t.label).join('\n') },
-          );
-        return interaction.reply({ embeds: [embed] });
-      }
-
       if (sub === 'sifirla') {
         if (!hasOwnerAccess(uid, interaction.member)) return interaction.reply({ ephemeral: true, content: '⛔ Sadece bot sahipleri kullanabilir.' });
         resetVoice(gid);
@@ -3395,8 +3651,8 @@ client.on('interactionCreate', async interaction => {
           const diffSec = Math.max(0, Math.floor((Date.now() - startedAt) / 1000));
           if (diffSec > 0) {
             addVoiceTime(gid, memberId, diffSec);
-            const prev = voiceDailySec.get(`${key}:${day}`) || 0;
-            voiceDailySec.set(`${key}:${day}`, prev + diffSec);
+            const minutes = Math.floor(diffSec / 60);
+            if (minutes > 0 && hasBankAccount(gid, memberId)) addBalance(gid, memberId, minutes * 2);
           }
           voiceJoinTimes.delete(key);
         }
@@ -3450,8 +3706,8 @@ client.on('interactionCreate', async interaction => {
           const diffSec = Math.max(0, Math.floor((Date.now() - startedAt) / 1000));
           if (diffSec > 0) {
             addVoiceTime(gid, memberId, diffSec);
-            const prev = voiceDailySec.get(`${key}:${day}`) || 0;
-            voiceDailySec.set(`${key}:${day}`, prev + diffSec);
+            const minutes = Math.floor(diffSec / 60);
+            if (minutes > 0 && hasBankAccount(gid, memberId)) addBalance(gid, memberId, minutes * 2);
           }
           voiceJoinTimes.delete(key);
         }
@@ -3504,7 +3760,7 @@ client.on('interactionCreate', async interaction => {
 
       if (sub === 'durum') {
         if (!sohbetCh) return interaction.reply({ ephemeral: true, content: '⛔ Sohbet kanalı ayarlanmamış. `/setup` ile ayarla.' });
-        return interaction.reply({ ephemeral: true, content: `💬 Sohbet kanalında (**<#${sohbetCh}>**) attığın her **2 mesajda 10 coin** otomatik olarak hesabına ekleniyor. Herhangi bir komuta gerek yok, sadece sohbet et!` });
+        return interaction.reply({ ephemeral: true, content: `💬 Sohbet kanalında (**<#${sohbetCh}>**) attığın her **2 mesajda 8 coin** otomatik olarak hesabına ekleniyor. Herhangi bir komuta gerek yok, sadece sohbet et!` });
       }
 
       if (sub === 'sifirla') {
@@ -3834,7 +4090,7 @@ client.on('interactionCreate', async interaction => {
               value: [
                 '🎲 **Şans Kutusu** — 80 coin • `/oyunlar sanskutusu`',
                 '💍 **Evlilik Yüzüğü** — 1500 coin • `/evlilik yuzuk-al`',
-                '💎 **XPBoost** (Kalıcı 2x) — 4000 coin • `/xpboost`',
+                '💎 **XPBoost** (Kalıcı 1.5x) — 4000 coin • `/xpboost`',
                 '🛡️ **Hırsızlık Kalkanı** (4 saat) — 450 coin • `/market esya-al esya:kalkan`',
                 '⚡ **Geçici XP Boost** (50 kullanım, 2x) — 400 coin • `/market esya-al esya:gecici_boost`',
                 '🎨 **İsim Rengi Rolü** — 4000 coin • `/renk al`',
@@ -3902,11 +4158,17 @@ client.on('interactionCreate', async interaction => {
 
       if (sub === 'esyalar') {
         const embed = new EmbedBuilder()
-          .setTitle('🎁 Özel Eşyalar')
+          .setTitle('🎁 Özel Eşyalar & Sistemler')
           .setColor(0xE67E22)
           .addFields(
-            { name: '🛡️ Hırsızlık Kalkanı', value: '**450 coin** — 4 saat boyunca `/oyunlar cal` komutundan korur.\nSatın al: `/market esya-al esya:kalkan`' },
-            { name: '⚡ Geçici XP Boost', value: '**400 coin** — sonraki 50 kullanımda **2 katı** kazanç sağlar.\nSatın al: `/market esya-al esya:gecici_boost`' },
+            { name: '🛡️ Hırsızlık Kalkanı', value: '**450 coin** — 4 saat boyunca `/çal` komutundan korur.\n`/market esya-al` → kalkan' },
+            { name: '⚡ Kalıcı XP Boost (1.5x)', value: '**4000 coin** — Her mesajda 1.5x XP. Geçici boost ile birlikte kullanılamaz.\n`/xpboost`' },
+            { name: '⚡ Geçici XP Boost (2x)', value: '**400 coin** — 50 kullanım hakkı, 2x XP. Kalıcı boost yoksa satın alınabilir.\n`/market esya-al` → gecici_boost' },
+            { name: '💰 Kalıcı Coin Boost (1.5x)', value: '**5000 coin** — Chat, madencilik, odunculuk gibi tüm coin kazanımlarında kalıcı 1.5x.\n`/market esya-al` → coinboost' },
+            { name: '🐾 Pet Sistemi', value: '🐱 **Kedi** 5000c (+%10 XP) | 🐶 **Köpek** 5000c (+%10 Coin) | 🦉 **Baykuş** 7000c (+%10 Günlük)\nHer pet Lv5\'e kadar geliştirilebilir (her sev. +%4).\n`/pet al` → kedi/kopek/baykus' },
+            { name: '🏺 Antika Koleksiyonu', value: 'Her gün 2 yeni antika markete düşer. Normal/Nadir/Çok Nadir üç rütbe.\n`/market antikalar` → listele | `/market antika-al` → satın al' },
+            { name: '👑 Kraliyet Eşyaları', value: '4 kraliyet eşyası (Kral Tacı, Kraliçe Tacı, Pelerin, Mücevher). Her satışta fiyat 1000 coin artar.\n`/market kraliyet` → listele | `/market kraliyet-al` → satın al' },
+            { name: '🏠 Mülk Sistemi', value: '🏠 **Ev** 5000c başlangıç | 🚗 **Araba** 5000c başlangıç. Lv15\'e kadar 5000c/sev.\n`/mulk ev-al` / `/mulk araba-al` → satın al | `/mulk ev-gelistir` → geliştir' },
           );
         return interaction.reply({ embeds: [embed] });
       }
@@ -3924,6 +4186,7 @@ client.on('interactionCreate', async interaction => {
           return interaction.reply('🛡️ **Hırsızlık Kalkanı** aktif! 4 saat boyunca `/oyunlar cal` komutundan korunuyorsun.');
         }
         if (esya === 'gecici_boost') {
+          if (hasBoost(gid, uid)) return interaction.reply({ ephemeral: true, content: '⛔ Kalıcı XP Boost sahibisin! Geçici boost ile birlikte kullanılamaz.' });
           const bal = getBalance(gid, uid);
           const price = 400;
           if (bal.balance < price) return interaction.reply({ ephemeral: true, content: `⛔ Yetersiz coin! Gerekli: **${price}**, Bakiye: **${bal.balance}**` });
@@ -3933,7 +4196,87 @@ client.on('interactionCreate', async interaction => {
             .addFields({ name: 'Kullanıcı', value: `<@${uid}>`, inline: true }).setTimestamp());
           return interaction.reply(`⚡ **Geçici XP Boost (2x)** satın alındı! Kalan kullanım: **${getTempBoostUses(gid, uid)}**`);
         }
+        if (esya === 'coinboost') {
+          if (hasCoinBoost(gid, uid)) return interaction.reply({ ephemeral: true, content: '💰 Zaten kalıcı **Coin Boost (1.5x)** sahibisin!' });
+          const bal = getBalance(gid, uid);
+          if (bal.balance < 5000) return interaction.reply({ ephemeral: true, content: `⛔ Yetersiz coin! Gerekli: **5000**, Bakiye: **${bal.balance}**` });
+          addBalance(gid, uid, -5000);
+          setCoinBoost(gid, uid);
+          sendLog(gid, 'market', new EmbedBuilder().setTitle('💰 Kalıcı Coin Boost Satın Alındı').setColor(0xF1C40F)
+            .addFields({ name: 'Kullanıcı', value: `<@${uid}>`, inline: true }).setTimestamp());
+          return interaction.reply(`💰 **Kalıcı Coin Boost (1.5x)** satın alındı! Artık tüm coin kazanımların 1.5x! 💰 Kalan: **${getBalance(gid, uid).balance} coin**`);
+        }
         return interaction.reply({ ephemeral: true, content: '⛔ Geçersiz eşya.' });
+      }
+
+      // ── Günlük Antika Marketi ─────────────────────────────
+      if (sub === 'antikalar') {
+        const daily = getDailyAntiqueMarket(gid);
+        const rarityLabel = { normal: '🟢 Normal', uncommon: '🟡 Nadir', rare: '🔴 Çok Nadir' };
+        const lines = daily.map(a =>
+          `${a.emoji} **${a.name}** \`${a.key}\`\n  ${rarityLabel[a.rarity]} • **${a.price} coin**\n  +%${a.xpBonus} XP | +%${a.coinBonus} Coin${a.dailyBonus ? ` | +%${a.dailyBonus} Günlük` : ''}\n  Satın al: \`/market antika-al antika:${a.key}\``
+        );
+        const embed = new EmbedBuilder()
+          .setTitle('🏺 Günlük Antika Marketi')
+          .setColor(0xE67E22)
+          .setDescription(lines.join('\n\n'))
+          .setFooter({ text: 'Her gün gece yarısında yeni antikalar gelir' });
+        return interaction.reply({ embeds: [embed] });
+      }
+
+      if (sub === 'antika-al') {
+        const antiqueKey = interaction.options.getString('antika');
+        const daily = getDailyAntiqueMarket(gid);
+        const available = daily.find(a => a.key === antiqueKey);
+        if (!available) {
+          const listed = daily.map(a => `${a.emoji} ${a.name} (\`${a.key}\`)`).join(', ');
+          return interaction.reply({ ephemeral: true, content: `⛔ Bu antika bugünkü markette yok!\nBugün mevcut: **${listed}**\nYarın yeni antikalar gelir.` });
+        }
+        const bal = getBalance(gid, uid);
+        if (bal.balance < available.price) return interaction.reply({ ephemeral: true, content: `⛔ Yetersiz coin! Gerekli: **${available.price}**, Bakiye: **${bal.balance}**` });
+        addBalance(gid, uid, -available.price);
+        addAntique(gid, uid, antiqueKey);
+        sendLog(gid, 'market', new EmbedBuilder().setTitle('🏺 Antika Satın Alındı').setColor(0xE67E22)
+          .addFields({ name: 'Kullanıcı', value: `<@${uid}>`, inline: true }, { name: 'Antika', value: `${available.emoji} ${available.name}`, inline: true }).setTimestamp());
+        return interaction.reply(`✅ ${available.emoji} **${available.name}** satın alındı!\nAktif etmek için: \`/antika aktif-et anahtar:${antiqueKey}\` | Bakiye: **${getBalance(gid, uid).balance} coin**`);
+      }
+
+      // ── Kraliyet Marketi ──────────────────────────────────
+      if (sub === 'kraliyet') {
+        const lines = ROYAL_ITEMS.map(ri => {
+          const r = getRoyalItem(gid, ri.key);
+          const ownerStr = r.ownerId ? `<@${r.ownerId}>` : '❌ Sahipsiz';
+          return `${ri.emoji} **${ri.name}** \`${ri.key}\`\n  Sahibi: ${ownerStr} • Güncel Fiyat: **${r.price} coin**`;
+        });
+        const embed = new EmbedBuilder()
+          .setTitle('👑 Kraliyet Eşyaları Marketi')
+          .setColor(0xFFD700)
+          .setDescription(lines.join('\n\n'))
+          .setFooter({ text: 'Her satışta fiyat 1000 coin artar • Satın al: /market kraliyet-al' });
+        return interaction.reply({ embeds: [embed] });
+      }
+
+      if (sub === 'kraliyet-al') {
+        const itemKey = interaction.options.getString('esya');
+        const ri = ROYAL_ITEMS.find(x => x.key === itemKey);
+        if (!ri) return interaction.reply({ ephemeral: true, content: '⛔ Geçersiz eşya.' });
+        const current = getRoyalItem(gid, itemKey);
+        if (current.ownerId === uid) return interaction.reply({ ephemeral: true, content: `${ri.emoji} Bu eşya zaten sende!` });
+        const bal = getBalance(gid, uid);
+        if (bal.balance < current.price) return interaction.reply({ ephemeral: true, content: `⛔ Yetersiz coin! Gerekli: **${current.price}**, Bakiye: **${bal.balance}**` });
+        addBalance(gid, uid, -current.price);
+        const { prevOwner, price } = buyRoyalItem(gid, itemKey, uid);
+        if (prevOwner) addBalance(gid, prevOwner, price); // eski sahibine iade
+        const nextPrice = price + 1000;
+        sendLog(gid, 'market', new EmbedBuilder().setTitle('👑 Kraliyet Eşyası El Değiştirdi').setColor(0xFFD700)
+          .addFields(
+            { name: 'Yeni Sahip', value: `<@${uid}>`, inline: true },
+            { name: 'Eşya', value: `${ri.emoji} ${ri.name}`, inline: true },
+            { name: 'Ödenen', value: `${price} coin`, inline: true },
+            { name: 'Eski Sahip', value: prevOwner ? `<@${prevOwner}>` : 'Yok', inline: true },
+          ).setTimestamp());
+        const prevMsg = prevOwner ? ` (eski sahibine **${price} coin** iade edildi)` : '';
+        return interaction.reply(`✅ ${ri.emoji} **${ri.name}** satın alındı!${prevMsg}\n💰 Ödenen: **${price} coin** | Yeni fiyat: **${nextPrice} coin** | Bakiye: **${getBalance(gid, uid).balance} coin**`);
       }
     }
 
@@ -4021,8 +4364,10 @@ client.on('interactionCreate', async interaction => {
         if (victim.bot) return interaction.reply({ ephemeral: true, content: 'Botlardan çalamazsın 😅' });
         if (victim.id === uid) return interaction.reply({ ephemeral: true, content: 'Kendinden çalamazsın 🙂' });
         if (hasShield(gid, victim.id)) return interaction.reply({ ephemeral: true, content: `🛡️ ${victim.username} şu anda **Hırsızlık Kalkanı** ile korunuyor, çalamazsın.` });
+        // Aynı anda yalnızca 1 kişi soyulabilir (aynı saldırgan başka hırsızlık işlemi yapamasın)
+        const alreadyThieving = [...activeSteals].some(k => k.startsWith(`${uid}:`));
+        if (alreadyThieving) return interaction.reply({ ephemeral: true, content: '⛔ Zaten aktif bir hırsızlık işlemin var! Önce o bitsin.' });
         const key = `${uid}:${victim.id}`;
-        if (activeSteals.has(key)) return interaction.reply({ ephemeral: true, content: 'Bu kullanıcıyla zaten aktif bir çalma denemen var, bekle.' });
         if (getBalance(gid, victim.id).balance < 100) return interaction.reply({ ephemeral: true, content: 'Hedefin coin\'i yetersiz.' });
         activeSteals.add(key);
         const cancelId = `cancel_steal_${Date.now()}_${uid}`;
@@ -4082,8 +4427,10 @@ client.on('interactionCreate', async interaction => {
       if (victim.bot) return interaction.reply({ ephemeral: true, content: 'Botlardan çalamazsın 😅' });
       if (victim.id === uid) return interaction.reply({ ephemeral: true, content: 'Kendinden çalamazsın 🙂' });
       if (hasShield(gid, victim.id)) return interaction.reply({ ephemeral: true, content: `🛡️ ${victim.username} şu anda **Hırsızlık Kalkanı** ile korunuyor, çalamazsın.` });
+      // Aynı anda yalnızca 1 kişi soyulabilir
+      const alreadyThieving2 = [...activeSteals].some(k => k.startsWith(`${uid}:`));
+      if (alreadyThieving2) return interaction.reply({ ephemeral: true, content: '⛔ Zaten aktif bir hırsızlık işlemin var! Önce o bitsin.' });
       const key = `${uid}:${victim.id}`;
-      if (activeSteals.has(key)) return interaction.reply({ ephemeral: true, content: 'Bu kullanıcıyla zaten aktif bir çalma denemen var, bekle.' });
       if (getBalance(gid, victim.id).balance < 100) return interaction.reply({ ephemeral: true, content: 'Hedefin coin\'i yetersiz.' });
       activeSteals.add(key);
       const cancelId = `cancel_steal_${Date.now()}_${uid}`;
@@ -4135,12 +4482,13 @@ client.on('interactionCreate', async interaction => {
     //  /xpboost (kalıcı)
     // ─────────────────────────────────────────────────────────
     if (cmd === 'xpboost') {
-      if (hasBoost(gid, uid)) return interaction.reply({ ephemeral: true, content: '⚡ Zaten kalıcı **XPBoost (2x)** sahibisin babuş!' });
+      if (hasBoost(gid, uid)) return interaction.reply({ ephemeral: true, content: '⚡ Zaten kalıcı **XPBoost (1.5x)** sahibisin babuş!' });
+      if (hasTempBoost(gid, uid)) return interaction.reply({ ephemeral: true, content: '⛔ Aktif geçici XP Boost\'un var! Kalıcı boost almak için önce geçici boost kullanımı bitmeli.' });
       const bal = getBalance(gid, uid);
       if (bal.balance < 4000) return interaction.reply({ ephemeral: true, content: `⛔ Yetersiz coin! Gerekli: **4000**, Bakiye: **${bal.balance}**` });
       addBalance(gid, uid, -4000);
       setBoost(gid, uid);
-      return interaction.reply('✅ **Kalıcı XPBoost (2x)** satın alındı! 🔥 Artık görev ödüllerin 2x!');
+      return interaction.reply('✅ **Kalıcı XPBoost (1.5x)** satın alındı! 🔥 Her mesajda 1.5x XP kazanırsın!');
     }
 
     // ─────────────────────────────────────────────────────────
@@ -4489,7 +4837,7 @@ client.on('interactionCreate', async interaction => {
           .setTitle('⛏️ Madencilik Sıralaması')
           .setColor(0x8B4513)
           .setDescription(lines.join('\n'))
-          .setFooter({ text: 'Rütbeler: Bronze(Lv5) • Iron(Lv10) • Gold(Lv15) • Master(Lv20)' });
+          .setFooter({ text: 'Rütbeler: Bronze(5) • Iron(10) • Gold(15) • Master(20) • Platinum(25) • Emerald(30) • Diamond(35) • Grandmaster(40) • Legendary(45) • 🔥Challenger(50)' });
         return interaction.reply({ ephemeral: true, embeds: [embed] });
       }
     }
@@ -4572,6 +4920,382 @@ client.on('interactionCreate', async interaction => {
         );
         return interaction.editReply(`⛔ Yedekleme başarısız: ${err.message}`);
       }
+    }
+
+    // ─────────────────────────────────────────────────────────
+    //  /hakkimda — profil (eski /xp seviye yerine)
+    // ─────────────────────────────────────────────────────────
+    if (cmd === 'hakkimda') {
+      const target = interaction.options.getUser('hedef') || interaction.user;
+      const tid = target.id;
+      const lvl = getLevel(gid, tid);
+      const needed = lvl.level >= NORMAL_MAX_LEVEL ? 0 : Math.round((lvl.level + 1) * 100 * 0.7809375);
+      const xpStr = lvl.level >= NORMAL_MAX_LEVEL ? 'MAX SEVİYE 🔥' : `${lvl.xp} / ${needed} XP`;
+
+      let boostInfo = '❌ Yok';
+      if (hasBoost(gid, tid)) boostInfo = '✅ Kalıcı 1.5x XP';
+      else if (hasTempBoost(gid, tid)) boostInfo = `✅ Geçici 2x XP (${getTempBoostUses(gid, tid)} kalan)`;
+      const coinBoostInfo = hasCoinBoost(gid, tid) ? '✅ Kalıcı 1.5x Coin' : '❌ Yok';
+
+      // Aktif antika
+      const activeAntique = getActiveAntique(gid, tid);
+      const antiqueStr = activeAntique
+        ? `${activeAntique.emoji} **${activeAntique.name}** (+%${activeAntique.xpBonus} XP, +%${activeAntique.coinBonus} Coin${activeAntique.dailyBonus ? `, +%${activeAntique.dailyBonus} Günlük` : ''})`
+        : '❌ Aktif antika yok';
+
+      // Antika envanteri özeti
+      const antiqueInv = getAntiqueInventory(gid, tid);
+      const antiqueInvStr = antiqueInv.length
+        ? antiqueInv.map(r => { const a = ANTIQUES.find(x => x.key === r.antiqueKey); return a ? `${a.emoji} ${a.name} ×${r.count}` : null; }).filter(Boolean).join(', ')
+        : '❌ Yok';
+
+      // Aktif pet
+      const activePet = getActivePet(gid, tid);
+      const petStr = activePet
+        ? `${activePet.emoji} **${activePet.name}** Lv.${activePet.level} (+%${getPetBonusByLevel(activePet, activePet.level)} ${activePet.bonusType === 'xp' ? 'XP' : activePet.bonusType === 'coin' ? 'Coin' : 'Günlük'})`
+        : '❌ Aktif pet yok';
+
+      // Pet envanteri özeti
+      const petRows = getPetRows(gid, tid);
+      const petInvStr = petRows.length
+        ? petRows.map(r => { const p = PETS.find(x => x.key === r.petKey); return p ? `${p.emoji} ${p.name} Lv.${r.level}` : null; }).filter(Boolean).join(', ')
+        : '❌ Yok';
+
+      // Mülkler
+      const props = getProperties(gid, tid);
+      const houseStr = props.houseLevel > 0 ? `Lv.${props.houseLevel}` : '❌ Yok';
+      const carStr   = props.carLevel   > 0 ? `Lv.${props.carLevel}`   : '❌ Yok';
+
+      // Kraliyet unvanları
+      const royalItems = getUserRoyalItems(gid, tid);
+      const royalStr = royalItems.length ? royalItems.map(r => `${r.emoji} ${r.name}`).join(', ') : '❌ Yok';
+
+      const embed = new EmbedBuilder()
+        .setTitle(`👤 ${target.username} — Profil`)
+        .setColor(0x5865F2)
+        .setThumbnail(target.displayAvatarURL())
+        .addFields(
+          { name: '🏆 Seviye',            value: `**${lvl.level}** / ${NORMAL_MAX_LEVEL}`, inline: true },
+          { name: '⚡ XP',                value: xpStr,                                    inline: true },
+          { name: '🔥 XP Boost',          value: boostInfo,                                inline: true },
+          { name: '💰 Coin Boost',        value: coinBoostInfo,                            inline: true },
+          { name: '🏺 Aktif Antika',      value: antiqueStr,                               inline: false },
+          { name: '📦 Antika Koleksiyonu', value: antiqueInvStr,                           inline: false },
+          { name: '🐾 Aktif Pet',          value: petStr,                                  inline: false },
+          { name: '🐾 Pet Koleksiyonu',    value: petInvStr,                               inline: false },
+          { name: '🏠 Ev',                value: houseStr,                                 inline: true },
+          { name: '🚗 Araba',             value: carStr,                                   inline: true },
+          { name: '👑 Kraliyet Unvanları', value: royalStr,                                inline: false },
+        );
+      return interaction.reply({ embeds: [embed] });
+    }
+
+    // ─────────────────────────────────────────────────────────
+    //  /siralama — seviye sıralaması (eski /xp siralama yerine)
+    // ─────────────────────────────────────────────────────────
+    if (cmd === 'siralama') {
+      const top = topLevels(gid, 10);
+      if (!top.length) return interaction.reply('🏁 Henüz seviye verisi yok.');
+
+      const royalLines = ROYAL_ITEMS.map(ri => {
+        const r = getRoyalItem(gid, ri.key);
+        return r.ownerId ? `${ri.emoji} **${ri.name}**: <@${r.ownerId}>` : null;
+      }).filter(Boolean);
+
+      const embed = new EmbedBuilder()
+        .setTitle('📊 Seviye Sıralaması')
+        .setColor(0x57F287)
+        .setDescription(top.map((r, i) => `**${i + 1}.** <@${r.userId}> — Seviye **${r.level}**`).join('\n'));
+
+      if (royalLines.length) embed.addFields({ name: '👑 Kraliyet Unvan Sahipleri', value: royalLines.join('\n'), inline: false });
+      return interaction.reply({ embeds: [embed] });
+    }
+
+    // ─────────────────────────────────────────────────────────
+    //  /mulk — mülk sistemi (Ev & Araba)
+    // ─────────────────────────────────────────────────────────
+    if (cmd === 'mulk') {
+      if (sub === 'bilgi') {
+        const target = interaction.options.getUser('hedef') || interaction.user;
+        const props = getProperties(gid, target.id);
+        const embed = new EmbedBuilder()
+          .setTitle(`🏠 ${target.username} — Mülkler`)
+          .setColor(0xE67E22)
+          .addFields(
+            { name: '🏠 Ev',   value: props.houseLevel > 0 ? `Lv.**${props.houseLevel}** / ${PROPERTY_MAX_LEVEL}` : '❌ Yok', inline: true },
+            { name: '🚗 Araba', value: props.carLevel   > 0 ? `Lv.**${props.carLevel}**   / ${PROPERTY_MAX_LEVEL}` : '❌ Yok', inline: true },
+          );
+        return interaction.reply({ embeds: [embed] });
+      }
+      if (sub === 'ev-al') {
+        const props = getProperties(gid, uid);
+        if (props.houseLevel > 0) return interaction.reply({ ephemeral: true, content: '🏠 Zaten bir evin var!' });
+        const bal = getBalance(gid, uid);
+        if (bal.balance < PROPERTY_COST) return interaction.reply({ ephemeral: true, content: `⛔ Yetersiz coin! Gerekli: **${PROPERTY_COST}**, Bakiye: **${bal.balance}**` });
+        addBalance(gid, uid, -PROPERTY_COST);
+        saveProperties(gid, uid, 1, props.carLevel);
+        return interaction.reply(`✅ 🏠 **Ev** satın alındı! Lv.**1** | Bakiye: **${getBalance(gid, uid).balance} coin**`);
+      }
+      if (sub === 'araba-al') {
+        const props = getProperties(gid, uid);
+        if (props.carLevel > 0) return interaction.reply({ ephemeral: true, content: '🚗 Zaten bir araban var!' });
+        const bal = getBalance(gid, uid);
+        if (bal.balance < PROPERTY_COST) return interaction.reply({ ephemeral: true, content: `⛔ Yetersiz coin! Gerekli: **${PROPERTY_COST}**, Bakiye: **${bal.balance}**` });
+        addBalance(gid, uid, -PROPERTY_COST);
+        saveProperties(gid, uid, props.houseLevel, 1);
+        return interaction.reply(`✅ 🚗 **Araba** satın alındı! Lv.**1** | Bakiye: **${getBalance(gid, uid).balance} coin**`);
+      }
+    }
+
+    // ─────────────────────────────────────────────────────────
+    //  /mulk-siralama
+    // ─────────────────────────────────────────────────────────
+    if (cmd === 'mulk-siralama') {
+      const top = getPropertyLeaderboard(gid);
+      if (!top.length) return interaction.reply('🏠 Henüz mülk verisi yok.');
+      const embed = new EmbedBuilder()
+        .setTitle('🏠 Mülk Sıralaması')
+        .setColor(0xE67E22)
+        .setDescription(top.map((r, i) => `**${i + 1}.** <@${r.userId}> — 🏠 Ev Lv.${r.houseLevel} | 🚗 Araba Lv.${r.carLevel}`).join('\n'));
+      return interaction.reply({ embeds: [embed] });
+    }
+
+    // ─────────────────────────────────────────────────────────
+    //  /pet — hayvan dostları
+    // ─────────────────────────────────────────────────────────
+    if (cmd === 'pet') {
+      if (sub === 'bilgi') {
+        const target = interaction.options.getUser('hedef') || interaction.user;
+        const rows = getPetRows(gid, target.id);
+        const active = getActivePet(gid, target.id);
+        if (!rows.length) return interaction.reply({ ephemeral: true, content: `🐾 **${target.username}**'in hiç peti yok. Satın almak için: \`/pet al\`` });
+        const petLines = rows.map(r => {
+          const def = PETS.find(p => p.key === r.petKey);
+          if (!def) return null;
+          const bonus = getPetBonusByLevel(def, r.level);
+          const isActive = active && active.key === r.petKey;
+          return `${def.emoji} **${def.name}** Lv.${r.level} — +%${bonus} ${def.bonusType === 'xp' ? 'XP' : def.bonusType === 'coin' ? 'Coin' : 'Günlük'} ${isActive ? '⭐ **AKTİF**' : ''}`;
+        }).filter(Boolean);
+        const embed = new EmbedBuilder().setTitle(`🐾 ${target.username} — Petler`).setColor(0xEB459E).setDescription(petLines.join('\n'));
+        return interaction.reply({ embeds: [embed] });
+      }
+      if (sub === 'al') {
+        const petKey = interaction.options.getString('pet');
+        const def = PETS.find(p => p.key === petKey);
+        if (!def) return interaction.reply({ ephemeral: true, content: '⛔ Geçersiz pet.' });
+        if (hasPet(gid, uid, petKey)) return interaction.reply({ ephemeral: true, content: `${def.emoji} Zaten bu pete sahipsin!` });
+        const bal = getBalance(gid, uid);
+        if (bal.balance < def.price) return interaction.reply({ ephemeral: true, content: `⛔ Yetersiz coin! Gerekli: **${def.price}**, Bakiye: **${bal.balance}**` });
+        addBalance(gid, uid, -def.price);
+        buyPet(gid, uid, petKey);
+        return interaction.reply(`✅ ${def.emoji} **${def.name}** satın alındı!\nAktif etmek için: \`/pet aktif\` | Bakiye: **${getBalance(gid, uid).balance} coin**`);
+      }
+      if (sub === 'aktif') {
+        const petKey = interaction.options.getString('pet');
+        if (!petKey || petKey === 'none') {
+          clearActivePet(gid, uid);
+          return interaction.reply('✅ Aktif pet kaldırıldı.');
+        }
+        const def = PETS.find(p => p.key === petKey);
+        if (!def) return interaction.reply({ ephemeral: true, content: '⛔ Geçersiz pet.' });
+        if (!hasPet(gid, uid, petKey)) return interaction.reply({ ephemeral: true, content: `${def.emoji} Bu pete sahip değilsin!` });
+        setActivePet(gid, uid, petKey);
+        const lv = getPetLevel(gid, uid, petKey);
+        const bonus = getPetBonusByLevel(def, lv);
+        return interaction.reply(`✅ ${def.emoji} **${def.name}** (Lv.${lv}) aktif pet olarak ayarlandı!\n+%${bonus} ${def.bonusType === 'xp' ? 'XP' : def.bonusType === 'coin' ? 'Coin' : 'Günlük'} kazanıyorsun.`);
+      }
+    }
+
+    // ─────────────────────────────────────────────────────────
+    //  /antika — antika koleksiyon sistemi
+    // ─────────────────────────────────────────────────────────
+    if (cmd === 'antika') {
+      if (sub === 'envanter') {
+        const inv = getAntiqueInventory(gid, uid);
+        const active = getActiveAntique(gid, uid);
+        if (!inv.length) return interaction.reply({ ephemeral: true, content: '📦 Antika envanterin boş. Günlük antika marketi: `/market antikalar`' });
+        const rarityLabel = { normal: '🟢', uncommon: '🟡', rare: '🔴' };
+        const lines = inv.map(r => {
+          const a = ANTIQUES.find(x => x.key === r.antiqueKey);
+          if (!a) return null;
+          const isActive = active && active.key === r.antiqueKey;
+          const upg = getAntiqueUpgradeLevel(gid, uid, a.key);
+          const maxUpg = a.rarity === 'uncommon' ? 1 : a.rarity === 'rare' ? 2 : 0;
+          const upgStr = maxUpg > 0 ? ` ${'⭐'.repeat(upg)}${'☆'.repeat(maxUpg - upg)}` : '';
+          const xp   = a.xpBonus    + upg * 5;
+          const coin = a.coinBonus  + upg * 5;
+          const daily= a.dailyBonus + upg * 5;
+          return `${rarityLabel[a.rarity]} ${a.emoji} **${a.name}** \`${a.key}\`${upgStr} ×${r.count} ${isActive ? '⭐ **AKTİF**' : ''}\n  ↳ +%${xp} XP | +%${coin} Coin${daily ? ` | +%${daily} Günlük` : ''}${maxUpg > 0 && upg < maxUpg ? `\n  ↳ 🔧 Yükseltilebilir (${upg}/${maxUpg}) — \`/antika yukselt\`` : ''}`;
+        }).filter(Boolean);
+        const embed = new EmbedBuilder()
+          .setTitle('🏺 Antika Koleksiyonu')
+          .setColor(0xE67E22)
+          .setDescription(lines.join('\n\n'))
+          .setFooter({ text: 'Aktif etmek için: /antika aktif-et anahtar:<key>' });
+        return interaction.reply({ ephemeral: true, embeds: [embed] });
+      }
+      if (sub === 'aktif-et') {
+        const key = interaction.options.getString('anahtar');
+        const inv = getAntiqueInventory(gid, uid);
+        const hasIt = inv.some(r => r.antiqueKey === key);
+        if (!hasIt) return interaction.reply({ ephemeral: true, content: '⛔ Bu antikaya sahip değilsin! `/antika envanter` ile kontrol et.' });
+        const a = ANTIQUES.find(x => x.key === key);
+        if (!a) return interaction.reply({ ephemeral: true, content: '⛔ Geçersiz antika anahtarı.' });
+        setActiveAntique(gid, uid, key);
+        return interaction.reply(`✅ ${a.emoji} **${a.name}** aktif antika olarak ayarlandı!\n+%${a.xpBonus} XP | +%${a.coinBonus} Coin${a.dailyBonus ? ` | +%${a.dailyBonus} Günlük` : ''}`);
+      }
+      if (sub === 'kaldir') {
+        const active = getActiveAntique(gid, uid);
+        if (!active) return interaction.reply({ ephemeral: true, content: '❌ Zaten aktif antikan yok.' });
+        clearActiveAntique(gid, uid);
+        return interaction.reply('✅ Aktif antika kaldırıldı.');
+      }
+    }
+
+    // ─────────────────────────────────────────────────────────
+    //  /yukselt — tek panelden her şeyi yükselt
+    // ─────────────────────────────────────────────────────────
+    if (cmd === 'yukselt') {
+      const props      = getProperties(gid, uid);
+      const bal        = getBalance(gid, uid).balance;
+      const petRows    = getPetRows(gid, uid);
+      const activeAnt  = getActiveAntique(gid, uid);
+      const bonusLabel = t => t === 'xp' ? 'XP' : t === 'coin' ? 'Coin' : 'Günlük';
+
+      const options = [];
+      const lines   = [];
+
+      // 🏠 Ev
+      if (props.houseLevel === 0) {
+        lines.push('🏠 **Ev** — Önce satın al: `/mulk ev-al`');
+      } else if (props.houseLevel >= PROPERTY_MAX_LEVEL) {
+        lines.push(`🏠 **Ev** Lv.${PROPERTY_MAX_LEVEL}/${PROPERTY_MAX_LEVEL} — 🔒 Maksimum`);
+      } else {
+        const ok = bal >= PROPERTY_COST;
+        options.push({ label: `🏠 Ev — Lv.${props.houseLevel} → Lv.${props.houseLevel + 1}`, description: `5000 coin${ok ? ' ✅' : ' ❌ Yetersiz'}`, value: 'ev' });
+        lines.push(`🏠 **Ev** Lv.${props.houseLevel}/${PROPERTY_MAX_LEVEL} — **5000 coin** ${ok ? '✅' : '❌ Yetersiz'}`);
+      }
+
+      // 🚗 Araba
+      if (props.carLevel === 0) {
+        lines.push('🚗 **Araba** — Önce satın al: `/mulk araba-al`');
+      } else if (props.carLevel >= PROPERTY_MAX_LEVEL) {
+        lines.push(`🚗 **Araba** Lv.${PROPERTY_MAX_LEVEL}/${PROPERTY_MAX_LEVEL} — 🔒 Maksimum`);
+      } else {
+        const ok = bal >= PROPERTY_COST;
+        options.push({ label: `🚗 Araba — Lv.${props.carLevel} → Lv.${props.carLevel + 1}`, description: `5000 coin${ok ? ' ✅' : ' ❌ Yetersiz'}`, value: 'araba' });
+        lines.push(`🚗 **Araba** Lv.${props.carLevel}/${PROPERTY_MAX_LEVEL} — **5000 coin** ${ok ? '✅' : '❌ Yetersiz'}`);
+      }
+
+      // 🐾 Petler
+      for (const row of petRows) {
+        const def = PETS.find(p => p.key === row.petKey);
+        if (!def) continue;
+        const lv = row.level;
+        if (lv >= PET_MAX_LEVEL) {
+          lines.push(`${def.emoji} **${def.name}** Lv.${PET_MAX_LEVEL}/${PET_MAX_LEVEL} — 🔒 Maksimum`);
+        } else {
+          const cost = PET_UPGRADE_COSTS[lv];
+          const nextBonus = getPetBonusByLevel(def, lv + 1);
+          const ok = bal >= cost;
+          options.push({ label: `${def.emoji} ${def.name} — Lv.${lv} → Lv.${lv + 1}`, description: `${cost} coin | +%${nextBonus} ${bonusLabel(def.bonusType)}${ok ? ' ✅' : ' ❌ Yetersiz'}`, value: `pet_${def.key}` });
+          lines.push(`${def.emoji} **${def.name}** Lv.${lv}/${PET_MAX_LEVEL} — **${cost} coin** → +%${nextBonus} ${bonusLabel(def.bonusType)} ${ok ? '✅' : '❌ Yetersiz'}`);
+        }
+      }
+
+      // 🏺 Aktif Antika
+      if (activeAnt) {
+        const maxUpg = activeAnt.rarity === 'uncommon' ? 1 : activeAnt.rarity === 'rare' ? 2 : 0;
+        if (maxUpg === 0) {
+          lines.push(`${activeAnt.emoji} **${activeAnt.name}** — Normal antikalar yükseltilemez`);
+        } else {
+          const curUpg = getAntiqueUpgradeLevel(gid, uid, activeAnt.key);
+          if (curUpg >= maxUpg) {
+            lines.push(`${activeAnt.emoji} **${activeAnt.name}** ${'⭐'.repeat(curUpg)} — 🔒 Maksimum yükseltme`);
+          } else {
+            const cost  = activeAnt.rarity === 'uncommon' ? 2000 : 3000;
+            const stars = '⭐'.repeat(curUpg) + '☆'.repeat(maxUpg - curUpg);
+            const ok    = bal >= cost;
+            options.push({ label: `${activeAnt.emoji} ${activeAnt.name} ${stars}`, description: `${cost} coin | Lv.${curUpg}→Lv.${curUpg + 1}${ok ? ' ✅' : ' ❌ Yetersiz'}`, value: 'antika' });
+            lines.push(`${activeAnt.emoji} **${activeAnt.name}** ${stars} (${curUpg}/${maxUpg}) — **${cost} coin** ${ok ? '✅' : '❌ Yetersiz'}`);
+          }
+        }
+      }
+
+      const embed = new EmbedBuilder()
+        .setTitle('⬆️ Yükseltme Paneli')
+        .setColor(0x9B59B6)
+        .setDescription(lines.length ? lines.join('\n') : '📦 Yükseltilebilecek hiçbir şeyin yok.')
+        .setFooter({ text: `💰 Bakiye: ${bal} coin` });
+
+      if (!options.length) return interaction.reply({ ephemeral: true, embeds: [embed] });
+
+      const menu = new StringSelectMenuBuilder()
+        .setCustomId('yukselt_sec')
+        .setPlaceholder('Ne yükseltmek istiyorsun?')
+        .addOptions(options);
+
+      const msg = await interaction.reply({ embeds: [embed], components: [new ActionRowBuilder().addComponents(menu)], fetchReply: true });
+
+      const collector = msg.createMessageComponentCollector({ filter: i => i.user.id === uid, time: 30_000 });
+      collector.on('collect', async i => {
+        collector.stop();
+        const choice  = i.values[0];
+        const nowBal  = getBalance(gid, uid).balance;
+
+        if (choice === 'ev') {
+          const p = getProperties(gid, uid);
+          if (p.houseLevel >= PROPERTY_MAX_LEVEL) return i.update({ content: '🏠 Ev zaten maksimum!', embeds: [], components: [] });
+          if (nowBal < PROPERTY_COST) return i.update({ content: `⛔ Yetersiz coin! Gerekli: **${PROPERTY_COST}**, Bakiye: **${nowBal}**`, embeds: [], components: [] });
+          addBalance(gid, uid, -PROPERTY_COST);
+          saveProperties(gid, uid, p.houseLevel + 1, p.carLevel);
+          return i.update({ content: `✅ 🏠 **Ev Lv.${p.houseLevel + 1}** oldu! 💰 Kalan: **${getBalance(gid, uid).balance} coin**`, embeds: [], components: [] });
+        }
+
+        if (choice === 'araba') {
+          const p = getProperties(gid, uid);
+          if (p.carLevel >= PROPERTY_MAX_LEVEL) return i.update({ content: '🚗 Araba zaten maksimum!', embeds: [], components: [] });
+          if (nowBal < PROPERTY_COST) return i.update({ content: `⛔ Yetersiz coin! Gerekli: **${PROPERTY_COST}**, Bakiye: **${nowBal}**`, embeds: [], components: [] });
+          addBalance(gid, uid, -PROPERTY_COST);
+          saveProperties(gid, uid, p.houseLevel, p.carLevel + 1);
+          return i.update({ content: `✅ 🚗 **Araba Lv.${p.carLevel + 1}** oldu! 💰 Kalan: **${getBalance(gid, uid).balance} coin**`, embeds: [], components: [] });
+        }
+
+        if (choice.startsWith('pet_')) {
+          const petKey = choice.slice(4);
+          const def    = PETS.find(p => p.key === petKey);
+          const lv     = getPetLevel(gid, uid, petKey);
+          const cost   = PET_UPGRADE_COSTS[lv];
+          if (nowBal < cost) return i.update({ content: `⛔ Yetersiz coin! Gerekli: **${cost}**, Bakiye: **${nowBal}**`, embeds: [], components: [] });
+          addBalance(gid, uid, -cost);
+          upgradePet(gid, uid, petKey);
+          const newLv  = lv + 1;
+          const bonus  = getPetBonusByLevel(def, newLv);
+          return i.update({ content: `✅ ${def.emoji} **${def.name} Lv.${newLv}** oldu! +%${bonus} ${bonusLabel(def.bonusType)} 💰 Kalan: **${getBalance(gid, uid).balance} coin**`, embeds: [], components: [] });
+        }
+
+        if (choice === 'antika') {
+          const active = getActiveAntique(gid, uid);
+          if (!active) return i.update({ content: '❌ Aktif antikan yok.', embeds: [], components: [] });
+          const maxUpg = active.rarity === 'uncommon' ? 1 : active.rarity === 'rare' ? 2 : 0;
+          const curUpg = getAntiqueUpgradeLevel(gid, uid, active.key);
+          const cost   = active.rarity === 'uncommon' ? 2000 : 3000;
+          if (nowBal < cost) return i.update({ content: `⛔ Yetersiz coin! Gerekli: **${cost}**, Bakiye: **${nowBal}**`, embeds: [], components: [] });
+          addBalance(gid, uid, -cost);
+          const newUpg  = curUpg + 1;
+          setAntiqueUpgradeLevel(gid, uid, active.key, newUpg);
+          const starsNew = '⭐'.repeat(newUpg) + '☆'.repeat(maxUpg - newUpg);
+          const newXp    = active.xpBonus    + newUpg * 5;
+          const newCoin  = active.coinBonus  + newUpg * 5;
+          const newDaily = active.dailyBonus + newUpg * 5;
+          return i.update({ content: `✨ ${active.emoji} **${active.name}** ${starsNew} yükseltildi!\n+%${newXp} XP | +%${newCoin} Coin${newDaily ? ` | +%${newDaily} Günlük` : ''}\n💰 Kalan: **${getBalance(gid, uid).balance} coin**`, embeds: [], components: [] });
+        }
+      });
+
+      collector.on('end', (_, reason) => {
+        if (reason === 'time') msg.edit({ components: [] }).catch(() => {});
+      });
+      return;
     }
 
     // ─────────────────────────────────────────────────────────
