@@ -2795,7 +2795,8 @@ const SLASH_COMMANDS = [
   new SlashCommandBuilder()
     .setName('renk')
     .setDescription('İsim rengi rolü komutları')
-    .addSubcommand(s => s.setName('al').setDescription('Renk rolü satın al (4000 coin, sadece 1 tane sahip olabilirsin)'))
+    .addSubcommand(s => s.setName('al').setDescription('Renk rolü satın al — renk adını yazarak ara')
+      .addStringOption(o => o.setName('renk').setDescription('Renk adını yaz (arama yapar)').setRequired(true).setAutocomplete(true)))
     .addSubcommand(s => s.setName('liste').setDescription('Mevcut renk rollerini gör')),
 
   // /balik — balıkçılık
@@ -3176,6 +3177,23 @@ client.on('messageCreate', async message => {
 // ──────────────────────────────────────────────────────────────
 client.on('interactionCreate', async interaction => {
   try {
+
+    // ── AUTOCOMPLETE ─────────────────────────────────────────
+    if (interaction.isAutocomplete()) {
+      const { commandName } = interaction;
+      if (commandName === 'renk' && interaction.options.getSubcommand(false) === 'al') {
+        const focused   = interaction.options.getFocused().toLowerCase();
+        const cRoles    = getColorRoles(interaction.guild.id);
+        const fetched   = await interaction.guild.roles.fetch();
+        const choices   = cRoles
+          .map(r => { const role = fetched.get(String(r.roleId)); return role ? { name: `${role.name} — ${r.price} coin`, value: String(r.roleId) } : null; })
+          .filter(Boolean)
+          .filter(c => c.name.toLowerCase().includes(focused))
+          .slice(0, 25);
+        return interaction.respond(choices);
+      }
+      return interaction.respond([]);
+    }
 
     // ── KANAL KISITLAMASI ────────────────────────────────────
     // Tüm slash komutları yalnızca GAME_CHANNEL_ID kanalında çalışır.
@@ -4522,19 +4540,28 @@ client.on('interactionCreate', async interaction => {
         return interaction.reply({ embeds: [embed] });
       }
       if (sub === 'al') {
-        if (!colorRoles.length) return interaction.reply({ ephemeral: true, content: '⛔ Henüz renk rolü eklenmemiş. Bir yönetici `/setup` üzerinden ekleyebilir.' });
-        // Cache'i güncel tut — bazı roller cache'de olmayabilir
-        await interaction.guild.roles.fetch();
-        const validRoles = colorRoles.filter(r => interaction.guild.roles.cache.has(r.roleId));
-        if (!validRoles.length) return interaction.reply({ ephemeral: true, content: '⛔ Kayıtlı renk rolleri sunucuda bulunamadı (silinmiş olabilir). Bir yönetici `/setup` üzerinden yeniden ekleyebilir.' });
-        const menu = new StringSelectMenuBuilder()
-          .setCustomId(`renkpick_${uid}`)
-          .setPlaceholder('Bir renk rolü seç...')
-          .addOptions(validRoles.slice(0, 25).map(r => {
-            const role = interaction.guild.roles.cache.get(r.roleId);
-            return { label: role.name, value: r.roleId, description: `${r.price} coin` };
-          }));
-        return interaction.reply({ ephemeral: true, content: '🎨 Almak istediğin renk rolünü seç (sadece 1 tane sahip olabilirsin, yenisi öncekinin yerine geçer):', components: [new ActionRowBuilder().addComponents(menu)] });
+        if (!colorRoles.length) return interaction.reply({ ephemeral: true, content: '⛔ Henüz renk rolü eklenmemiş. Bir yönetici `/renkrolekle` komutuyla ekleyebilir.' });
+        const roleId = interaction.options.getString('renk');
+        const cr = colorRoles.find(r => String(r.roleId) === roleId);
+        if (!cr) return interaction.reply({ ephemeral: true, content: '⛔ Bu renk rolü listede yok. Lütfen açılan önerilerden birini seç.' });
+        const role = await interaction.guild.roles.fetch(roleId).catch(() => null);
+        if (!role) return interaction.reply({ ephemeral: true, content: '⛔ Rol sunucuda bulunamadı (silinmiş olabilir).' });
+        const me = interaction.guild.members.me;
+        if (!me?.permissions.has(PermissionFlagsBits.ManageRoles) || role.position >= me.roles.highest.position)
+          return interaction.reply({ ephemeral: true, content: '⛔ Bu rolü yönetemiyorum (hiyerarşi/izin sorunu).' });
+        const bal = getBalance(gid, uid);
+        if (bal.balance < cr.price) return interaction.reply({ ephemeral: true, content: `⛔ Yetersiz coin! Gerekli: **${cr.price}**, Bakiye: **${bal.balance}**` });
+        // Önceki renk rolünü kaldır
+        const allColorRoleIds = colorRoles.map(r => String(r.roleId));
+        const member = interaction.member;
+        const owned = allColorRoleIds.filter(rid => member.roles.cache.has(rid));
+        for (const rid of owned) await member.roles.remove(rid).catch(() => {});
+        await member.roles.add(roleId).catch(() => {});
+        addBalance(gid, uid, -cr.price);
+        sendLog(gid, 'market', new EmbedBuilder().setTitle('🎨 Renk Rolü Satın Alındı').setColor(0xEB459E)
+          .addFields({ name: 'Kullanıcı', value: `<@${uid}>`, inline: true }, { name: 'Rol', value: `<@&${roleId}>`, inline: true }, { name: 'Fiyat', value: `${cr.price} coin`, inline: true })
+          .setTimestamp());
+        return interaction.reply({ ephemeral: true, content: `✅ <@&${roleId}> renk rolünü aldın! **-${cr.price}** coin. Bakiye: **${getBalance(gid, uid).balance}**` });
       }
     }
 
