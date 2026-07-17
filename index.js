@@ -876,9 +876,28 @@ function getActivePet(gid, uid) {
 }
 function setActivePet(gid, uid, petKey) { db.prepare('INSERT OR REPLACE INTO active_pet(guildId,userId,petKey)VALUES(?,?,?)').run(gid, uid, petKey); }
 function clearActivePet(gid, uid)        { db.prepare('DELETE FROM active_pet WHERE guildId=? AND userId=?').run(gid, uid); }
-function getPetXpBonus(gid, uid)    { const p = getActivePet(gid, uid); return (p && p.bonusType === 'xp')    ? getPetBonusByLevel(p, p.level) : 0; }
-function getPetCoinBonus(gid, uid)  { const p = getActivePet(gid, uid); return (p && p.bonusType === 'coin')  ? getPetBonusByLevel(p, p.level) : 0; }
-function getPetDailyBonus(gid, uid) { const p = getActivePet(gid, uid); return (p && p.bonusType === 'daily') ? getPetBonusByLevel(p, p.level) : 0; }
+// Tüm sahip olunan petlerin bonusları toplanır (aktif/pasif ayrımı yok)
+function getPetXpBonus(gid, uid) {
+  const rows = getPetRows(gid, uid);
+  return rows.reduce((sum, r) => {
+    const def = PETS.find(p => p.key === r.petKey);
+    return (def && def.bonusType === 'xp') ? sum + getPetBonusByLevel(def, r.level) : sum;
+  }, 0);
+}
+function getPetCoinBonus(gid, uid) {
+  const rows = getPetRows(gid, uid);
+  return rows.reduce((sum, r) => {
+    const def = PETS.find(p => p.key === r.petKey);
+    return (def && def.bonusType === 'coin') ? sum + getPetBonusByLevel(def, r.level) : sum;
+  }, 0);
+}
+function getPetDailyBonus(gid, uid) {
+  const rows = getPetRows(gid, uid);
+  return rows.reduce((sum, r) => {
+    const def = PETS.find(p => p.key === r.petKey);
+    return (def && def.bonusType === 'daily') ? sum + getPetBonusByLevel(def, r.level) : sum;
+  }, 0);
+}
 
 // ──────────────────────────────────────────────────────────────
 //  ÇAPRAZ BOOST HESAPLAMA
@@ -896,8 +915,14 @@ function getXpMultiplier(gid, uid, consume = true) {
   return m;
 }
 
+// Mülk coin bonusu: Ev Lv başına +%2, Araba Lv başına +%2
+function getPropertyCoinBonus(gid, uid) {
+  const p = getProperties(gid, uid);
+  return p.houseLevel * 2 + p.carLevel * 2;
+}
+
 // Coin bonus % (chat coin, madencilik satışı vb.)
-function getTotalCoinBonusPct(gid, uid) { return getAntiqueCoinBonus(gid, uid) + getPetCoinBonus(gid, uid) + (hasCoinBoost(gid, uid) ? 50 : 0); }
+function getTotalCoinBonusPct(gid, uid) { return getAntiqueCoinBonus(gid, uid) + getPetCoinBonus(gid, uid) + getPropertyCoinBonus(gid, uid) + (hasCoinBoost(gid, uid) ? 50 : 0); }
 
 // Günlük ödül bonus % (yalnızca %1 antika + baykuş pet)
 function getTotalDailyBonusPct(gid, uid) { return getAntiqueDailyBonus(gid, uid) + getPetDailyBonus(gid, uid); }
@@ -2726,14 +2751,6 @@ const SLASH_COMMANDS = [
           { name: '🐱 Kedi (4500 coin, +%10 XP)', value: 'kedi' },
           { name: '🐶 Köpek (4500 coin, +%10 Coin)', value: 'kopek' },
           { name: '🦉 Baykuş (6300 coin, +%10 Günlük)', value: 'baykus' },
-        )))
-    .addSubcommand(s => s.setName('aktif').setDescription('Aktif peti ayarla (sadece 1 aktif olabilir)')
-      .addStringOption(o => o.setName('pet').setDescription('Aktifleştirmek istediğin pet').setRequired(true)
-        .addChoices(
-          { name: '🐱 Kedi', value: 'kedi' },
-          { name: '🐶 Köpek', value: 'kopek' },
-          { name: '🦉 Baykuş', value: 'baykus' },
-          { name: '🚫 Aktif peti kaldır', value: 'none' },
         ))),
 
   // /antika — antika koleksiyon sistemi
@@ -3368,7 +3385,7 @@ client.on('interactionCreate', async interaction => {
               '`/market kraliyet` — Kraliyet eşyaları marketi',
               '`/market kraliyet-al` — Kraliyet eşyası satın al',
               '`/xpboost` — Kalıcı 1.5x XP Boost (4000 coin)',
-              '`/pet al/gelistir/aktif/bilgi` — Pet sistemi',
+              '`/pet al/bilgi` — Pet sistemi (hepsi otomatik aktif)',
               '`/antika envanter/aktif-et/kaldir` — Antika sistemi',
               '`/mulk ev-al/araba-al` — Mülk satın al',
               '`/yukselt` — Ev, Araba, Pet, Antika yükselt (tek panel)',
@@ -4165,10 +4182,10 @@ client.on('interactionCreate', async interaction => {
             { name: '⚡ Kalıcı XP Boost (1.5x)', value: '**4000 coin** — Her mesajda 1.5x XP. Geçici boost ile birlikte kullanılamaz.\n`/xpboost`' },
             { name: '⚡ Geçici XP Boost (2x)', value: '**400 coin** — 50 kullanım hakkı, 2x XP. Kalıcı boost yoksa satın alınabilir.\n`/market esya-al` → gecici_boost' },
             { name: '💰 Kalıcı Coin Boost (1.5x)', value: '**5000 coin** — Chat, madencilik, odunculuk gibi tüm coin kazanımlarında kalıcı 1.5x.\n`/market esya-al` → coinboost' },
-            { name: '🐾 Pet Sistemi', value: '🐱 **Kedi** 5000c (+%10 XP) | 🐶 **Köpek** 5000c (+%10 Coin) | 🦉 **Baykuş** 7000c (+%10 Günlük)\nHer pet Lv5\'e kadar geliştirilebilir (her sev. +%4).\n`/pet al` → kedi/kopek/baykus' },
+            { name: '🐾 Pet Sistemi', value: '🐱 **Kedi** 4500c (+%10 XP) | 🐶 **Köpek** 4500c (+%10 Coin) | 🦉 **Baykuş** 6300c (+%10 Günlük)\nHer pet satın alındığında **otomatik aktifleşir**, hepsi aynı anda aktif!\nHer pet Lv5\'e kadar geliştirilebilir (her sev. +%4).\n`/pet al` → kedi/kopek/baykus' },
             { name: '🏺 Antika Koleksiyonu', value: 'Her gün 2 yeni antika markete düşer. Normal/Nadir/Çok Nadir üç rütbe.\n`/market antikalar` → listele | `/market antika-al` → satın al' },
             { name: '👑 Kraliyet Eşyaları', value: '4 kraliyet eşyası (Kral Tacı, Kraliçe Tacı, Pelerin, Mücevher). Her satışta fiyat 1000 coin artar.\n`/market kraliyet` → listele | `/market kraliyet-al` → satın al' },
-            { name: '🏠 Mülk Sistemi', value: '🏠 **Ev** 5000c başlangıç | 🚗 **Araba** 5000c başlangıç. Lv15\'e kadar 5000c/sev.\n`/mulk ev-al` / `/mulk araba-al` → satın al | `/mulk ev-gelistir` → geliştir' },
+            { name: '🏠 Mülk Sistemi', value: '🏠 **Ev** 5000c başlangıç (+%2 Coin/sev.) | 🚗 **Araba** 5000c başlangıç (+%2 Coin/sev.). Lv15\'e kadar 5000c/sev.\n`/mulk ev-al` / `/mulk araba-al` → satın al | `/yukselt` → geliştir' },
           );
         return interaction.reply({ embeds: [embed] });
       }
@@ -4506,12 +4523,16 @@ client.on('interactionCreate', async interaction => {
       }
       if (sub === 'al') {
         if (!colorRoles.length) return interaction.reply({ ephemeral: true, content: '⛔ Henüz renk rolü eklenmemiş. Bir yönetici `/setup` üzerinden ekleyebilir.' });
+        // Cache'i güncel tut — bazı roller cache'de olmayabilir
+        await interaction.guild.roles.fetch();
+        const validRoles = colorRoles.filter(r => interaction.guild.roles.cache.has(r.roleId));
+        if (!validRoles.length) return interaction.reply({ ephemeral: true, content: '⛔ Kayıtlı renk rolleri sunucuda bulunamadı (silinmiş olabilir). Bir yönetici `/setup` üzerinden yeniden ekleyebilir.' });
         const menu = new StringSelectMenuBuilder()
           .setCustomId(`renkpick_${uid}`)
           .setPlaceholder('Bir renk rolü seç...')
-          .addOptions(colorRoles.slice(0, 25).map(r => {
+          .addOptions(validRoles.slice(0, 25).map(r => {
             const role = interaction.guild.roles.cache.get(r.roleId);
-            return { label: role ? role.name : r.roleId, value: r.roleId, description: `${r.price} coin` };
+            return { label: role.name, value: r.roleId, description: `${r.price} coin` };
           }));
         return interaction.reply({ ephemeral: true, content: '🎨 Almak istediğin renk rolünü seç (sadece 1 tane sahip olabilirsin, yenisi öncekinin yerine geçer):', components: [new ActionRowBuilder().addComponents(menu)] });
       }
@@ -4949,22 +4970,16 @@ client.on('interactionCreate', async interaction => {
         ? antiqueInv.map(r => { const a = ANTIQUES.find(x => x.key === r.antiqueKey); return a ? `${a.emoji} ${a.name} ×${r.count}` : null; }).filter(Boolean).join(', ')
         : '❌ Yok';
 
-      // Aktif pet
-      const activePet = getActivePet(gid, tid);
-      const petStr = activePet
-        ? `${activePet.emoji} **${activePet.name}** Lv.${activePet.level} (+%${getPetBonusByLevel(activePet, activePet.level)} ${activePet.bonusType === 'xp' ? 'XP' : activePet.bonusType === 'coin' ? 'Coin' : 'Günlük'})`
-        : '❌ Aktif pet yok';
-
-      // Pet envanteri özeti
+      // Petler (hepsi her zaman aktif)
       const petRows = getPetRows(gid, tid);
-      const petInvStr = petRows.length
-        ? petRows.map(r => { const p = PETS.find(x => x.key === r.petKey); return p ? `${p.emoji} ${p.name} Lv.${r.level}` : null; }).filter(Boolean).join(', ')
-        : '❌ Yok';
+      const petStr = petRows.length
+        ? petRows.map(r => { const p = PETS.find(x => x.key === r.petKey); return p ? `${p.emoji} **${p.name}** Lv.${r.level} (+%${getPetBonusByLevel(p, r.level)} ${p.bonusType === 'xp' ? 'XP' : p.bonusType === 'coin' ? 'Coin' : 'Günlük'}) ✅` : null; }).filter(Boolean).join('\n')
+        : '❌ Pet yok';
 
       // Mülkler
       const props = getProperties(gid, tid);
-      const houseStr = props.houseLevel > 0 ? `Lv.${props.houseLevel}` : '❌ Yok';
-      const carStr   = props.carLevel   > 0 ? `Lv.${props.carLevel}`   : '❌ Yok';
+      const houseStr = props.houseLevel > 0 ? `Lv.${props.houseLevel} (+%${props.houseLevel * 2} Coin Boost)` : '❌ Yok';
+      const carStr   = props.carLevel   > 0 ? `Lv.${props.carLevel} (+%${props.carLevel * 2} Coin Boost)`   : '❌ Yok';
 
       // Kraliyet unvanları
       const royalItems = getUserRoyalItems(gid, tid);
@@ -4981,8 +4996,7 @@ client.on('interactionCreate', async interaction => {
           { name: '💰 Coin Boost',        value: coinBoostInfo,                            inline: true },
           { name: '🏺 Aktif Antika',      value: antiqueStr,                               inline: false },
           { name: '📦 Antika Koleksiyonu', value: antiqueInvStr,                           inline: false },
-          { name: '🐾 Aktif Pet',          value: petStr,                                  inline: false },
-          { name: '🐾 Pet Koleksiyonu',    value: petInvStr,                               inline: false },
+          { name: '🐾 Petler (Hepsi Aktif)', value: petStr,                                  inline: false },
           { name: '🏠 Ev',                value: houseStr,                                 inline: true },
           { name: '🚗 Araba',             value: carStr,                                   inline: true },
           { name: '👑 Kraliyet Unvanları', value: royalStr,                                inline: false },
@@ -5022,8 +5036,8 @@ client.on('interactionCreate', async interaction => {
           .setTitle(`🏠 ${target.username} — Mülkler`)
           .setColor(0xE67E22)
           .addFields(
-            { name: '🏠 Ev',   value: props.houseLevel > 0 ? `Lv.**${props.houseLevel}** / ${PROPERTY_MAX_LEVEL}` : '❌ Yok', inline: true },
-            { name: '🚗 Araba', value: props.carLevel   > 0 ? `Lv.**${props.carLevel}**   / ${PROPERTY_MAX_LEVEL}` : '❌ Yok', inline: true },
+            { name: '🏠 Ev',   value: props.houseLevel > 0 ? `Lv.**${props.houseLevel}** / ${PROPERTY_MAX_LEVEL} (+%${props.houseLevel * 2} Coin Boost)` : '❌ Yok', inline: true },
+            { name: '🚗 Araba', value: props.carLevel   > 0 ? `Lv.**${props.carLevel}** / ${PROPERTY_MAX_LEVEL} (+%${props.carLevel * 2} Coin Boost)` : '❌ Yok', inline: true },
           );
         return interaction.reply({ embeds: [embed] });
       }
@@ -5034,7 +5048,7 @@ client.on('interactionCreate', async interaction => {
         if (bal.balance < PROPERTY_COST) return interaction.reply({ ephemeral: true, content: `⛔ Yetersiz coin! Gerekli: **${PROPERTY_COST}**, Bakiye: **${bal.balance}**` });
         addBalance(gid, uid, -PROPERTY_COST);
         saveProperties(gid, uid, 1, props.carLevel);
-        return interaction.reply(`✅ 🏠 **Ev** satın alındı! Lv.**1** | Bakiye: **${getBalance(gid, uid).balance} coin**`);
+        return interaction.reply(`✅ 🏠 **Ev** satın alındı! Lv.**1** (+%2 Coin Boost) | Bakiye: **${getBalance(gid, uid).balance} coin**`);
       }
       if (sub === 'araba-al') {
         const props = getProperties(gid, uid);
@@ -5043,7 +5057,7 @@ client.on('interactionCreate', async interaction => {
         if (bal.balance < PROPERTY_COST) return interaction.reply({ ephemeral: true, content: `⛔ Yetersiz coin! Gerekli: **${PROPERTY_COST}**, Bakiye: **${bal.balance}**` });
         addBalance(gid, uid, -PROPERTY_COST);
         saveProperties(gid, uid, props.houseLevel, 1);
-        return interaction.reply(`✅ 🚗 **Araba** satın alındı! Lv.**1** | Bakiye: **${getBalance(gid, uid).balance} coin**`);
+        return interaction.reply(`✅ 🚗 **Araba** satın alındı! Lv.**1** (+%2 Coin Boost) | Bakiye: **${getBalance(gid, uid).balance} coin**`);
       }
     }
 
@@ -5067,16 +5081,18 @@ client.on('interactionCreate', async interaction => {
       if (sub === 'bilgi') {
         const target = interaction.options.getUser('hedef') || interaction.user;
         const rows = getPetRows(gid, target.id);
-        const active = getActivePet(gid, target.id);
         if (!rows.length) return interaction.reply({ ephemeral: true, content: `🐾 **${target.username}**'in hiç peti yok. Satın almak için: \`/pet al\`` });
         const petLines = rows.map(r => {
           const def = PETS.find(p => p.key === r.petKey);
           if (!def) return null;
           const bonus = getPetBonusByLevel(def, r.level);
-          const isActive = active && active.key === r.petKey;
-          return `${def.emoji} **${def.name}** Lv.${r.level} — +%${bonus} ${def.bonusType === 'xp' ? 'XP' : def.bonusType === 'coin' ? 'Coin' : 'Günlük'} ${isActive ? '⭐ **AKTİF**' : ''}`;
+          return `${def.emoji} **${def.name}** Lv.${r.level} — +%${bonus} ${def.bonusType === 'xp' ? 'XP' : def.bonusType === 'coin' ? 'Coin' : 'Günlük'} ✅ **AKTİF**`;
         }).filter(Boolean);
-        const embed = new EmbedBuilder().setTitle(`🐾 ${target.username} — Petler`).setColor(0xEB459E).setDescription(petLines.join('\n'));
+        const embed = new EmbedBuilder()
+          .setTitle(`🐾 ${target.username} — Petler`)
+          .setColor(0xEB459E)
+          .setDescription(petLines.join('\n'))
+          .setFooter({ text: 'Tüm petler her zaman aktif — bonuslar otomatik uygulanır.' });
         return interaction.reply({ embeds: [embed] });
       }
       if (sub === 'al') {
@@ -5088,21 +5104,8 @@ client.on('interactionCreate', async interaction => {
         if (bal.balance < def.price) return interaction.reply({ ephemeral: true, content: `⛔ Yetersiz coin! Gerekli: **${def.price}**, Bakiye: **${bal.balance}**` });
         addBalance(gid, uid, -def.price);
         buyPet(gid, uid, petKey);
-        return interaction.reply(`✅ ${def.emoji} **${def.name}** satın alındı!\nAktif etmek için: \`/pet aktif\` | Bakiye: **${getBalance(gid, uid).balance} coin**`);
-      }
-      if (sub === 'aktif') {
-        const petKey = interaction.options.getString('pet');
-        if (!petKey || petKey === 'none') {
-          clearActivePet(gid, uid);
-          return interaction.reply('✅ Aktif pet kaldırıldı.');
-        }
-        const def = PETS.find(p => p.key === petKey);
-        if (!def) return interaction.reply({ ephemeral: true, content: '⛔ Geçersiz pet.' });
-        if (!hasPet(gid, uid, petKey)) return interaction.reply({ ephemeral: true, content: `${def.emoji} Bu pete sahip değilsin!` });
-        setActivePet(gid, uid, petKey);
-        const lv = getPetLevel(gid, uid, petKey);
-        const bonus = getPetBonusByLevel(def, lv);
-        return interaction.reply(`✅ ${def.emoji} **${def.name}** (Lv.${lv}) aktif pet olarak ayarlandı!\n+%${bonus} ${def.bonusType === 'xp' ? 'XP' : def.bonusType === 'coin' ? 'Coin' : 'Günlük'} kazanıyorsun.`);
+        const bonus = getPetBonusByLevel(def, 1);
+        return interaction.reply(`✅ ${def.emoji} **${def.name}** satın alındı ve otomatik aktifleşti!\n+%${bonus} ${def.bonusType === 'xp' ? 'XP' : def.bonusType === 'coin' ? 'Coin' : 'Günlük'} bonus kazanmaya başladın. | Bakiye: **${getBalance(gid, uid).balance} coin**`);
       }
     }
 
