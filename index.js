@@ -1,4 +1,4 @@
-ant// ╔══════════════════════════════════════════════════════════════╗
+// ╔══════════════════════════════════════════════════════════════╗
 // ║         DeathWish Game Bot — TEK DOSYA                      ║
 // ║  Özellikler: Seviye/XP, Ekonomi, Ses Takibi, Sohbet,       ║
 // ║  Yazı Oyunu, Market, Evlilik, Balıkçılık, Blackjack,        ║
