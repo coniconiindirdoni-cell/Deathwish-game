@@ -3047,12 +3047,10 @@ const SLASH_COMMANDS = [
     .setName('xpboost')
     .setDescription('Kalıcı 1.5x XPBoost satın al (4000 coin)'),
 
-  // /renk — isim rengi rolleri
+  // /renk — isim rengi rolleri (al artık /market → 🎨 Renk Al butonu ile)
   new SlashCommandBuilder()
     .setName('renk')
-    .setDescription('İsim rengi rolü komutları')
-    .addSubcommand(s => s.setName('al').setDescription('Renk rolü satın al — renk adını yazarak ara')
-      .addStringOption(o => o.setName('renk').setDescription('Renk adını yaz (arama yapar)').setRequired(true).setAutocomplete(true)))
+    .setDescription('İsim rengi rolleri')
     .addSubcommand(s => s.setName('liste').setDescription('Mevcut renk rollerini gör')),
 
   // /balik — balıkçılık
@@ -3437,17 +3435,6 @@ client.on('interactionCreate', async interaction => {
     // ── AUTOCOMPLETE ─────────────────────────────────────────
     if (interaction.isAutocomplete()) {
       const { commandName } = interaction;
-      if (commandName === 'renk' && interaction.options.getSubcommand(false) === 'al') {
-        const focused   = interaction.options.getFocused().toLowerCase();
-        const cRoles    = getColorRoles(interaction.guild.id);
-        const fetched   = await interaction.guild.roles.fetch();
-        const choices   = cRoles
-          .map(r => { const role = fetched.get(String(r.roleId)); return role ? { name: `${role.name} — ${r.price} coin`, value: String(r.roleId) } : null; })
-          .filter(Boolean)
-          .filter(c => c.name.toLowerCase().includes(focused))
-          .slice(0, 25);
-        return interaction.respond(choices);
-      }
       return interaction.respond([]);
     }
 
@@ -3686,7 +3673,7 @@ client.on('interactionCreate', async interaction => {
               '`/mulk ev-al/araba-al` — Mülk satın al',
               '`/yukselt` — Ev, Araba, Pet, Antika yükselt',
               '`/mulk-siralama` — Mülk sıralaması',
-              '`/renk al` — İsim rengi rolü (4000 coin)',
+              '`/market` → 🎨 Renk Al butonu — İsim rengi rolü (owner)',
             ].join('\n'),
           },
           {
@@ -4397,20 +4384,20 @@ client.on('interactionCreate', async interaction => {
           .setColor(0xE67E22)
           .setDescription('Bir bölüm seç:')
           .addFields(
-            { name: '🎭 Roller',          value: 'Sunucu rollerini satın al / iade et.',                 inline: true },
             { name: '🎁 Özel Eşyalar',   value: 'Kalkan, XP Boost, Coin Boost ve daha fazlası.',        inline: true },
             { name: '🏺 Antikalar',       value: 'Her gün 2 yeni antika gelir.',                         inline: true },
             { name: '👑 Kraliyet',        value: 'Her satışta fiyat artan kraliyet eşyaları.',           inline: true },
             { name: '🐾 Pet Satın Al',   value: 'Kedi, Köpek, Baykuş.',                                  inline: true },
             { name: '📿 Relikler',       value: 'Kalıcı güç bonusları kazandıran kutsal eserler.',       inline: true },
             { name: '🍖 Hayvan Maması',  value: '⚠️ Petlerini besle! 1 gün beslenmezse ölür!',          inline: true },
+            { name: '🎨 Renk Al',        value: 'İsim rengi rolü satın al (yalnızca owner).',            inline: true },
           )
           .setFooter({ text: '/market-yonet ile rol ekle/çıkar (admin)' });
         const r1 = new ActionRowBuilder().addComponents(
-          new ButtonBuilder().setCustomId(`mkt_roller_${uid}`).setLabel('🎭 Roller').setStyle(ButtonStyle.Primary),
           new ButtonBuilder().setCustomId(`mkt_esyalar_${uid}`).setLabel('🎁 Eşyalar').setStyle(ButtonStyle.Primary),
           new ButtonBuilder().setCustomId(`mkt_antikalar_${uid}`).setLabel('🏺 Antikalar').setStyle(ButtonStyle.Secondary),
           new ButtonBuilder().setCustomId(`mkt_kraliyet_${uid}`).setLabel('👑 Kraliyet').setStyle(ButtonStyle.Secondary),
+          new ButtonBuilder().setCustomId(`mkt_renkal_${uid}`).setLabel('🎨 Renk Al').setStyle(ButtonStyle.Primary),
         );
         const r2 = new ActionRowBuilder().addComponents(
           new ButtonBuilder().setCustomId(`mkt_pet_${uid}`).setLabel('🐾 Pet Al').setStyle(ButtonStyle.Success),
@@ -4437,74 +4424,37 @@ client.on('interactionCreate', async interaction => {
           return i.update(buildMarketHome());
         }
 
-        // ── ROLLER ───────────────────────────────────────────
-        if (section === 'roller') {
-          const roles   = getMarketRoles(gid);
-          const normal  = roles.filter(r => !r.isPremium);
-          const premium = roles.filter(r => r.isPremium);
-          const normalLines  = normal.length  ? normal.map(r  => `<@&${r.roleId}> — **${r.price} coin**`).join('\n')  : '_Henüz rol eklenmemiş_';
-          const premiumLines = premium.length ? premium.map(r => `<@&${r.roleId}> — **${r.price} coin** ⭐`).join('\n') : '_Yok_';
-          const e = new EmbedBuilder().setTitle('🎭 Rol Marketi').setColor(0xE67E22)
-            .addFields({ name: '📦 Normal', value: normalLines }, { name: '⭐ Premium', value: premiumLines })
-            .setFooter({ text: 'Aşağıdan rol seç → Satın Al veya İade Et' });
-
-          const components = [];
-
-          if (roles.length) {
-            const guildRoles = interaction.guild.roles.cache;
-            const options = roles.slice(0, 25).map(r => {
-              const roleObj = guildRoles.get(r.roleId);
-              const owned   = i.member.roles.cache.has(r.roleId);
-              const label   = roleObj ? roleObj.name : r.roleId;
-              const desc    = `${r.price} coin${r.isPremium ? ' ⭐ Premium' : ''}${owned ? ' — Zaten sahipsin' : ''}`;
-              return { label: label.slice(0, 100), description: desc.slice(0, 100), value: r.roleId };
-            });
-            const selectMenu = new StringSelectMenuBuilder()
-              .setCustomId(`mkt_rolsec_${uid}`)
-              .setPlaceholder('🔍 Rol ara veya listeden seç...')
-              .addOptions(options);
-            components.push(new ActionRowBuilder().addComponents(selectMenu));
+        // ── RENK AL (yalnızca owner) ─────────────────────────
+        if (section === 'renkal') {
+          if (!hasOwnerAccess(uid, i.member)) {
+            return i.reply({ ephemeral: true, content: '⛔ Bu butonu yalnızca bot sahipleri kullanabilir.' });
           }
-
-          components.push(new ActionRowBuilder().addComponents(
-            new ButtonBuilder().setCustomId(`mkt_roliade_${uid}`).setLabel('↩️ İade Et').setStyle(ButtonStyle.Secondary),
-            new ButtonBuilder().setCustomId(`mkt_back_${uid}`).setLabel('← Geri').setStyle(ButtonStyle.Danger),
-          ));
-
-          return i.update({ embeds: [e], components });
-        }
-
-        if (section === 'rolsec') {
-          const roleId = i.values[0];
-          const mRoles = getMarketRoles(gid);
-          const mRole  = mRoles.find(r => r.roleId === roleId);
-          if (!mRole) return i.reply({ ephemeral: true, content: '⛔ Bu rol artık markette yok.' });
-          const role = interaction.guild.roles.cache.get(roleId);
-          if (!role) return i.reply({ ephemeral: true, content: '⛔ Rol sunucuda bulunamadı.' });
-          const me = interaction.guild.members.me;
-          if (!me?.permissions.has(PermissionFlagsBits.ManageRoles) || role.position >= me.roles.highest.position)
-            return i.reply({ ephemeral: true, content: '⛔ Bu rolü yönetemiyorum.' });
-          if (i.member.roles.cache.has(roleId)) return i.reply({ ephemeral: true, content: `ℹ️ <@&${roleId}> rolüne zaten sahipsin.` });
-          const owned = mRoles.find(r => i.member.roles.cache.has(r.roleId));
-          if (owned) return i.reply({ ephemeral: true, content: `⛔ Zaten bir market rolün var: <@&${owned.roleId}>. Önce iade et.` });
-          const bal = getBalance(gid, uid);
-          if (bal.balance < mRole.price) return i.reply({ ephemeral: true, content: `⛔ Yetersiz coin! Gerekli: **${mRole.price}**, Bakiye: **${bal.balance}**` });
-          await i.member.roles.add(roleId, 'Market').catch(() => {});
-          addBalance(gid, uid, -mRole.price);
-          sendLog(gid, 'market', new EmbedBuilder().setTitle('🛒 Rol Satın Alındı').setColor(0xE67E22).addFields({ name: 'Kullanıcı', value: `<@${uid}>`, inline: true }, { name: 'Rol', value: `<@&${roleId}>`, inline: true }).setTimestamp());
-          return i.reply({ ephemeral: true, content: `✅ <@&${roleId}> rolünü aldın! **-${mRole.price}** coin | Bakiye: **${getBalance(gid, uid).balance}**` });
-        }
-
-
-        if (section === 'roliade') {
-          const mRoles = getMarketRoles(gid);
-          const owned  = mRoles.find(r => i.member.roles.cache.has(r.roleId));
-          if (!owned) return i.reply({ ephemeral: true, content: 'ℹ️ İade edebileceğin bir market rolün yok.' });
-          const refund = Math.floor(owned.price / 2);
-          await i.member.roles.remove(owned.roleId, 'Market iade').catch(() => {});
-          addBalance(gid, uid, refund);
-          sendLog(gid, 'market', new EmbedBuilder().setTitle('↩️ Rol İade').setColor(0xE67E22).addFields({ name: 'Kullanıcı', value: `<@${uid}>`, inline: true }, { name: 'Rol', value: `<@&${owned.roleId}>`, inline: true }).setTimestamp());
-          return i.reply({ ephemeral: true, content: `↩️ <@&${owned.roleId}> iade edildi. **+${refund} coin** | Bakiye: **${getBalance(gid, uid).balance}**` });
+          const colorRoles = getColorRoles(gid);
+          if (!colorRoles.length) {
+            return i.reply({ ephemeral: true, content: '⛔ Henüz renk rolü eklenmemiş. `/renkrolekle` komutuyla ekleyebilirsin.' });
+          }
+          const guildRoles2 = interaction.guild.roles.cache;
+          const colorOptions = colorRoles.slice(0, 25).map(r => {
+            const roleObj = guildRoles2.get(r.roleId);
+            const label   = roleObj ? roleObj.name : r.roleId;
+            const owned2  = i.member.roles.cache.has(r.roleId);
+            const desc    = `${r.price} coin${owned2 ? ' — Zaten sahipsin' : ''}`;
+            return { label: label.slice(0, 100), description: desc.slice(0, 100), value: r.roleId };
+          });
+          const colorSelect = new StringSelectMenuBuilder()
+            .setCustomId(`renkpick_${uid}`)
+            .setPlaceholder('🎨 Renk adına göre ara veya listeden seç...')
+            .addOptions(colorOptions);
+          const colorRow = new ActionRowBuilder().addComponents(colorSelect);
+          const colorEmbed = new EmbedBuilder()
+            .setTitle('🎨 Renk Rolü Seç')
+            .setColor(0xEB459E)
+            .setDescription(colorRoles.map(r => `<@&${r.roleId}> — **${r.price} coin**`).join('\n'))
+            .setFooter({ text: 'Bir renk rolü seç — sadece 1 renk rolüne sahip olabilirsin' });
+          const targetChannel = interaction.guild.channels.cache.get('1528416412950069441');
+          if (!targetChannel) return i.reply({ ephemeral: true, content: '⛔ Hedef kanal bulunamadı (ID: 1528416412950069441).' });
+          await targetChannel.send({ embeds: [colorEmbed], components: [colorRow] });
+          return i.reply({ ephemeral: true, content: `✅ Renk seçim paneli <#1528416412950069441> kanalına gönderildi!` });
         }
 
         // ── ÖZEL EŞYALAR ─────────────────────────────────────
@@ -4952,30 +4902,6 @@ client.on('interactionCreate', async interaction => {
           .setColor(0xEB459E)
           .setDescription(colorRoles.map(r => `<@&${r.roleId}> — **${r.price} coin**`).join('\n'));
         return interaction.reply({ embeds: [embed] });
-      }
-      if (sub === 'al') {
-        if (!colorRoles.length) return interaction.reply({ ephemeral: true, content: '⛔ Henüz renk rolü eklenmemiş. Bir yönetici `/renkrolekle` komutuyla ekleyebilir.' });
-        const roleId = interaction.options.getString('renk');
-        const cr = colorRoles.find(r => String(r.roleId) === roleId);
-        if (!cr) return interaction.reply({ ephemeral: true, content: '⛔ Bu renk rolü listede yok. Lütfen açılan önerilerden birini seç.' });
-        const role = await interaction.guild.roles.fetch(roleId).catch(() => null);
-        if (!role) return interaction.reply({ ephemeral: true, content: '⛔ Rol sunucuda bulunamadı (silinmiş olabilir).' });
-        const me = interaction.guild.members.me;
-        if (!me?.permissions.has(PermissionFlagsBits.ManageRoles) || role.position >= me.roles.highest.position)
-          return interaction.reply({ ephemeral: true, content: '⛔ Bu rolü yönetemiyorum (hiyerarşi/izin sorunu).' });
-        const bal = getBalance(gid, uid);
-        if (bal.balance < cr.price) return interaction.reply({ ephemeral: true, content: `⛔ Yetersiz coin! Gerekli: **${cr.price}**, Bakiye: **${bal.balance}**` });
-        // Önceki renk rolünü kaldır
-        const allColorRoleIds = colorRoles.map(r => String(r.roleId));
-        const member = interaction.member;
-        const owned = allColorRoleIds.filter(rid => member.roles.cache.has(rid));
-        for (const rid of owned) await member.roles.remove(rid).catch(() => {});
-        await member.roles.add(roleId).catch(() => {});
-        addBalance(gid, uid, -cr.price);
-        sendLog(gid, 'market', new EmbedBuilder().setTitle('🎨 Renk Rolü Satın Alındı').setColor(0xEB459E)
-          .addFields({ name: 'Kullanıcı', value: `<@${uid}>`, inline: true }, { name: 'Rol', value: `<@&${roleId}>`, inline: true }, { name: 'Fiyat', value: `${cr.price} coin`, inline: true })
-          .setTimestamp());
-        return interaction.reply({ ephemeral: true, content: `✅ <@&${roleId}> renk rolünü aldın! **-${cr.price}** coin. Bakiye: **${getBalance(gid, uid).balance}**` });
       }
     }
 
