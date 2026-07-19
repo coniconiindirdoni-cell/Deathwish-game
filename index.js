@@ -238,6 +238,10 @@ function ensureSchema() {
       guildId TEXT, userId TEXT, relicKey TEXT,
       PRIMARY KEY(guildId, userId, relicKey)
     );
+    CREATE TABLE IF NOT EXISTS relic_upgrades (
+      guildId TEXT, userId TEXT, relicKey TEXT, level INTEGER DEFAULT 1,
+      PRIMARY KEY(guildId, userId, relicKey)
+    );
     CREATE TABLE IF NOT EXISTS pet_food (
       guildId TEXT, userId TEXT, petKey TEXT, lastFedAt TEXT,
       PRIMARY KEY(guildId, userId, petKey)
@@ -498,6 +502,7 @@ async function restoreFromGithub(filePath, opts = {}) {
 
     // Mevcut DB'yi kapat, yeni dosyayı yaz, yeniden aç
     db.close();
+    _ownedRelicsCache.clear(); // DB değişecek (başarı ya da rollback fark etmez), eski cache güvenilmez
     const tmpDb = DB_PATH + `.old-${Date.now()}.db`;
     fs.renameSync(DB_PATH, tmpDb); // mevcut DB'yi sakla
     try {
@@ -593,7 +598,17 @@ function setSetting(gid, key, value)   { db.prepare('INSERT OR REPLACE INTO guil
 function getAllSettings(gid)            { const rows = db.prepare('SELECT key,value FROM guild_settings WHERE guildId=?').all(gid); const o = {}; for (const r of rows) o[r.key] = r.value; return o; }
 
 function getBalance(gid, uid)          { return db.prepare('SELECT balance,bank FROM economy WHERE guildId=? AND userId=?').get(gid, uid) || { balance: 0, bank: 0 }; }
-function addBalance(gid, uid, amt)     { db.prepare('INSERT OR IGNORE INTO economy(guildId,userId,balance,bank)VALUES(?,?,0,0)').run(gid, uid); db.prepare('UPDATE economy SET balance=MAX(0,balance+?) WHERE guildId=? AND userId=?').run(amt, gid, uid); return getBalance(gid, uid); }
+function addBalance(gid, uid, amt)     {
+  db.prepare('INSERT OR IGNORE INTO economy(guildId,userId,balance,bank)VALUES(?,?,0,0)').run(gid, uid);
+  if (amt >= 0) {
+    // Ödül / kazanç — bakiye her zaman artmalı, sıfırlanmamalı
+    db.prepare('UPDATE economy SET balance=balance+? WHERE guildId=? AND userId=?').run(amt, gid, uid);
+  } else {
+    // Harcama — bakiye sıfırın altına düşemez
+    db.prepare('UPDATE economy SET balance=MAX(0,balance+?) WHERE guildId=? AND userId=?').run(amt, gid, uid);
+  }
+  return getBalance(gid, uid);
+}
 function addBank(gid, uid, amt)        { db.prepare('INSERT OR IGNORE INTO economy(guildId,userId,balance,bank)VALUES(?,?,0,0)').run(gid, uid); db.prepare('UPDATE economy SET bank=MAX(0,bank+?) WHERE guildId=? AND userId=?').run(amt, gid, uid); return getBalance(gid, uid); }
 function transfer(gid, from, to, amt)  { if (getBalance(gid, from).balance < amt) return false; addBalance(gid, from, -amt); addBalance(gid, to, amt); return true; }
 function topBalance(gid, n = 10)       { return db.prepare('SELECT userId,balance,bank FROM economy WHERE guildId=? ORDER BY (balance+bank) DESC LIMIT ?').all(gid, n); }
@@ -653,7 +668,7 @@ function addXp(gid, uid, amt) {
 function topLevels(gid, n = 10)        { return db.prepare('SELECT userId,level,xp FROM level_data WHERE guildId=? ORDER BY level DESC,xp DESC LIMIT ?').all(gid, n); }
 
 // ── Yeni özellik yardımcıları ───────────────────────────────────
-// Hırsızlık Kalkanı (450 coin, 4 saat, /oyunlar cal komutundan korur)
+// Hırsızlık Kalkanı (900 coin, 4 saat, /oyunlar cal komutundan korur)
 function hasShield(gid, uid) {
   const r = db.prepare('SELECT expiresAt FROM theft_shields WHERE guildId=? AND userId=?').get(gid, uid);
   if (!r) return false;
@@ -662,7 +677,7 @@ function hasShield(gid, uid) {
 }
 function setShield(gid, uid, ms) { db.prepare('INSERT OR REPLACE INTO theft_shields(guildId,userId,expiresAt)VALUES(?,?,?)').run(gid, uid, Date.now() + ms); }
 
-// Geçici XP Boost — süreye değil kullanım hakkına dayanır (400 coin, 50 kullanım, 2x)
+// Geçici XP Boost — süreye değil kullanım hakkına dayanır (2000 coin, 50 kullanım, 2x)
 function getTempBoostUses(gid, uid) { const r = db.prepare('SELECT usesLeft FROM temp_xp_boosts WHERE guildId=? AND userId=?').get(gid, uid); return r ? (r.usesLeft || 0) : 0; }
 function hasTempBoost(gid, uid) { return getTempBoostUses(gid, uid) > 0; }
 function addTempBoostUses(gid, uid, n) {
@@ -877,6 +892,18 @@ const PETS = [
 const PET_UPGRADE_COSTS = [0, 2000, 2500, 3000, 3500]; // Lv1→Lv2=2000, …, Lv4→Lv5=3500
 const PET_MAX_LEVEL = 5;
 const PET_BONUS_PER_LEVEL = 4; // her seviyede +4%
+const RELIC_MAX_LEVEL = 5;
+const RELIC_UPGRADE_COST = 2000; // her seviyede 2000 coin
+const RELIC_BONUS_PER_LEVEL = 5; // her seviyede +5%
+
+// Ejder Seti ayrı bir yükseltme sistemine sahiptir: set tamamlanmadan
+// (3 parça bir arada olmadan) yükseltilemez. Tamamlandığında Lv.1 olarak
+// başlar ve her yükseltme (max Lv.5) verdiği TÜM bonuslara +%7 ekler.
+const EJDER_MAX_LEVEL = 5;
+const EJDER_UPGRADE_COST = 3000; // her seviyede 3000 coin
+const EJDER_BONUS_PER_LEVEL = 7; // her seviyede +7%
+const EJDER_BASE_COIN_BONUS = 30; // Lv1 Coin bonusu (%)
+const EJDER_BASE_XP_BONUS   = 20; // Lv1 XP bonusu (%)
 
 // ──────────────────────────────────────────────────────────────
 //  RELİK SİSTEMİ
@@ -1073,26 +1100,95 @@ function deleteMarketListing(id)        { db.prepare('DELETE FROM player_market 
 // ──────────────────────────────────────────────────────────────
 function getRelics(gid, uid)          { return db.prepare('SELECT relicKey FROM relics WHERE guildId=? AND userId=?').all(gid, uid).map(r => r.relicKey); }
 function hasRelic(gid, uid, key)      { return !!db.prepare('SELECT 1 FROM relics WHERE guildId=? AND userId=? AND relicKey=?').get(gid, uid, key); }
-function buyRelic(gid, uid, key)      { db.prepare('INSERT OR IGNORE INTO relics(guildId,userId,relicKey)VALUES(?,?,?)').run(gid, uid, key); }
-function hasAllEjderParts(gid, uid)   { return EJDER_SET_KEYS.every(k => hasRelic(gid, uid, k)); }
+
+// messageCreate her mesajda hasAllEjderParts()'ı (XP ve Coin hesapları için ayrı
+// ayrı) çağırıyor. Bunu ham SQL'e her seferinde gitmek yerine, kısa ömürlü
+// (3 sn) bir bellek içi cache ile besliyoruz — trafik yoğun sunucularda relik
+// kontrolü başına 3 sorguyu 1'e, mesaj başına toplam sorgu sayısını da
+// büyük ölçüde azaltır. Relik satın alma/yükseltme az sıklıkta olduğundan
+// 3 sn'lik olası gecikme (satın al → hemen mesaj at) kabul edilebilir; yine de
+// buyRelic/upgradeEjderSet çağrılarında cache anında temizleniyor.
+const _ownedRelicsCache = new Map(); // key: `${gid}:${uid}` -> { keys, expires }
+const OWNED_RELICS_CACHE_TTL = 3000;
+function getRelicsCached(gid, uid) {
+  const key = `${gid}:${uid}`;
+  const now = Date.now();
+  const hit = _ownedRelicsCache.get(key);
+  if (hit && hit.expires > now) return hit.keys;
+  const keys = getRelics(gid, uid);
+  _ownedRelicsCache.set(key, { keys, expires: now + OWNED_RELICS_CACHE_TTL });
+  return keys;
+}
+function invalidateRelicsCache(gid, uid) { _ownedRelicsCache.delete(`${gid}:${uid}`); }
+
+function buyRelic(gid, uid, key)      { db.prepare('INSERT OR IGNORE INTO relics(guildId,userId,relicKey)VALUES(?,?,?)').run(gid, uid, key); invalidateRelicsCache(gid, uid); }
+function hasAllEjderParts(gid, uid)   { const owned = getRelicsCached(gid, uid); return EJDER_SET_KEYS.every(k => owned.includes(k)); }
+
+// Relik yükseltme (Lv1-5, her biri RELIC_UPGRADE_COST coin, +RELIC_BONUS_PER_LEVEL% bonus/lv)
+function getRelicLevel(gid, uid, key) {
+  if (!hasRelic(gid, uid, key)) return 0;
+  const r = db.prepare('SELECT level FROM relic_upgrades WHERE guildId=? AND userId=? AND relicKey=?').get(gid, uid, key);
+  return r ? r.level : 1;
+}
+function upgradeRelic(gid, uid, key) {
+  db.prepare('INSERT OR IGNORE INTO relic_upgrades(guildId,userId,relicKey,level)VALUES(?,?,?,1)').run(gid, uid, key);
+  db.prepare('UPDATE relic_upgrades SET level=level+1 WHERE guildId=? AND userId=? AND relicKey=?').run(gid, uid, key);
+}
+
+// Ejder Seti seviyesi — set tamamlanmadan (3 parça) 0 döner, yani yükseltilemez.
+// Tamamlandığında ilk sorguda otomatik olarak Lv.1 kabul edilir (satır DB'de yoksa).
+function getEjderLevel(gid, uid) {
+  if (!hasAllEjderParts(gid, uid)) return 0;
+  const r = db.prepare('SELECT level FROM relic_upgrades WHERE guildId=? AND userId=? AND relicKey=?').get(gid, uid, 'ejderset');
+  return r ? r.level : 1;
+}
+function upgradeEjderSet(gid, uid) {
+  db.prepare('INSERT OR IGNORE INTO relic_upgrades(guildId,userId,relicKey,level)VALUES(?,?,?,1)').run(gid, uid, 'ejderset');
+  db.prepare('UPDATE relic_upgrades SET level=level+1 WHERE guildId=? AND userId=? AND relicKey=?').run(gid, uid, 'ejderset');
+}
+function getEjderCoinBonus(gid, uid) {
+  const lv = getEjderLevel(gid, uid); // 0 dönerse set tamamlanmamış demektir
+  if (lv === 0) return 0;
+  return EJDER_BASE_COIN_BONUS + (lv - 1) * EJDER_BONUS_PER_LEVEL; // Lv1=30% … Lv5=58%
+}
+function getEjderXpBonus(gid, uid) {
+  const lv = getEjderLevel(gid, uid); // 0 dönerse set tamamlanmamış demektir
+  if (lv === 0) return 0;
+  return EJDER_BASE_XP_BONUS + (lv - 1) * EJDER_BONUS_PER_LEVEL; // Lv1=20% … Lv5=48%
+}
 
 function getRelicXpBonus(gid, uid) {
   let bonus = 0;
-  if (hasRelic(gid, uid, 'bilgelik')) bonus += 15;  // +%15 XP
-  if (hasAllEjderParts(gid, uid))     bonus += 20;  // Ejder seti +%20 XP
+  if (hasRelic(gid, uid, 'bilgelik')) {
+    const lv = getRelicLevel(gid, uid, 'bilgelik');
+    bonus += 15 + (lv - 1) * RELIC_BONUS_PER_LEVEL; // Lv1=15% … Lv5=35%
+  }
+  bonus += getEjderXpBonus(gid, uid); // Ejder seti Lv1=%20 … Lv5=%48
   return bonus;
 }
 function getRelicCoinBonus(gid, uid) {
   let bonus = 0;
-  if (hasRelic(gid, uid, 'tuccar'))   bonus += 10;  // +%10 Coin (satışlarda)
-  if (hasAllEjderParts(gid, uid))     bonus += 30;  // Ejder seti +%30 Coin
+  if (hasRelic(gid, uid, 'tuccar')) {
+    const lv = getRelicLevel(gid, uid, 'tuccar');
+    bonus += 10 + (lv - 1) * RELIC_BONUS_PER_LEVEL; // Lv1=10% … Lv5=30%
+  }
+  bonus += getEjderCoinBonus(gid, uid); // Ejder seti Lv1=%30 … Lv5=%58
   return bonus;
 }
 function getRelicMineBonus(gid, uid) {
-  return hasRelic(gid, uid, 'madenci') ? 20 : 0;   // +%20 maden satış
+  if (!hasRelic(gid, uid, 'madenci')) return 0;
+  const lv = getRelicLevel(gid, uid, 'madenci');
+  return 20 + (lv - 1) * RELIC_BONUS_PER_LEVEL; // Lv1=20% … Lv5=40%
 }
 function getRelicFishBonus(gid, uid) {
-  return hasRelic(gid, uid, 'tuccar') ? 10 : 0;    // +%10 balık satış (Tüccar)
+  if (!hasRelic(gid, uid, 'tuccar')) return 0;
+  const lv = getRelicLevel(gid, uid, 'tuccar');
+  return 10 + (lv - 1) * RELIC_BONUS_PER_LEVEL; // Lv1=10% … Lv5=30%
+}
+function getRelicDenizFishMultiplier(gid, uid) {
+  if (!hasRelic(gid, uid, 'deniz')) return 1.0;
+  const lv = getRelicLevel(gid, uid, 'deniz');
+  return 1.3 + (lv - 1) * 0.2; // Lv1=1.3x … Lv5=2.1x nadir balık ağırlığı
 }
 
 // ──────────────────────────────────────────────────────────────
@@ -1301,10 +1397,10 @@ const FISH_TYPES = FISH_TIERS.flatMap(tier =>
   tier.fish.map(f => ({ ...f, weight: tier.totalWeight / tier.fish.length }))
 );
 
-function pickFish(boosted, denizBoost = false) {
+function pickFish(boosted, denizMult = 1.0) {
   let pool = FISH_TYPES.map(f => ({ ...f }));
-  if (boosted)    pool = pool.map(f => ({ ...f, weight: f.value >= 14 ? f.weight * 3 : f.weight }));
-  if (denizBoost) pool = pool.map(f => ({ ...f, weight: f.value >= 100 ? f.weight * 1.3 : f.weight }));
+  if (boosted)         pool = pool.map(f => ({ ...f, weight: f.value >= 14  ? f.weight * 3         : f.weight }));
+  if (denizMult > 1.0) pool = pool.map(f => ({ ...f, weight: f.value >= 100 ? f.weight * denizMult : f.weight }));
   const total = pool.reduce((a, f) => a + f.weight, 0);
   let r = Math.random() * total;
   for (const f of pool) {
@@ -1435,7 +1531,7 @@ function resolveFishCast(gid, uid, boosted) {
 
   saveFishCastState(gid, uid, state);
 
-  return { type: 'catch', fish: pickFish(boosted, hasRelic(gid, uid, 'deniz')) };
+  return { type: 'catch', fish: pickFish(boosted, getRelicDenizFishMultiplier(gid, uid)) };
 }
 
 // Blackjack / At Yarışı ortak ödül hesaplayıcı — 2x kazanç (bet kadar kâr)
@@ -3328,17 +3424,20 @@ client.on('messageCreate', async message => {
     const xpGained = Math.max(1, Math.round(xpBase * xpMult));
     const result = addXp(gid, uid, xpGained);
 
-    // XP Log
-    sendLog(gid, 'xp', new EmbedBuilder()
-      .setTitle('⚡ XP Kazanıldı')
-      .setColor(0x57F287)
-      .addFields(
-        { name: 'Kullanıcı', value: `<@${uid}>`, inline: true },
-        { name: 'XP', value: `+${xpGained}`, inline: true },
-        { name: 'Toplam', value: `${getLevel(gid, uid).xp} XP`, inline: true },
-      )
-      .setTimestamp()
-    );
+    // XP Log — yalnızca log kanalı ayarlıysa embed inşa et (aksi halde her
+    // mesajda boşa bir EmbedBuilder + ekstra getLevel() sorgusu çalışırdı)
+    if (getSetting(gid, 'log_xp_channel')) {
+      sendLog(gid, 'xp', new EmbedBuilder()
+        .setTitle('⚡ XP Kazanıldı')
+        .setColor(0x57F287)
+        .addFields(
+          { name: 'Kullanıcı', value: `<@${uid}>`, inline: true },
+          { name: 'XP', value: `+${xpGained}`, inline: true },
+          { name: 'Toplam', value: `${getLevel(gid, uid).xp} XP`, inline: true },
+        )
+        .setTimestamp()
+      );
+    }
 
     if (result.leveled) {
       const lvlCh = getSetting(gid, 'level_channel');
@@ -3673,7 +3772,7 @@ client.on('interactionCreate', async interaction => {
               '`/mulk ev-al/araba-al` — Mülk satın al',
               '`/yukselt` — Ev, Araba, Pet, Antika yükselt',
               '`/mulk-siralama` — Mülk sıralaması',
-              '`/market` → 🎨 Renk Al butonu — İsim rengi rolü (owner)',
+              '`/market` → 🎨 Renk Al butonu — İsim rengi rolü satın al',
             ].join('\n'),
           },
           {
@@ -4390,7 +4489,7 @@ client.on('interactionCreate', async interaction => {
             { name: '🐾 Pet Satın Al',   value: 'Kedi, Köpek, Baykuş.',                                  inline: true },
             { name: '📿 Relikler',       value: 'Kalıcı güç bonusları kazandıran kutsal eserler.',       inline: true },
             { name: '🍖 Hayvan Maması',  value: '⚠️ Petlerini besle! 1 gün beslenmezse ölür!',          inline: true },
-            { name: '🎨 Renk Al',        value: 'İsim rengi rolü satın al (yalnızca owner).',            inline: true },
+            { name: '🎨 Renk Al',        value: 'İsim rengi rolü satın al.',                            inline: true },
           )
           .setFooter({ text: '/market-yonet ile rol ekle/çıkar (admin)' });
         const r1 = new ActionRowBuilder().addComponents(
@@ -4424,11 +4523,8 @@ client.on('interactionCreate', async interaction => {
           return i.update(buildMarketHome());
         }
 
-        // ── RENK AL (yalnızca owner) ─────────────────────────
+        // ── RENK AL (herkes kullanabilir) ────────────────────
         if (section === 'renkal') {
-          if (!hasOwnerAccess(uid, i.member)) {
-            return i.reply({ ephemeral: true, content: '⛔ Bu butonu yalnızca bot sahipleri kullanabilir.' });
-          }
           const colorRoles = getColorRoles(gid);
           if (!colorRoles.length) {
             return i.reply({ ephemeral: true, content: '⛔ Henüz renk rolü eklenmemiş. `/renkrolekle` komutuyla ekleyebilirsin.' });
@@ -4446,29 +4542,29 @@ client.on('interactionCreate', async interaction => {
             .setPlaceholder('🎨 Renk adına göre ara veya listeden seç...')
             .addOptions(colorOptions);
           const colorRow = new ActionRowBuilder().addComponents(colorSelect);
+          const backRow  = new ActionRowBuilder().addComponents(
+            new ButtonBuilder().setCustomId(`mkt_back_${uid}`).setLabel('← Geri').setStyle(ButtonStyle.Danger)
+          );
           const colorEmbed = new EmbedBuilder()
             .setTitle('🎨 Renk Rolü Seç')
             .setColor(0xEB459E)
             .setDescription(colorRoles.map(r => `<@&${r.roleId}> — **${r.price} coin**`).join('\n'))
             .setFooter({ text: 'Bir renk rolü seç — sadece 1 renk rolüne sahip olabilirsin' });
-          const targetChannel = interaction.guild.channels.cache.get('1528416412950069441');
-          if (!targetChannel) return i.reply({ ephemeral: true, content: '⛔ Hedef kanal bulunamadı (ID: 1528416412950069441).' });
-          await targetChannel.send({ embeds: [colorEmbed], components: [colorRow] });
-          return i.reply({ ephemeral: true, content: `✅ Renk seçim paneli <#1528416412950069441> kanalına gönderildi!` });
+          return i.update({ embeds: [colorEmbed], components: [colorRow, backRow] });
         }
 
         // ── ÖZEL EŞYALAR ─────────────────────────────────────
         if (section === 'esyalar') {
           const e = new EmbedBuilder().setTitle('🎁 Özel Eşyalar').setColor(0xE67E22)
             .addFields(
-              { name: '🛡️ Kalkan',         value: '**450 coin** — 4 saat hırsızlık koruması',   inline: true },
-              { name: '⚡ Geçici XP (2x)', value: '**400 coin** — 50 kullanım',                  inline: true },
+              { name: '🛡️ Kalkan',         value: '**900 coin** — 4 saat hırsızlık koruması',   inline: true },
+              { name: '⚡ Geçici XP (2x)', value: '**2000 coin** — 50 kullanım',                 inline: true },
               { name: '💰 Coin Boost',     value: '**5000 coin** — Kalıcı 1.5x coin',            inline: true },
               { name: '⚡ Kalıcı XP',      value: '**4000 coin** — Kalıcı 1.5x XP',             inline: true },
             );
           const r = new ActionRowBuilder().addComponents(
-            new ButtonBuilder().setCustomId(`mkt_esya_kalkan_${uid}`).setLabel('🛡️ Kalkan (450c)').setStyle(ButtonStyle.Primary),
-            new ButtonBuilder().setCustomId(`mkt_esya_gecici_${uid}`).setLabel('⚡ Geçici XP (400c)').setStyle(ButtonStyle.Primary),
+            new ButtonBuilder().setCustomId(`mkt_esya_kalkan_${uid}`).setLabel('🛡️ Kalkan (900c)').setStyle(ButtonStyle.Primary),
+            new ButtonBuilder().setCustomId(`mkt_esya_gecici_${uid}`).setLabel('⚡ Geçici XP (2000c)').setStyle(ButtonStyle.Primary),
             new ButtonBuilder().setCustomId(`mkt_esya_coinboost_${uid}`).setLabel('💰 Coin Boost (5000c)').setStyle(ButtonStyle.Success),
             new ButtonBuilder().setCustomId(`mkt_esya_xpboost_${uid}`).setLabel('⚡ XP Boost (4000c)').setStyle(ButtonStyle.Success),
             new ButtonBuilder().setCustomId(`mkt_back_${uid}`).setLabel('← Geri').setStyle(ButtonStyle.Danger),
@@ -4481,16 +4577,16 @@ client.on('interactionCreate', async interaction => {
           if (esya === 'kalkan') {
             if (hasShield(gid, uid)) return i.reply({ ephemeral: true, content: '🛡️ Zaten aktif bir kalkanın var.' });
             const bal = getBalance(gid, uid);
-            if (bal.balance < 450) return i.reply({ ephemeral: true, content: `⛔ Yetersiz coin! Gerekli: **450**, Bakiye: **${bal.balance}**` });
-            addBalance(gid, uid, -450); setShield(gid, uid, 4 * 60 * 60 * 1000);
+            if (bal.balance < 900) return i.reply({ ephemeral: true, content: `⛔ Yetersiz coin! Gerekli: **900**, Bakiye: **${bal.balance}**` });
+            addBalance(gid, uid, -900); setShield(gid, uid, 4 * 60 * 60 * 1000);
             sendLog(gid, 'market', new EmbedBuilder().setTitle('🛡️ Kalkan').setColor(0xE67E22).addFields({ name: 'Kullanıcı', value: `<@${uid}>`, inline: true }).setTimestamp());
             return i.reply({ ephemeral: true, content: `🛡️ **Hırsızlık Kalkanı** aktif! 4 saat korunuyorsun. Bakiye: **${getBalance(gid, uid).balance}**` });
           }
           if (esya === 'gecici') {
             if (hasBoost(gid, uid)) return i.reply({ ephemeral: true, content: '⛔ Kalıcı XP Boost sahibisin, geçici kullanılamaz.' });
             const bal = getBalance(gid, uid);
-            if (bal.balance < 400) return i.reply({ ephemeral: true, content: `⛔ Yetersiz coin! Gerekli: **400**, Bakiye: **${bal.balance}**` });
-            addBalance(gid, uid, -400); addTempBoostUses(gid, uid, 50);
+            if (bal.balance < 2000) return i.reply({ ephemeral: true, content: `⛔ Yetersiz coin! Gerekli: **2000**, Bakiye: **${bal.balance}**` });
+            addBalance(gid, uid, -2000); addTempBoostUses(gid, uid, 50);
             sendLog(gid, 'market', new EmbedBuilder().setTitle('⚡ Geçici XP Boost').setColor(0xE67E22).addFields({ name: 'Kullanıcı', value: `<@${uid}>`, inline: true }).setTimestamp());
             return i.reply({ ephemeral: true, content: `⚡ **Geçici XP Boost (2x)** alındı! Kalan: **${getTempBoostUses(gid, uid)}** | Bakiye: **${getBalance(gid, uid).balance}**` });
           }
@@ -4604,22 +4700,86 @@ client.on('interactionCreate', async interaction => {
           const ownedKeys = getRelics(gid, uid);
           const ejderCnt  = EJDER_SET_KEYS.filter(k => ownedKeys.includes(k)).length;
           const lines = RELICS.map(r => {
-            const owned = ownedKeys.includes(r.key);
+            const owned   = ownedKeys.includes(r.key);
             const isEjder = r.group === 'ejder';
+            if (owned && !isEjder) {
+              const lv  = getRelicLevel(gid, uid, r.key);
+              const bar = '⭐'.repeat(lv) + '☆'.repeat(RELIC_MAX_LEVEL - lv);
+              const tag = lv >= RELIC_MAX_LEVEL ? `✅ **Lv.${lv} (MAKSİMUM)**` : `✅ **Lv.${lv}** ${bar} — Yükselt: **${RELIC_UPGRADE_COST} coin**`;
+              return `${r.emoji} **${r.name}** — ${tag}\n  ↳ ${r.description}`;
+            }
             const tag = owned ? '✅ **SAHİPSİN**' : isEjder ? '🐉 Oyuncu Pazarı / Şans Eseri' : `**${r.price} coin**`;
             return `${r.emoji} **${r.name}** — ${tag}\n  ↳ ${r.description}`;
           });
-          lines.push(`\n🐉 **Ejder Seti** (${ejderCnt}/3): Tümü takılınca **+%30 Coin** + **+%20 XP**\n  ↳ Madencilik/odunculukta **1/1000** şansla düşer ya da \`/pazar listele\`'den satın alınabilir.`);
-          // Sadece single group relikleri satın alınabilir
-          const avail = RELICS.filter(r => r.group === 'single' && !ownedKeys.includes(r.key));
-          const btns  = avail.map(r => new ButtonBuilder().setCustomId(`mkt_relical_${r.key}_${uid}`).setLabel(`${r.emoji} ${r.name.split(' ')[0]} (${r.price}c)`).setStyle(ButtonStyle.Primary));
-          const rows  = [];
-          if (btns.length) rows.push(new ActionRowBuilder().addComponents(...btns.slice(0, 5)));
+          // Ejder Seti — set tamamlanmadan yükseltilemez, tamamlanınca Lv.1'den başlar
+          const ejderLv = ejderCnt === 3 ? getEjderLevel(gid, uid) : 0;
+          let ejderStatus;
+          if (ejderCnt < 3) {
+            ejderStatus = `🐉 Oyuncu Pazarı / Şans Eseri ile parçaları topla`;
+          } else {
+            const ejderBar   = '⭐'.repeat(ejderLv) + '☆'.repeat(EJDER_MAX_LEVEL - ejderLv);
+            const coinBonus  = getEjderCoinBonus(gid, uid);
+            const xpBonus    = getEjderXpBonus(gid, uid);
+            ejderStatus = ejderLv >= EJDER_MAX_LEVEL
+              ? `✅ **Lv.${ejderLv} (MAKSİMUM)** ${ejderBar} — **+%${coinBonus} Coin** / **+%${xpBonus} XP**`
+              : `✅ **Lv.${ejderLv}** ${ejderBar} — **+%${coinBonus} Coin** / **+%${xpBonus} XP** — Yükselt: **${EJDER_UPGRADE_COST} coin**`;
+          }
+          lines.push(`\n🐉 **Ejder Seti** (${ejderCnt}/3): ${ejderStatus}\n  ↳ Madencilik/odunculukta **1/1000** şansla düşer ya da \`/pazar listele\`'den satın alınabilir. Set tamamlanmadan yükseltilemez.`);
+          // Satın alma butonları (henüz sahip olunamayanlar)
+          const avail   = RELICS.filter(r => r.group === 'single' && !ownedKeys.includes(r.key));
+          const buyBtns = avail.map(r => new ButtonBuilder().setCustomId(`mkt_relical_${r.key}_${uid}`).setLabel(`${r.emoji} ${r.name.split(' ')[0]} (${r.price}c)`).setStyle(ButtonStyle.Primary));
+          // Yükseltme butonları (sahip olunan, max olmayan single relikler)
+          const upgRelics = RELICS.filter(r => r.group === 'single' && ownedKeys.includes(r.key) && getRelicLevel(gid, uid, r.key) < RELIC_MAX_LEVEL);
+          const upgBtns   = upgRelics.map(r => {
+            const lv = getRelicLevel(gid, uid, r.key);
+            return new ButtonBuilder().setCustomId(`mkt_relicupg_${r.key}_${uid}`).setLabel(`⬆️ ${r.emoji} Lv.${lv}→${lv+1} (${RELIC_UPGRADE_COST}c)`).setStyle(ButtonStyle.Success);
+          });
+          // Ejder Seti yükseltme butonu (yalnızca set tamamlandıysa ve max değilse)
+          if (ejderCnt === 3 && ejderLv < EJDER_MAX_LEVEL) {
+            upgBtns.push(new ButtonBuilder().setCustomId(`mkt_relicupg_ejderset_${uid}`).setLabel(`⬆️ 🐉 Ejder Seti Lv.${ejderLv}→${ejderLv+1} (${EJDER_UPGRADE_COST}c)`).setStyle(ButtonStyle.Success));
+          }
+          const rows = [];
+          if (buyBtns.length) rows.push(new ActionRowBuilder().addComponents(...buyBtns.slice(0, 5)));
+          if (upgBtns.length) rows.push(new ActionRowBuilder().addComponents(...upgBtns.slice(0, 5)));
           rows.push(new ActionRowBuilder().addComponents(new ButtonBuilder().setCustomId(`mkt_back_${uid}`).setLabel('← Geri').setStyle(ButtonStyle.Danger)));
           const e = new EmbedBuilder().setTitle('📿 Relikler').setColor(0x9B59B6)
             .setDescription(lines.join('\n\n'))
-            .setFooter({ text: 'Ejder Seti = sadece oyuncu pazarı veya şans eseri drop' });
+            .setFooter({ text: `Tekli relik: +%${RELIC_BONUS_PER_LEVEL}/lv (${RELIC_UPGRADE_COST}c) • Ejder Seti: +%${EJDER_BONUS_PER_LEVEL}/lv (${EJDER_UPGRADE_COST}c) • Max Lv.${RELIC_MAX_LEVEL}` });
           return i.update({ embeds: [e], components: rows.slice(0, 5) });
+        }
+
+        if (section === 'relicupg') {
+          const relicKey = parts[2];
+
+          // Ejder Seti — ayrı yükseltme mantığı: set tamamlanmadan yükseltilemez
+          if (relicKey === 'ejderset') {
+            if (!hasAllEjderParts(gid, uid)) return i.reply({ ephemeral: true, content: '🐉 Ejder Setini yükseltebilmek için önce **3 parçanın da** (Pençe, Diş, Göz) sahibi olmalısın!' });
+            const lv = getEjderLevel(gid, uid);
+            if (lv >= EJDER_MAX_LEVEL) return i.reply({ ephemeral: true, content: `🐉 **Ejder Seti** zaten maksimum seviyede (Lv.${EJDER_MAX_LEVEL})!` });
+            const bal = getBalance(gid, uid);
+            if (bal.balance < EJDER_UPGRADE_COST) return i.reply({ ephemeral: true, content: `⛔ Yetersiz coin! Gerekli: **${EJDER_UPGRADE_COST}**, Bakiye: **${bal.balance}**` });
+            addBalance(gid, uid, -EJDER_UPGRADE_COST);
+            upgradeEjderSet(gid, uid);
+            const newLv = lv + 1;
+            sendLog(gid, 'market', new EmbedBuilder().setTitle('🐉 Ejder Seti Yükseltme').setColor(0x9B59B6)
+              .addFields({ name: 'Kullanıcı', value: `<@${uid}>`, inline: true }, { name: 'Yeni Lv.', value: `${newLv}`, inline: true }).setTimestamp());
+            return i.reply({ ephemeral: true, content: `✨ 🐉 **Ejder Seti** → **Lv.${newLv}** yükseltildi! (+%${EJDER_BONUS_PER_LEVEL} Coin & XP bonus)\n💰 Kalan: **${getBalance(gid, uid).balance} coin**\n📊 Yeni toplam: **+%${getEjderCoinBonus(gid, uid)} Coin** / **+%${getEjderXpBonus(gid, uid)} XP**` });
+          }
+
+          const rDef     = RELICS.find(r => r.key === relicKey);
+          if (!rDef || rDef.group === 'ejder') return i.reply({ ephemeral: true, content: '⛔ Geçersiz relik.' });
+          if (!hasRelic(gid, uid, relicKey)) return i.reply({ ephemeral: true, content: `${rDef.emoji} Bu relike sahip değilsin!` });
+          const lv = getRelicLevel(gid, uid, relicKey);
+          if (lv >= RELIC_MAX_LEVEL) return i.reply({ ephemeral: true, content: `${rDef.emoji} **${rDef.name}** zaten maksimum seviyede (Lv.${RELIC_MAX_LEVEL})!` });
+          const bal = getBalance(gid, uid);
+          if (bal.balance < RELIC_UPGRADE_COST) return i.reply({ ephemeral: true, content: `⛔ Yetersiz coin! Gerekli: **${RELIC_UPGRADE_COST}**, Bakiye: **${bal.balance}**` });
+          addBalance(gid, uid, -RELIC_UPGRADE_COST);
+          upgradeRelic(gid, uid, relicKey);
+          const newLv    = lv + 1;
+          const newBonus = 15 + (newLv - 1) * RELIC_BONUS_PER_LEVEL; // genel gösterim için
+          sendLog(gid, 'market', new EmbedBuilder().setTitle(`📿 Relik Yükseltme: ${rDef.name}`).setColor(0x9B59B6)
+            .addFields({ name: 'Kullanıcı', value: `<@${uid}>`, inline: true }, { name: 'Yeni Lv.', value: `${newLv}`, inline: true }).setTimestamp());
+          return i.reply({ ephemeral: true, content: `✨ ${rDef.emoji} **${rDef.name}** → **Lv.${newLv}** yükseltildi! (+%${RELIC_BONUS_PER_LEVEL} bonus)\n💰 Kalan: **${getBalance(gid, uid).balance} coin**` });
         }
 
         if (section === 'relical') {
@@ -5616,6 +5776,7 @@ client.on('interactionCreate', async interaction => {
           if (!hasRelic(gid, uid, key)) return interaction.reply({ ephemeral: true, content: `⛔ Bu relike sahip değilsin!` });
           // Reliği envanterden sil
           db.prepare('DELETE FROM relics WHERE guildId=? AND userId=? AND relicKey=?').run(gid, uid, key);
+          invalidateRelicsCache(gid, uid);
           const id = createMarketListing(gid, uid, 'ejder', key, price);
           return interaction.reply(`✅ ${def.emoji} **${def.name}** **${price} coin**'e ilanı açıldı! İlan #${id}`);
         }
@@ -5662,7 +5823,7 @@ client.on('interactionCreate', async interaction => {
           addPlayerTool(gid, uid, listing.itemKey);
         } else if (listing.itemType === 'ejder') {
           buyRelic(gid, uid, listing.itemKey);
-          const ejderMsg = hasAllEjderParts(gid, uid) ? '\n🐉 **Ejder Seti tamamlandı!** +%30 Coin ve +%20 XP aktif!' : '';
+          const ejderMsg = hasAllEjderParts(gid, uid) ? `\n🐉 **Ejder Seti tamamlandı!** +%${getEjderCoinBonus(gid, uid)} Coin ve +%${getEjderXpBonus(gid, uid)} XP aktif! (\`/market\` → Relikler'den yükseltebilirsin)` : '';
           sendLog(gid, 'market', new EmbedBuilder().setTitle('🏪 Oyuncu Pazarı — Alım').setColor(0xE67E22)
             .addFields({ name: 'Alıcı', value: `<@${uid}>`, inline: true }, { name: 'Satıcı', value: `<@${listing.sellerId}>`, inline: true }, { name: 'Eşya', value: name, inline: true }, { name: 'Fiyat', value: `${listing.price} coin`, inline: true }).setTimestamp());
           return interaction.reply(`✅ ${name} satın alındı! **-${listing.price} coin** | Bakiye: **${getBalance(gid, uid).balance}**${ejderMsg}`);
@@ -5744,6 +5905,34 @@ client.on('interactionCreate', async interaction => {
           const ok = bal >= cost;
           options.push({ label: `${def.emoji} ${def.name} — Lv.${lv} → Lv.${lv + 1}`, description: `${cost} coin | +%${nextBonus} ${bonusLabel(def.bonusType)}${ok ? ' ✅' : ' ❌ Yetersiz'}`, value: `pet_${def.key}` });
           lines.push(`${def.emoji} **${def.name}** Lv.${lv}/${PET_MAX_LEVEL} — **${cost} coin** → +%${nextBonus} ${bonusLabel(def.bonusType)} ${ok ? '✅' : '❌ Yetersiz'}`);
+        }
+      }
+
+      // 📿 Relikler (single group, sahip olunan, max olmayan)
+      const ownedSingleRelics = RELICS.filter(r => r.group === 'single' && hasRelic(gid, uid, r.key));
+      for (const r of ownedSingleRelics) {
+        const lv = getRelicLevel(gid, uid, r.key);
+        if (lv >= RELIC_MAX_LEVEL) {
+          lines.push(`${r.emoji} **${r.name}** Lv.${RELIC_MAX_LEVEL}/${RELIC_MAX_LEVEL} — 🔒 Maksimum`);
+        } else {
+          const ok = bal >= RELIC_UPGRADE_COST;
+          const bar = '⭐'.repeat(lv) + '☆'.repeat(RELIC_MAX_LEVEL - lv);
+          options.push({ label: `${r.emoji} ${r.name} — Lv.${lv} → Lv.${lv + 1}`, description: `${RELIC_UPGRADE_COST} coin | +%${RELIC_BONUS_PER_LEVEL} bonus${ok ? ' ✅' : ' ❌ Yetersiz'}`, value: `relic_${r.key}` });
+          lines.push(`${r.emoji} **${r.name}** ${bar} (${lv}/${RELIC_MAX_LEVEL}) — **${RELIC_UPGRADE_COST} coin** ${ok ? '✅' : '❌ Yetersiz'}`);
+        }
+      }
+
+      // 🐉 Ejder Seti (yalnızca 3 parça tamamlandıysa yükseltilebilir)
+      const ejderCntPanel = EJDER_SET_KEYS.filter(k => hasRelic(gid, uid, k)).length;
+      if (ejderCntPanel === 3) {
+        const ejLv = getEjderLevel(gid, uid);
+        if (ejLv >= EJDER_MAX_LEVEL) {
+          lines.push(`🐉 **Ejder Seti** Lv.${EJDER_MAX_LEVEL}/${EJDER_MAX_LEVEL} — 🔒 Maksimum`);
+        } else {
+          const ok  = bal >= EJDER_UPGRADE_COST;
+          const bar = '⭐'.repeat(ejLv) + '☆'.repeat(EJDER_MAX_LEVEL - ejLv);
+          options.push({ label: `🐉 Ejder Seti — Lv.${ejLv} → Lv.${ejLv + 1}`, description: `${EJDER_UPGRADE_COST} coin | +%${EJDER_BONUS_PER_LEVEL} Coin & XP${ok ? ' ✅' : ' ❌ Yetersiz'}`, value: 'ejderset' });
+          lines.push(`🐉 **Ejder Seti** ${bar} (${ejLv}/${EJDER_MAX_LEVEL}) — **${EJDER_UPGRADE_COST} coin** ${ok ? '✅' : '❌ Yetersiz'}`);
         }
       }
 
@@ -5833,6 +6022,32 @@ client.on('interactionCreate', async interaction => {
           const newCoin  = active.coinBonus  + newUpg * 5;
           const newDaily = active.dailyBonus + newUpg * 5;
           return i.update({ content: `✨ ${active.emoji} **${active.name}** ${starsNew} yükseltildi!\n+%${newXp} XP | +%${newCoin} Coin${newDaily ? ` | +%${newDaily} Günlük` : ''}\n💰 Kalan: **${getBalance(gid, uid).balance} coin**`, embeds: [], components: [] });
+        }
+
+        if (choice === 'ejderset') {
+          if (!hasAllEjderParts(gid, uid)) return i.update({ content: '🐉 Ejder Setini yükseltebilmek için önce **3 parçanın da** sahibi olmalısın!', embeds: [], components: [] });
+          const lv = getEjderLevel(gid, uid);
+          if (lv >= EJDER_MAX_LEVEL) return i.update({ content: `🐉 **Ejder Seti** zaten maksimum (Lv.${EJDER_MAX_LEVEL})!`, embeds: [], components: [] });
+          if (nowBal < EJDER_UPGRADE_COST) return i.update({ content: `⛔ Yetersiz coin! Gerekli: **${EJDER_UPGRADE_COST}**, Bakiye: **${nowBal}**`, embeds: [], components: [] });
+          addBalance(gid, uid, -EJDER_UPGRADE_COST);
+          upgradeEjderSet(gid, uid);
+          const newLv = lv + 1;
+          const bar   = '⭐'.repeat(newLv) + '☆'.repeat(EJDER_MAX_LEVEL - newLv);
+          return i.update({ content: `✨ 🐉 **Ejder Seti** ${bar} **Lv.${newLv}** oldu! **+%${getEjderCoinBonus(gid, uid)} Coin** / **+%${getEjderXpBonus(gid, uid)} XP**\n💰 Kalan: **${getBalance(gid, uid).balance} coin**`, embeds: [], components: [] });
+        }
+
+        if (choice.startsWith('relic_')) {
+          const relicKey = choice.slice(6);
+          const rDef     = RELICS.find(r => r.key === relicKey);
+          if (!rDef) return i.update({ content: '⛔ Geçersiz relik.', embeds: [], components: [] });
+          const lv = getRelicLevel(gid, uid, relicKey);
+          if (lv >= RELIC_MAX_LEVEL) return i.update({ content: `${rDef.emoji} **${rDef.name}** zaten maksimum (Lv.${RELIC_MAX_LEVEL})!`, embeds: [], components: [] });
+          if (nowBal < RELIC_UPGRADE_COST) return i.update({ content: `⛔ Yetersiz coin! Gerekli: **${RELIC_UPGRADE_COST}**, Bakiye: **${nowBal}**`, embeds: [], components: [] });
+          addBalance(gid, uid, -RELIC_UPGRADE_COST);
+          upgradeRelic(gid, uid, relicKey);
+          const newLv = lv + 1;
+          const bar   = '⭐'.repeat(newLv) + '☆'.repeat(RELIC_MAX_LEVEL - newLv);
+          return i.update({ content: `✨ ${rDef.emoji} **${rDef.name}** ${bar} **Lv.${newLv}** oldu! (+%${RELIC_BONUS_PER_LEVEL} bonus)\n💰 Kalan: **${getBalance(gid, uid).balance} coin**`, embeds: [], components: [] });
         }
       });
 
@@ -6054,7 +6269,7 @@ async function sendSetupPanel(interaction) {
         `⛔ Hata: ${fmt('log_error_channel')}`,
         `📝 Slash: ${fmt('log_slash_channel')}`,
       ].join('\n') },
-      { name: '💰 Ekonomi', value: `Başlangıç Coin: **${s.start_coin || '0'}**\nGünlük Ödül: **${s.daily_reward || '80'}**` },
+      { name: '💰 Ekonomi', value: `Başlangıç Coin: **${s.start_coin || '0'}**\nGünlük Ödül: **${s.daily_reward || '640'}**` },
     );
 
   const mainMenu = new StringSelectMenuBuilder()
