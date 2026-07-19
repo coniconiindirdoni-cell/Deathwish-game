@@ -234,6 +234,23 @@ function ensureSchema() {
       guildId TEXT, date TEXT, antique1 TEXT, antique2 TEXT,
       PRIMARY KEY(guildId, date)
     );
+    CREATE TABLE IF NOT EXISTS relics (
+      guildId TEXT, userId TEXT, relicKey TEXT,
+      PRIMARY KEY(guildId, userId, relicKey)
+    );
+    CREATE TABLE IF NOT EXISTS pet_food (
+      guildId TEXT, userId TEXT, petKey TEXT, lastFedAt TEXT,
+      PRIMARY KEY(guildId, userId, petKey)
+    );
+    CREATE TABLE IF NOT EXISTS player_tools (
+      guildId TEXT, userId TEXT, toolKey TEXT, quantity INTEGER DEFAULT 1,
+      PRIMARY KEY(guildId, userId, toolKey)
+    );
+    CREATE TABLE IF NOT EXISTS player_market (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      guildId TEXT, sellerId TEXT, itemType TEXT, itemKey TEXT,
+      quantity INTEGER DEFAULT 1, price INTEGER, listedAt TEXT
+    );
   `);
 }
 
@@ -579,7 +596,7 @@ function getBalance(gid, uid)          { return db.prepare('SELECT balance,bank 
 function addBalance(gid, uid, amt)     { db.prepare('INSERT OR IGNORE INTO economy(guildId,userId,balance,bank)VALUES(?,?,0,0)').run(gid, uid); db.prepare('UPDATE economy SET balance=MAX(0,balance+?) WHERE guildId=? AND userId=?').run(amt, gid, uid); return getBalance(gid, uid); }
 function addBank(gid, uid, amt)        { db.prepare('INSERT OR IGNORE INTO economy(guildId,userId,balance,bank)VALUES(?,?,0,0)').run(gid, uid); db.prepare('UPDATE economy SET bank=MAX(0,bank+?) WHERE guildId=? AND userId=?').run(amt, gid, uid); return getBalance(gid, uid); }
 function transfer(gid, from, to, amt)  { if (getBalance(gid, from).balance < amt) return false; addBalance(gid, from, -amt); addBalance(gid, to, amt); return true; }
-function topBalance(gid, n = 10)       { return db.prepare('SELECT userId,balance FROM economy WHERE guildId=? ORDER BY balance DESC LIMIT ?').all(gid, n); }
+function topBalance(gid, n = 10)       { return db.prepare('SELECT userId,balance,bank FROM economy WHERE guildId=? ORDER BY (balance+bank) DESC LIMIT ?').all(gid, n); }
 
 function getMarriage(gid, uid)         { return db.prepare('SELECT * FROM marriages WHERE guildId=? AND (user1=? OR user2=?)').get(gid, uid, uid); }
 function setMarriage(gid, u1, u2)      { const now = nowTR(); db.prepare('INSERT OR IGNORE INTO marriages(guildId,user1,user2,marriedAt)VALUES(?,?,?,?)').run(gid, u1, u2, now); db.prepare('INSERT OR IGNORE INTO marriages(guildId,user1,user2,marriedAt)VALUES(?,?,?,?)').run(gid, u2, u1, now); }
@@ -861,6 +878,57 @@ const PET_UPGRADE_COSTS = [0, 2000, 2500, 3000, 3500]; // Lv1→Lv2=2000, …, L
 const PET_MAX_LEVEL = 5;
 const PET_BONUS_PER_LEVEL = 4; // her seviyede +4%
 
+// ──────────────────────────────────────────────────────────────
+//  RELİK SİSTEMİ
+// ──────────────────────────────────────────────────────────────
+const RELICS = [
+  { key: 'madenci',       name: 'Madenci Reliği',  emoji: '⛏️', price: 10000, group: 'single',
+    description: 'Çıkardığın madenlerin satış değeri **+%20** artar.' },
+  { key: 'deniz',         name: 'Deniz Reliği',    emoji: '🎣', price: 10000, group: 'single',
+    description: '**+%30** daha yüksek değerli balık yakalama şansı (nadir balıklar daha sık gelir).' },
+  { key: 'bilgelik',      name: 'Bilgelik Reliği', emoji: '📚', price: 10000, group: 'single',
+    description: 'Tüm XP kazanımları **+%15** artar.' },
+  { key: 'tuccar',        name: 'Tüccar Reliği',   emoji: '💰', price: 10000, group: 'single',
+    description: 'Balık ve maden satışından **+%10** coin kazanırsın. Pazar vergisi **%50** azalır.' },
+  { key: 'ejder_pence',   name: 'Ejder Pençesi',   emoji: '🐉', price: 10000, group: 'ejder',
+    description: 'Ejder Setinin bir parçası. Tüm 3 parça takılınca aktifleşir.' },
+  { key: 'ejder_disi',    name: 'Ejder Dişi',      emoji: '🦷', price: 10000, group: 'ejder',
+    description: 'Ejder Setinin bir parçası. Tüm 3 parça takılınca aktifleşir.' },
+  { key: 'ejder_gozu',    name: 'Ejder Gözü',      emoji: '👁️', price: 10000, group: 'ejder',
+    description: 'Ejder Setinin bir parçası. Tüm 3 parça takılınca aktifleşir.' },
+];
+const EJDER_SET_KEYS = ['ejder_pence', 'ejder_disi', 'ejder_gozu'];
+
+// ──────────────────────────────────────────────────────────────
+//  HAYVAN MAMASI
+// ──────────────────────────────────────────────────────────────
+const PET_FOODS = [
+  { key: 'kedi_mama',   name: 'Kedi Maması',   emoji: '🐱', petKey: 'kedi',   price: 400 },
+  { key: 'kopek_mama',  name: 'Köpek Maması',  emoji: '🐶', petKey: 'kopek',  price: 400 },
+  { key: 'baykus_mama', name: 'Baykuş Maması', emoji: '🦉', petKey: 'baykus', price: 400 },
+];
+
+// ──────────────────────────────────────────────────────────────
+//  MADENCİLİK ARAÇLARI (sadece oyuncu pazarından/drop)
+// ──────────────────────────────────────────────────────────────
+const MINING_TOOLS = [
+  { key: 'demir_kazma',  name: 'Demir Kazma',   emoji: '⛏️',  bonus: 5,  type: 'kazma', dropWeight: 50 },
+  { key: 'altin_kazma',  name: 'Altın Kazma',   emoji: '🪙',  bonus: 10, type: 'kazma', dropWeight: 30 },
+  { key: 'elmas_kazma',  name: 'Elmas Kazma',   emoji: '💎',  bonus: 15, type: 'kazma', dropWeight: 15 },
+  { key: 'buyulu_kazma', name: 'Büyülü Kazma',  emoji: '✨',  bonus: 20, type: 'kazma', dropWeight: 5  },
+];
+
+// ──────────────────────────────────────────────────────────────
+//  ODUNCULUK ARAÇLARI (sadece oyuncu pazarından/drop)
+// ──────────────────────────────────────────────────────────────
+const WOOD_TOOLS = [
+  { key: 'demir_balta',  name: 'Demir Balta',   emoji: '🪓',  bonus: 5,  type: 'balta', dropWeight: 50 },
+  { key: 'altin_balta',  name: 'Altın Balta',   emoji: '🪙',  bonus: 10, type: 'balta', dropWeight: 30 },
+  { key: 'elmas_balta',  name: 'Elmas Balta',   emoji: '💎',  bonus: 15, type: 'balta', dropWeight: 15 },
+  { key: 'buyulu_balta', name: 'Büyülü Balta',  emoji: '✨',  bonus: 20, type: 'balta', dropWeight: 5  },
+];
+const ALL_TOOLS = [...MINING_TOOLS, ...WOOD_TOOLS];
+
 function getPetBonusByLevel(petDef, level) { return petDef.bonusBase + (level - 1) * PET_BONUS_PER_LEVEL; }
 function getPetRows(gid, uid) { return db.prepare('SELECT petKey, level FROM pets WHERE guildId=? AND userId=?').all(gid, uid); }
 function hasPet(gid, uid, petKey) { return !!db.prepare('SELECT 1 FROM pets WHERE guildId=? AND userId=? AND petKey=?').get(gid, uid, petKey); }
@@ -900,6 +968,170 @@ function getPetDailyBonus(gid, uid) {
 }
 
 // ──────────────────────────────────────────────────────────────
+//  ARAÇ & OYUNCU PAZARI YARDIMCILARI
+// ──────────────────────────────────────────────────────────────
+function getPlayerTools(gid, uid)            { return db.prepare('SELECT toolKey, quantity FROM player_tools WHERE guildId=? AND userId=?').all(gid, uid); }
+function getPlayerTool(gid, uid, key)        { return db.prepare('SELECT quantity FROM player_tools WHERE guildId=? AND userId=? AND toolKey=?').get(gid, uid, key); }
+function addPlayerTool(gid, uid, key, qty=1) {
+  const row = getPlayerTool(gid, uid, key);
+  if (row) db.prepare('UPDATE player_tools SET quantity=quantity+? WHERE guildId=? AND userId=? AND toolKey=?').run(qty, gid, uid, key);
+  else      db.prepare('INSERT INTO player_tools(guildId,userId,toolKey,quantity)VALUES(?,?,?,?)').run(gid, uid, key, qty);
+}
+function removePlayerTool(gid, uid, key, qty=1) {
+  const row = getPlayerTool(gid, uid, key);
+  if (!row || row.quantity < qty) return false;
+  if (row.quantity === qty) db.prepare('DELETE FROM player_tools WHERE guildId=? AND userId=? AND toolKey=?').run(gid, uid, key);
+  else db.prepare('UPDATE player_tools SET quantity=quantity-? WHERE guildId=? AND userId=? AND toolKey=?').run(qty, gid, uid, key);
+  return true;
+}
+
+function getBestMiningToolBonus(gid, uid) {
+  const tools = getPlayerTools(gid, uid);
+  let best = 0;
+  for (const t of tools) {
+    const def = MINING_TOOLS.find(x => x.key === t.toolKey);
+    if (def && def.bonus > best) best = def.bonus;
+  }
+  return best;
+}
+function getBestWoodToolBonus(gid, uid) {
+  const tools = getPlayerTools(gid, uid);
+  let best = 0;
+  for (const t of tools) {
+    const def = WOOD_TOOLS.find(x => x.key === t.toolKey);
+    if (def && def.bonus > best) best = def.bonus;
+  }
+  return best;
+}
+function getBestMiningToolDef(gid, uid) {
+  const tools = getPlayerTools(gid, uid);
+  let best = null;
+  for (const t of tools) {
+    const def = MINING_TOOLS.find(x => x.key === t.toolKey);
+    if (def && (!best || def.bonus > best.bonus)) best = def;
+  }
+  return best;
+}
+function getBestWoodToolDef(gid, uid) {
+  const tools = getPlayerTools(gid, uid);
+  let best = null;
+  for (const t of tools) {
+    const def = WOOD_TOOLS.find(x => x.key === t.toolKey);
+    if (def && (!best || def.bonus > best.bonus)) best = def;
+  }
+  return best;
+}
+
+// Ağırlıklı rastgele seçim
+function pickWeighted(arr) {
+  const total = arr.reduce((s, x) => s + x.dropWeight, 0);
+  let r = Math.random() * total;
+  for (const x of arr) { if (r < x.dropWeight) return x; r -= x.dropWeight; }
+  return arr[arr.length - 1];
+}
+
+// Şans eseri drop (madencilik veya odunculuk)
+function giveRareDrop(gid, uid, toolPool) {
+  const roll = Math.random();
+  if (roll < 0.40) {
+    // Rastgele antika
+    const a = ANTIQUES[Math.floor(Math.random() * ANTIQUES.length)];
+    addAntique(gid, uid, a.key);
+    return `✨ **Şans Eseri!** ${a.emoji} **${a.name}** antikası bulundu! (\`/antika envanter\` ile gör)`;
+  } else if (roll < 0.70) {
+    // Rastgele relik (ejder dahil)
+    const r = RELICS[Math.floor(Math.random() * RELICS.length)];
+    if (!hasRelic(gid, uid, r.key)) {
+      buyRelic(gid, uid, r.key);
+      const ejderMsg = r.group === 'ejder' && hasAllEjderParts(gid, uid) ? ' 🐉 Ejder Seti tamamlandı!' : '';
+      return `✨ **Şans Eseri!** ${r.emoji} **${r.name}** reliği bulundu!${ejderMsg}`;
+    }
+    // Zaten sahipse araç ver
+    const tool = pickWeighted(toolPool);
+    addPlayerTool(gid, uid, tool.key);
+    return `✨ **Şans Eseri!** ${tool.emoji} **${tool.name}** düştü! (\`/pazar envanter\` ile gör)`;
+  } else {
+    // Araç drop
+    const tool = pickWeighted(toolPool);
+    addPlayerTool(gid, uid, tool.key);
+    return `✨ **Şans Eseri!** ${tool.emoji} **${tool.name}** düştü! (\`/pazar envanter\` ile gör)`;
+  }
+}
+
+// Oyuncu Pazarı DB yardımcıları
+function createMarketListing(gid, sellerId, itemType, itemKey, price) {
+  const listedAt = new Date().toISOString();
+  const res = db.prepare('INSERT INTO player_market(guildId,sellerId,itemType,itemKey,price,listedAt)VALUES(?,?,?,?,?,?)').run(gid, sellerId, itemType, itemKey, price, listedAt);
+  return res.lastInsertRowid;
+}
+function getMarketListings(gid)         { return db.prepare('SELECT * FROM player_market WHERE guildId=? ORDER BY id DESC').all(gid); }
+function getMarketListing(id)           { return db.prepare('SELECT * FROM player_market WHERE id=?').get(id); }
+function deleteMarketListing(id)        { db.prepare('DELETE FROM player_market WHERE id=?').run(id); }
+
+// ──────────────────────────────────────────────────────────────
+//  RELİK YARDIMCILARI
+// ──────────────────────────────────────────────────────────────
+function getRelics(gid, uid)          { return db.prepare('SELECT relicKey FROM relics WHERE guildId=? AND userId=?').all(gid, uid).map(r => r.relicKey); }
+function hasRelic(gid, uid, key)      { return !!db.prepare('SELECT 1 FROM relics WHERE guildId=? AND userId=? AND relicKey=?').get(gid, uid, key); }
+function buyRelic(gid, uid, key)      { db.prepare('INSERT OR IGNORE INTO relics(guildId,userId,relicKey)VALUES(?,?,?)').run(gid, uid, key); }
+function hasAllEjderParts(gid, uid)   { return EJDER_SET_KEYS.every(k => hasRelic(gid, uid, k)); }
+
+function getRelicXpBonus(gid, uid) {
+  let bonus = 0;
+  if (hasRelic(gid, uid, 'bilgelik')) bonus += 15;  // +%15 XP
+  if (hasAllEjderParts(gid, uid))     bonus += 20;  // Ejder seti +%20 XP
+  return bonus;
+}
+function getRelicCoinBonus(gid, uid) {
+  let bonus = 0;
+  if (hasRelic(gid, uid, 'tuccar'))   bonus += 10;  // +%10 Coin (satışlarda)
+  if (hasAllEjderParts(gid, uid))     bonus += 30;  // Ejder seti +%30 Coin
+  return bonus;
+}
+function getRelicMineBonus(gid, uid) {
+  return hasRelic(gid, uid, 'madenci') ? 20 : 0;   // +%20 maden satış
+}
+function getRelicFishBonus(gid, uid) {
+  return hasRelic(gid, uid, 'tuccar') ? 10 : 0;    // +%10 balık satış (Tüccar)
+}
+
+// ──────────────────────────────────────────────────────────────
+//  HAYVAN MAMASI YARDIMCILARI
+// ──────────────────────────────────────────────────────────────
+function getPetFedDate(gid, uid, petKey)         { const r = db.prepare('SELECT lastFedAt FROM pet_food WHERE guildId=? AND userId=? AND petKey=?').get(gid, uid, petKey); return r ? r.lastFedAt : null; }
+function setPetFedDate(gid, uid, petKey, date)   { db.prepare('INSERT OR REPLACE INTO pet_food(guildId,userId,petKey,lastFedAt)VALUES(?,?,?,?)').run(gid, uid, petKey, date); }
+
+function isPetAlive(gid, uid, petKey) {
+  const fedDate = getPetFedDate(gid, uid, petKey);
+  if (!fedDate) return true; // Hiç mama kaydı yoksa ölmüş sayılmaz (yeni sistem)
+  const today    = new Date().toLocaleDateString('tr-TR', { timeZone: 'Europe/Istanbul' }).split('.').reverse().join('-');
+  const yesterday = new Date(Date.now() - 86400000).toLocaleDateString('tr-TR', { timeZone: 'Europe/Istanbul' }).split('.').reverse().join('-');
+  // Bugün veya dün beslendiyse canlı
+  return fedDate >= yesterday;
+}
+
+function killPet(gid, uid, petKey) {
+  db.prepare('DELETE FROM pets WHERE guildId=? AND userId=? AND petKey=?').run(gid, uid, petKey);
+  db.prepare('DELETE FROM pet_food WHERE guildId=? AND userId=? AND petKey=?').run(gid, uid, petKey);
+  db.prepare('DELETE FROM active_pet WHERE guildId=? AND userId=?').run(gid, uid);
+}
+
+// Starvation check: Pet açsa öldür, canlı petleri döndür
+function checkAndKillHungryPets(gid, uid) {
+  const rows = db.prepare('SELECT petKey FROM pets WHERE guildId=? AND userId=?').all(gid, uid);
+  const killed = [];
+  for (const r of rows) {
+    const fedDate = getPetFedDate(gid, uid, r.petKey);
+    if (fedDate !== null && !isPetAlive(gid, uid, r.petKey)) {
+      killPet(gid, uid, r.petKey);
+      const def = PETS.find(p => p.key === r.petKey);
+      if (def) killed.push(def);
+    }
+  }
+  return killed;
+}
+
+// ──────────────────────────────────────────────────────────────
 //  ÇAPRAZ BOOST HESAPLAMA
 // ──────────────────────────────────────────────────────────────
 // XP çarpanı — YALNIZCA normal seviye sistemi, madencilik XP'sini etkilemez
@@ -911,7 +1143,7 @@ function getXpMultiplier(gid, uid, consume = true) {
     m *= 2.0;
     if (consume) consumeTempBoost(gid, uid);
   }
-  m += (getAntiqueXpBonus(gid, uid) + getPetXpBonus(gid, uid)) / 100;
+  m += (getAntiqueXpBonus(gid, uid) + getPetXpBonus(gid, uid) + getRelicXpBonus(gid, uid)) / 100;
   return m;
 }
 
@@ -922,7 +1154,7 @@ function getPropertyCoinBonus(gid, uid) {
 }
 
 // Coin bonus % (chat coin, madencilik satışı vb.)
-function getTotalCoinBonusPct(gid, uid) { return getAntiqueCoinBonus(gid, uid) + getPetCoinBonus(gid, uid) + getPropertyCoinBonus(gid, uid) + (hasCoinBoost(gid, uid) ? 50 : 0); }
+function getTotalCoinBonusPct(gid, uid) { return getAntiqueCoinBonus(gid, uid) + getPetCoinBonus(gid, uid) + getPropertyCoinBonus(gid, uid) + (hasCoinBoost(gid, uid) ? 50 : 0) + getRelicCoinBonus(gid, uid); }
 
 // Günlük ödül bonus % (yalnızca %1 antika + baykuş pet)
 function getTotalDailyBonusPct(gid, uid) { return getAntiqueDailyBonus(gid, uid) + getPetDailyBonus(gid, uid); }
@@ -1069,9 +1301,10 @@ const FISH_TYPES = FISH_TIERS.flatMap(tier =>
   tier.fish.map(f => ({ ...f, weight: tier.totalWeight / tier.fish.length }))
 );
 
-function pickFish(boosted) {
+function pickFish(boosted, denizBoost = false) {
   let pool = FISH_TYPES.map(f => ({ ...f }));
-  if (boosted) pool = pool.map(f => ({ ...f, weight: f.value >= 14 ? f.weight * 3 : f.weight }));
+  if (boosted)    pool = pool.map(f => ({ ...f, weight: f.value >= 14 ? f.weight * 3 : f.weight }));
+  if (denizBoost) pool = pool.map(f => ({ ...f, weight: f.value >= 100 ? f.weight * 1.3 : f.weight }));
   const total = pool.reduce((a, f) => a + f.weight, 0);
   let r = Math.random() * total;
   for (const f of pool) {
@@ -1202,7 +1435,7 @@ function resolveFishCast(gid, uid, boosted) {
 
   saveFishCastState(gid, uid, state);
 
-  return { type: 'catch', fish: pickFish(boosted) };
+  return { type: 'catch', fish: pickFish(boosted, hasRelic(gid, uid, 'deniz')) };
 }
 
 // Blackjack / At Yarışı ortak ödül hesaplayıcı — 2x kazanç (bet kadar kâr)
@@ -1511,6 +1744,12 @@ async function handleMineButton(interaction) {
     if (justRanOut)   embed.addFields({ name: '🍽️ Yiyecek Bitti!',   value: 'Tüm yiyecek kullanımları tükendi! Marketten yenisini al.',       inline: false });
     if (isHungry)     embed.addFields({ name: '😫 İşçiler Aç!',       value: 'Yiyecek yok — verimlilik %50 düştü! Marketten yemek al.',        inline: false });
 
+    // ── 1/1000 şans eseri drop (gönderme anında) ─────────────
+    if (Math.random() < 0.001) {
+      const dropMsg = giveRareDrop(gid, uid, MINING_TOOLS);
+      embed.addFields({ name: '🎉 Nadir Düşme!', value: dropMsg });
+    }
+
     // ── Madencilik Lv.15: Rol ver + madencilik kanalına duyuru ─
     if (leveledUp && data.miningLevel >= 15) {
       const WOOD_UNLOCK_ROLE = '1526518698054123602';
@@ -1592,18 +1831,24 @@ async function handleMineButton(interaction) {
       lines.push(`${ore.emoji} ${ore.name} × ${r.amount} = ${earned} coin`);
     }
     clearMiningInventory(gid, uid);
-    // Madencilik satış değeri %25 azaltıldı
-    const mineCoinsRaw = Math.floor(totalValue * 0.75);
-    const mineBonus    = getTotalCoinBonusPct(gid, uid);
-    const mineEarned   = Math.round(mineCoinsRaw * (1 + mineBonus / 100));
+    // Madencilik satış değeri %25 azaltıldı + Madenci Reliği +%20 + En iyi kazma bonusu
+    const mineCoinsRaw  = Math.floor(totalValue * 0.75);
+    const mineToolBonus = getBestMiningToolBonus(gid, uid);
+    const mineBonus     = getTotalCoinBonusPct(gid, uid) + getRelicMineBonus(gid, uid) + mineToolBonus;
+    const mineEarned    = Math.round(mineCoinsRaw * (1 + mineBonus / 100));
     addBalance(gid, uid, mineEarned);
+
+    const bestKazma = getBestMiningToolDef(gid, uid);
+    const toolStr   = bestKazma ? ` • ${bestKazma.emoji} ${bestKazma.name} (+%${bestKazma.bonus})` : '';
 
     const embed = new EmbedBuilder()
       .setTitle('💰 Madenler Satıldı!')
       .setColor(0x2ECC71)
       .setDescription(lines.join('\n'))
-      .addFields({ name: '💰 Kazanılan', value: `**+${mineEarned} coin**${mineBonus > 0 ? ` (+%${mineBonus} coin bonusu)` : ''}`, inline: true },
-                 { name: '💳 Yeni Bakiye', value: `**${getBalance(gid, uid).balance} coin**`, inline: true });
+      .addFields(
+        { name: '💰 Kazanılan', value: `**+${mineEarned} coin**${mineBonus > 0 ? ` (+%${mineBonus}${toolStr})` : ''}`, inline: true },
+        { name: '💳 Yeni Bakiye', value: `**${getBalance(gid, uid).balance} coin**`, inline: true },
+      );
 
     return interaction.reply({ ephemeral: true, embeds: [embed] });
   }
@@ -2201,6 +2446,12 @@ async function handleWoodButton(interaction) {
     if (justRanOut)  embed.addFields({ name: '🍽️ Yiyecek Bitti!',  value: 'Tüm yiyecek kullanımları tükendi! Marketten yenisini al.',      inline: false });
     if (isHungry)    embed.addFields({ name: '😫 Oduncular Aç!',    value: 'Yiyecek yok — verimlilik %50 düştü! Marketten yemek al.',       inline: false });
 
+    // ── 1/1000 şans eseri drop (gönderme anında) ─────────────
+    if (Math.random() < 0.001) {
+      const dropMsg = giveRareDrop(gid, uid, WOOD_TOOLS);
+      embed.addFields({ name: '🎉 Nadir Düşme!', value: dropMsg });
+    }
+
     return interaction.reply({ ephemeral: true, embeds: [embed] });
   }
 
@@ -2267,19 +2518,23 @@ async function handleWoodButton(interaction) {
       lines.push(`${w.emoji} ${w.name} × ${r.amount} = ${earned} coin`);
     }
     clearWoodInventory(gid, uid);
-    // Odunculuk satış değeri %15 azaltıldı
-    const woodCoinsRaw = Math.floor(totalValue * 0.85);
-    const woodBonus    = getTotalCoinBonusPct(gid, uid);
-    const woodEarned   = Math.round(woodCoinsRaw * (1 + woodBonus / 100));
+    // Odunculuk satış değeri %15 azaltıldı + En iyi balta bonusu
+    const woodCoinsRaw  = Math.floor(totalValue * 0.85);
+    const woodToolBonus = getBestWoodToolBonus(gid, uid);
+    const woodBonus     = getTotalCoinBonusPct(gid, uid) + woodToolBonus;
+    const woodEarned    = Math.round(woodCoinsRaw * (1 + woodBonus / 100));
     addBalance(gid, uid, woodEarned);
+
+    const bestBalta = getBestWoodToolDef(gid, uid);
+    const toolStr   = bestBalta ? ` • ${bestBalta.emoji} ${bestBalta.name} (+%${bestBalta.bonus})` : '';
 
     const embed = new EmbedBuilder()
       .setTitle('💰 Odunlar Satıldı!')
       .setColor(0x2ECC71)
       .setDescription(lines.join('\n'))
       .addFields(
-        { name: '💰 Kazanılan',    value: `**+${woodEarned} coin**${woodBonus > 0 ? ` (+%${woodBonus} coin bonusu)` : ''}`, inline: true },
-        { name: '💳 Yeni Bakiye', value: `**${getBalance(gid, uid).balance} coin**`,                                         inline: true },
+        { name: '💰 Kazanılan',   value: `**+${woodEarned} coin**${woodBonus > 0 ? ` (+%${woodBonus}${toolStr})` : ''}`, inline: true },
+        { name: '💳 Yeni Bakiye', value: `**${getBalance(gid, uid).balance} coin**`,                                      inline: true },
       );
 
     return interaction.reply({ ephemeral: true, embeds: [embed] });
@@ -2682,30 +2937,10 @@ const SLASH_COMMANDS = [
     .setName('esim')
     .setDescription('Eşini gör'),
 
-  // /market
+  // /market — tek komut, butonlarla gezinme
   new SlashCommandBuilder()
     .setName('market')
-    .setDescription('Market komutları')
-    .addSubcommand(s => s.setName('liste').setDescription('Market listesi (roller)'))
-    .addSubcommand(s => s.setName('al').setDescription('Marketten rol satın al').addStringOption(o => o.setName('rolid').setDescription('Rol ID\'si').setRequired(true)))
-    .addSubcommand(s => s.setName('iade').setDescription('Marketten aldığın rolü iade et').addStringOption(o => o.setName('rolid').setDescription('Rol ID\'si').setRequired(true)))
-    .addSubcommand(s => s.setName('esyalar').setDescription('Özel eşyaları gör (Kalkan, XP Boost, Pet, Antika, Kraliyet)'))
-    .addSubcommand(s => s.setName('esya-al').setDescription('Özel eşya satın al').addStringOption(o => o.setName('esya').setDescription('Eşya').setRequired(true)
-      .addChoices(
-        { name: '🛡️ Hırsızlık Kalkanı (450 coin, 4 saat)', value: 'kalkan' },
-        { name: '⚡ Geçici XP Boost (400 coin, 50 kullanım, 2x — kalıcı boost yoksa)', value: 'gecici_boost' },
-        { name: '💰 Kalıcı Coin Boost (5000 coin, 1.5x coin)', value: 'coinboost' },
-      )))
-    .addSubcommand(s => s.setName('antikalar').setDescription('Günlük antika marketi (her gün 2 yeni antika)'))
-    .addSubcommand(s => s.setName('antika-al').setDescription('Günlük marketten antika satın al').addStringOption(o => o.setName('antika').setDescription('Antika anahtarı').setRequired(true)))
-    .addSubcommand(s => s.setName('kraliyet').setDescription('Kraliyet eşyaları marketi'))
-    .addSubcommand(s => s.setName('kraliyet-al').setDescription('Kraliyet eşyası satın al').addStringOption(o => o.setName('esya').setDescription('Eşya').setRequired(true)
-      .addChoices(
-        { name: '👑 Kral Tacı', value: 'kral_taci' },
-        { name: '👑 Kraliçe Tacı', value: 'kralice_taci' },
-        { name: '🧥 Kraliyet Pelerini', value: 'pelerin' },
-        { name: '💎 Kraliyet Mücevheri', value: 'mucevher' },
-      ))),
+    .setDescription('🏪 Market — alışveriş için butonları kullan'),
 
   // /market-yonet (admin)
   new SlashCommandBuilder()
@@ -2739,6 +2974,27 @@ const SLASH_COMMANDS = [
   new SlashCommandBuilder()
     .setName('mulk-siralama')
     .setDescription('Mülk sıralamasını gör'),
+
+  // /pazar — oyuncu pazarı
+  new SlashCommandBuilder()
+    .setName('pazar')
+    .setDescription('Oyuncu pazarı — araç, ejder reliği ve antika al/sat')
+    .addSubcommand(s => s.setName('listele').setDescription('Aktif ilanları gör'))
+    .addSubcommand(s => s.setName('envanter').setDescription('Araç envanterini gör'))
+    .addSubcommand(s => s.setName('sat').setDescription('İlan aç')
+      .addStringOption(o => o.setName('tur').setDescription('Eşya türü').setRequired(true)
+        .addChoices(
+          { name: '⛏️ Kazma (madencilik aracı)', value: 'kazma' },
+          { name: '🪓 Balta (odunculuk aracı)',  value: 'balta'  },
+          { name: '🐉 Ejder Seti Reliği',         value: 'ejder'  },
+          { name: '🏺 Antika',                    value: 'antika' },
+        ))
+      .addStringOption(o => o.setName('anahtar').setDescription('Eşya anahtarı (örn: demir_kazma, ejder_pence, antika_key)').setRequired(true))
+      .addIntegerOption(o => o.setName('fiyat').setDescription('Satış fiyatı (coin)').setRequired(true).setMinValue(1)))
+    .addSubcommand(s => s.setName('al').setDescription('İlandan satın al')
+      .addIntegerOption(o => o.setName('id').setDescription('İlan ID numarası').setRequired(true)))
+    .addSubcommand(s => s.setName('iptal').setDescription('Kendi ilanını iptal et')
+      .addIntegerOption(o => o.setName('id').setDescription('İlan ID numarası').setRequired(true))),
 
   // /pet — hayvan dostları sistemi
   new SlashCommandBuilder()
@@ -3392,21 +3648,43 @@ client.on('interactionCreate', async interaction => {
             ].join('\n'),
           },
           {
-            name: '🛒 Market',
+            name: '🏪 Market',
             value: [
-              '`/market liste` — Rol listesi',
-              '`/market al/iade` — Rol satın al / iade et',
-              '`/market esyalar` — Özel eşyalar (Kalkan, Boost, Pet, Antika)',
-              '`/market esya-al` — Kalkan / Geçici XP Boost satın al',
-              '`/market antikalar` — Günlük antika marketi',
-              '`/market antika-al` — Antika satın al',
-              '`/market kraliyet` — Kraliyet eşyaları marketi',
-              '`/market kraliyet-al` — Kraliyet eşyası satın al',
+              '`/market` — **Tüm alışveriş buradan** (butonlarla gezin)',
+              '  🎭 Roller · 🎁 Eşyalar · 🏺 Antikalar · 👑 Kraliyet · 🐾 Pet · 📿 Relikler · 🍖 Mama',
+              '⚠️ **Ejder Seti** (🐉 Pençe/Diş/Göz) marketten satılmaz — sadece oyuncu pazarı veya şans eseri drop',
+            ].join('\n'),
+          },
+          {
+            name: '🏪 Oyuncu Pazarı',
+            value: [
+              '`/pazar listele` — Aktif ilanları gör',
+              '`/pazar envanter` — Araç envanterine bak (kazma/balta)',
+              '`/pazar sat tur:<tür> anahtar:<key> fiyat:<coin>` — İlan aç',
+              '`/pazar al id:<numara>` — İlandan satın al',
+              '`/pazar iptal id:<numara>` — Kendi ilanını geri çek',
+              '📌 **Satılabilir:** ⛏️ Kazmalar · 🪓 Baltalar · 🐉 Ejder Seti Relikleri · 🏺 Antikalar',
+              '💡 Kazmalar/baltalar madencilik & odunculukta **1/1000** şansla düşer',
+            ].join('\n'),
+          },
+          {
+            name: '⛏️ Araçlar & Şans Eseri',
+            value: [
+              '**Madencilik Kazmalar** (satış bonusu):',
+              '  ⛏️ Demir +%5 · 🪙 Altın +%10 · 💎 Elmas +%15 · ✨ Büyülü +%20',
+              '**Odunculuk Baltaları** (satış bonusu):',
+              '  🪓 Demir +%5 · 🪙 Altın +%10 · 💎 Elmas +%15 · ✨ Büyülü +%20',
+              '🎲 Her satışta **1/1000** ihtimalle antika, relik veya araç düşebilir!',
+            ].join('\n'),
+          },
+          {
+            name: '🔧 Diğer',
+            value: [
               '`/xpboost` — Kalıcı 1.5x XP Boost (4000 coin)',
-              '`/pet al/bilgi` — Pet sistemi (hepsi otomatik aktif)',
+              '`/pet bilgi` — Pet bilgisi & yem durumu',
               '`/antika envanter/aktif-et/kaldir` — Antika sistemi',
               '`/mulk ev-al/araba-al` — Mülk satın al',
-              '`/yukselt` — Ev, Araba, Pet, Antika yükselt (tek panel)',
+              '`/yukselt` — Ev, Araba, Pet, Antika yükselt',
               '`/mulk-siralama` — Mülk sıralaması',
               '`/renk al` — İsim rengi rolü (4000 coin)',
             ].join('\n'),
@@ -3551,9 +3829,9 @@ client.on('interactionCreate', async interaction => {
         const top = topBalance(gid, 10);
         if (!top.length) return interaction.reply('🏁 Henüz coin verisi yok.');
         const embed = new EmbedBuilder()
-          .setTitle('💰 Coin Sıralaması')
+          .setTitle('💰 Coin Sıralaması (Toplam)')
           .setColor(0xF1C40F)
-          .setDescription(top.map((r, i) => `**${i + 1}.** <@${r.userId}> — **${r.balance}** coin`).join('\n'));
+          .setDescription(top.map((r, i) => `**${i + 1}.** <@${r.userId}> — **${r.balance + r.bank}** coin`).join('\n'));
         return interaction.reply({ embeds: [embed] });
       }
 
@@ -4112,207 +4390,343 @@ client.on('interactionCreate', async interaction => {
     //  /market
     // ─────────────────────────────────────────────────────────
     if (cmd === 'market') {
-      if (sub === 'liste') {
-        const roles   = getMarketRoles(gid);
-        const normal  = roles.filter(r => !r.isPremium);
-        const premium = roles.filter(r => r.isPremium);
-        const embed = new EmbedBuilder()
-          .setTitle('🛒 Market')
+      // ─── Yardımcı: Market embed + buton satırları ─────────
+      function buildMarketHome() {
+        const e = new EmbedBuilder()
+          .setTitle('🏪 DeathWish Market')
           .setColor(0xE67E22)
+          .setDescription('Bir bölüm seç:')
           .addFields(
-            {
-              name: '🎁 Eşyalar',
-              value: [
-                '🎲 **Şans Kutusu** — 80 coin • `/oyunlar sanskutusu`',
-                '💍 **Evlilik Yüzüğü** — 1500 coin • `/evlilik yuzuk-al`',
-                '💎 **XPBoost** (Kalıcı 1.5x) — 4000 coin • `/xpboost`',
-                '🛡️ **Hırsızlık Kalkanı** (4 saat) — 450 coin • `/market esya-al esya:kalkan`',
-                '⚡ **Geçici XP Boost** (50 kullanım, 2x) — 400 coin • `/market esya-al esya:gecici_boost`',
-                '🎨 **İsim Rengi Rolü** — 4000 coin • `/renk al`',
-                '🎣 **Balıkçılık Şansı Boost** (100 kullanım) — 2000 coin • `/balik boost-al`',
-              ].join('\n'),
-            }
+            { name: '🎭 Roller',          value: 'Sunucu rollerini satın al / iade et.',                 inline: true },
+            { name: '🎁 Özel Eşyalar',   value: 'Kalkan, XP Boost, Coin Boost ve daha fazlası.',        inline: true },
+            { name: '🏺 Antikalar',       value: 'Her gün 2 yeni antika gelir.',                         inline: true },
+            { name: '👑 Kraliyet',        value: 'Her satışta fiyat artan kraliyet eşyaları.',           inline: true },
+            { name: '🐾 Pet Satın Al',   value: 'Kedi, Köpek, Baykuş.',                                  inline: true },
+            { name: '📿 Relikler',       value: 'Kalıcı güç bonusları kazandıran kutsal eserler.',       inline: true },
+            { name: '🍖 Hayvan Maması',  value: '⚠️ Petlerini besle! 1 gün beslenmezse ölür!',          inline: true },
+          )
+          .setFooter({ text: '/market-yonet ile rol ekle/çıkar (admin)' });
+        const r1 = new ActionRowBuilder().addComponents(
+          new ButtonBuilder().setCustomId(`mkt_roller_${uid}`).setLabel('🎭 Roller').setStyle(ButtonStyle.Primary),
+          new ButtonBuilder().setCustomId(`mkt_esyalar_${uid}`).setLabel('🎁 Eşyalar').setStyle(ButtonStyle.Primary),
+          new ButtonBuilder().setCustomId(`mkt_antikalar_${uid}`).setLabel('🏺 Antikalar').setStyle(ButtonStyle.Secondary),
+          new ButtonBuilder().setCustomId(`mkt_kraliyet_${uid}`).setLabel('👑 Kraliyet').setStyle(ButtonStyle.Secondary),
+        );
+        const r2 = new ActionRowBuilder().addComponents(
+          new ButtonBuilder().setCustomId(`mkt_pet_${uid}`).setLabel('🐾 Pet Al').setStyle(ButtonStyle.Success),
+          new ButtonBuilder().setCustomId(`mkt_relikler_${uid}`).setLabel('📿 Relikler').setStyle(ButtonStyle.Success),
+          new ButtonBuilder().setCustomId(`mkt_mama_${uid}`).setLabel('🍖 Hayvan Maması').setStyle(ButtonStyle.Danger),
+        );
+        return { embeds: [e], components: [r1, r2] };
+      }
+
+      const homePayload = buildMarketHome();
+      const msg = await interaction.reply({ ...homePayload, fetchReply: true });
+
+      const collector = msg.createMessageComponentCollector({
+        filter: i => i.user.id === uid && i.customId.startsWith('mkt_'),
+        time: 120_000,
+      });
+
+      collector.on('collect', async i => {
+        const parts   = i.customId.split('_');
+        const section = parts[1]; // e.g. roller, esyalar, antikalar, kraliyet, pet, petbuy, relikler, relical, mama, mamaver, esya, antika, kral, back
+
+        // ── GERİ ─────────────────────────────────────────────
+        if (section === 'back') {
+          return i.update(buildMarketHome());
+        }
+
+        // ── ROLLER ───────────────────────────────────────────
+        if (section === 'roller') {
+          const roles   = getMarketRoles(gid);
+          const normal  = roles.filter(r => !r.isPremium);
+          const premium = roles.filter(r => r.isPremium);
+          const normalLines  = normal.length  ? normal.map(r  => `<@&${r.roleId}> — **${r.price} coin**`).join('\n')  : '_Henüz rol eklenmemiş_';
+          const premiumLines = premium.length ? premium.map(r => `<@&${r.roleId}> — **${r.price} coin** ⭐`).join('\n') : '_Yok_';
+          const e = new EmbedBuilder().setTitle('🎭 Rol Marketi').setColor(0xE67E22)
+            .addFields({ name: '📦 Normal', value: normalLines }, { name: '⭐ Premium', value: premiumLines })
+            .setFooter({ text: 'Aşağıdan rol seç → Satın Al veya İade Et' });
+
+          const components = [];
+
+          if (roles.length) {
+            const guildRoles = interaction.guild.roles.cache;
+            const options = roles.slice(0, 25).map(r => {
+              const roleObj = guildRoles.get(r.roleId);
+              const owned   = i.member.roles.cache.has(r.roleId);
+              const label   = roleObj ? roleObj.name : r.roleId;
+              const desc    = `${r.price} coin${r.isPremium ? ' ⭐ Premium' : ''}${owned ? ' — Zaten sahipsin' : ''}`;
+              return { label: label.slice(0, 100), description: desc.slice(0, 100), value: r.roleId };
+            });
+            const selectMenu = new StringSelectMenuBuilder()
+              .setCustomId(`mkt_rolsec_${uid}`)
+              .setPlaceholder('🔍 Rol ara veya listeden seç...')
+              .addOptions(options);
+            components.push(new ActionRowBuilder().addComponents(selectMenu));
+          }
+
+          components.push(new ActionRowBuilder().addComponents(
+            new ButtonBuilder().setCustomId(`mkt_roliade_${uid}`).setLabel('↩️ İade Et').setStyle(ButtonStyle.Secondary),
+            new ButtonBuilder().setCustomId(`mkt_back_${uid}`).setLabel('← Geri').setStyle(ButtonStyle.Danger),
+          ));
+
+          return i.update({ embeds: [e], components });
+        }
+
+        if (section === 'rolsec') {
+          const roleId = i.values[0];
+          const mRoles = getMarketRoles(gid);
+          const mRole  = mRoles.find(r => r.roleId === roleId);
+          if (!mRole) return i.reply({ ephemeral: true, content: '⛔ Bu rol artık markette yok.' });
+          const role = interaction.guild.roles.cache.get(roleId);
+          if (!role) return i.reply({ ephemeral: true, content: '⛔ Rol sunucuda bulunamadı.' });
+          const me = interaction.guild.members.me;
+          if (!me?.permissions.has(PermissionFlagsBits.ManageRoles) || role.position >= me.roles.highest.position)
+            return i.reply({ ephemeral: true, content: '⛔ Bu rolü yönetemiyorum.' });
+          if (i.member.roles.cache.has(roleId)) return i.reply({ ephemeral: true, content: `ℹ️ <@&${roleId}> rolüne zaten sahipsin.` });
+          const owned = mRoles.find(r => i.member.roles.cache.has(r.roleId));
+          if (owned) return i.reply({ ephemeral: true, content: `⛔ Zaten bir market rolün var: <@&${owned.roleId}>. Önce iade et.` });
+          const bal = getBalance(gid, uid);
+          if (bal.balance < mRole.price) return i.reply({ ephemeral: true, content: `⛔ Yetersiz coin! Gerekli: **${mRole.price}**, Bakiye: **${bal.balance}**` });
+          await i.member.roles.add(roleId, 'Market').catch(() => {});
+          addBalance(gid, uid, -mRole.price);
+          sendLog(gid, 'market', new EmbedBuilder().setTitle('🛒 Rol Satın Alındı').setColor(0xE67E22).addFields({ name: 'Kullanıcı', value: `<@${uid}>`, inline: true }, { name: 'Rol', value: `<@&${roleId}>`, inline: true }).setTimestamp());
+          return i.reply({ ephemeral: true, content: `✅ <@&${roleId}> rolünü aldın! **-${mRole.price}** coin | Bakiye: **${getBalance(gid, uid).balance}**` });
+        }
+
+
+        if (section === 'roliade') {
+          const mRoles = getMarketRoles(gid);
+          const owned  = mRoles.find(r => i.member.roles.cache.has(r.roleId));
+          if (!owned) return i.reply({ ephemeral: true, content: 'ℹ️ İade edebileceğin bir market rolün yok.' });
+          const refund = Math.floor(owned.price / 2);
+          await i.member.roles.remove(owned.roleId, 'Market iade').catch(() => {});
+          addBalance(gid, uid, refund);
+          sendLog(gid, 'market', new EmbedBuilder().setTitle('↩️ Rol İade').setColor(0xE67E22).addFields({ name: 'Kullanıcı', value: `<@${uid}>`, inline: true }, { name: 'Rol', value: `<@&${owned.roleId}>`, inline: true }).setTimestamp());
+          return i.reply({ ephemeral: true, content: `↩️ <@&${owned.roleId}> iade edildi. **+${refund} coin** | Bakiye: **${getBalance(gid, uid).balance}**` });
+        }
+
+        // ── ÖZEL EŞYALAR ─────────────────────────────────────
+        if (section === 'esyalar') {
+          const e = new EmbedBuilder().setTitle('🎁 Özel Eşyalar').setColor(0xE67E22)
+            .addFields(
+              { name: '🛡️ Kalkan',         value: '**450 coin** — 4 saat hırsızlık koruması',   inline: true },
+              { name: '⚡ Geçici XP (2x)', value: '**400 coin** — 50 kullanım',                  inline: true },
+              { name: '💰 Coin Boost',     value: '**5000 coin** — Kalıcı 1.5x coin',            inline: true },
+              { name: '⚡ Kalıcı XP',      value: '**4000 coin** — Kalıcı 1.5x XP',             inline: true },
+            );
+          const r = new ActionRowBuilder().addComponents(
+            new ButtonBuilder().setCustomId(`mkt_esya_kalkan_${uid}`).setLabel('🛡️ Kalkan (450c)').setStyle(ButtonStyle.Primary),
+            new ButtonBuilder().setCustomId(`mkt_esya_gecici_${uid}`).setLabel('⚡ Geçici XP (400c)').setStyle(ButtonStyle.Primary),
+            new ButtonBuilder().setCustomId(`mkt_esya_coinboost_${uid}`).setLabel('💰 Coin Boost (5000c)').setStyle(ButtonStyle.Success),
+            new ButtonBuilder().setCustomId(`mkt_esya_xpboost_${uid}`).setLabel('⚡ XP Boost (4000c)').setStyle(ButtonStyle.Success),
+            new ButtonBuilder().setCustomId(`mkt_back_${uid}`).setLabel('← Geri').setStyle(ButtonStyle.Danger),
           );
-        return interaction.reply({ embeds: [embed] });
-      }
-
-      if (sub === 'al') {
-        const roleId = (interaction.options.getString('rolid') || '').replace(/\D/g, '');
-        if (!roleId) return interaction.reply({ ephemeral: true, content: '⛔ Geçersiz rol ID.' });
-        const mRoles = getMarketRoles(gid);
-        const mRole  = mRoles.find(r => r.roleId === roleId);
-        if (!mRole) return interaction.reply({ ephemeral: true, content: '⛔ Bu rol markette yok. `/market liste` ile listele.' });
-        const role = interaction.guild.roles.cache.get(roleId);
-        if (!role) return interaction.reply({ ephemeral: true, content: '⛔ Rol sunucuda bulunamadı (silinmiş olabilir).' });
-        const me = interaction.guild.members.me;
-        if (!me?.permissions.has(PermissionFlagsBits.ManageRoles) || role.position >= me.roles.highest.position) {
-          return interaction.reply({ ephemeral: true, content: '⛔ Bu rolü yönetemiyorum (hiyerarşi/izin).' });
+          return i.update({ embeds: [e], components: [r] });
         }
-        const member = interaction.member;
-        if (member.roles.cache.has(roleId)) return interaction.reply({ ephemeral: true, content: 'ℹ️ Bu role zaten sahipsin.' });
-        const owned = mRoles.find(r => member.roles.cache.has(r.roleId));
-        if (owned) return interaction.reply({ ephemeral: true, content: `⛔ Zaten bir market rolün var: <@&${owned.roleId}>. Önce iade et: \`/market iade ${owned.roleId}\`` });
-        const bal = getBalance(gid, uid);
-        if (bal.balance < mRole.price) return interaction.reply({ ephemeral: true, content: `⛔ Yetersiz coin! Gerekli: **${mRole.price}**, Bakiye: **${bal.balance}**` });
-        await member.roles.add(roleId, 'Market satın alma').catch(() => {});
-        addBalance(gid, uid, -mRole.price);
-        sendLog(gid, 'market', new EmbedBuilder()
-          .setTitle('🛒 Market — Satın Alma')
-          .setColor(0xE67E22)
-          .addFields(
-            { name: 'Kullanıcı', value: `<@${uid}>`, inline: true },
-            { name: 'Rol', value: `<@&${roleId}>`, inline: true },
-            { name: 'Fiyat', value: `${mRole.price} coin`, inline: true },
-          ).setTimestamp()
-        );
-        return interaction.reply(`✅ <@&${roleId}> rolünü aldın! **-${mRole.price}** coin. Yeni bakiye: **${getBalance(gid, uid).balance}**`);
-      }
 
-      if (sub === 'iade') {
-        const roleId = (interaction.options.getString('rolid') || '').replace(/\D/g, '');
-        if (!roleId) return interaction.reply({ ephemeral: true, content: '⛔ Geçersiz rol ID.' });
-        const mRoles = getMarketRoles(gid);
-        const mRole  = mRoles.find(r => r.roleId === roleId);
-        if (!mRole) return interaction.reply({ ephemeral: true, content: '⛔ Bu rol markette yok.' });
-        const member = interaction.member;
-        if (!member.roles.cache.has(roleId)) return interaction.reply({ ephemeral: true, content: 'ℹ️ Bu role sahip değilsin.' });
-        const refund = Math.floor(mRole.price / 2);
-        await member.roles.remove(roleId, 'Market iade').catch(() => {});
-        addBalance(gid, uid, refund);
-        sendLog(gid, 'market', new EmbedBuilder()
-          .setTitle('↩️ Market — İade')
-          .setColor(0xE67E22)
-          .addFields(
-            { name: 'Kullanıcı', value: `<@${uid}>`, inline: true },
-            { name: 'Rol', value: `<@&${roleId}>`, inline: true },
-            { name: 'İade', value: `+${refund} coin`, inline: true },
-          ).setTimestamp()
-        );
-        return interaction.reply(`↩️ <@&${roleId}> iade edildi. **+${refund}** coin geri yüklendi. Bakiye: **${getBalance(gid, uid).balance}**`);
-      }
+        if (section === 'esya') {
+          const esya = parts[2];
+          if (esya === 'kalkan') {
+            if (hasShield(gid, uid)) return i.reply({ ephemeral: true, content: '🛡️ Zaten aktif bir kalkanın var.' });
+            const bal = getBalance(gid, uid);
+            if (bal.balance < 450) return i.reply({ ephemeral: true, content: `⛔ Yetersiz coin! Gerekli: **450**, Bakiye: **${bal.balance}**` });
+            addBalance(gid, uid, -450); setShield(gid, uid, 4 * 60 * 60 * 1000);
+            sendLog(gid, 'market', new EmbedBuilder().setTitle('🛡️ Kalkan').setColor(0xE67E22).addFields({ name: 'Kullanıcı', value: `<@${uid}>`, inline: true }).setTimestamp());
+            return i.reply({ ephemeral: true, content: `🛡️ **Hırsızlık Kalkanı** aktif! 4 saat korunuyorsun. Bakiye: **${getBalance(gid, uid).balance}**` });
+          }
+          if (esya === 'gecici') {
+            if (hasBoost(gid, uid)) return i.reply({ ephemeral: true, content: '⛔ Kalıcı XP Boost sahibisin, geçici kullanılamaz.' });
+            const bal = getBalance(gid, uid);
+            if (bal.balance < 400) return i.reply({ ephemeral: true, content: `⛔ Yetersiz coin! Gerekli: **400**, Bakiye: **${bal.balance}**` });
+            addBalance(gid, uid, -400); addTempBoostUses(gid, uid, 50);
+            sendLog(gid, 'market', new EmbedBuilder().setTitle('⚡ Geçici XP Boost').setColor(0xE67E22).addFields({ name: 'Kullanıcı', value: `<@${uid}>`, inline: true }).setTimestamp());
+            return i.reply({ ephemeral: true, content: `⚡ **Geçici XP Boost (2x)** alındı! Kalan: **${getTempBoostUses(gid, uid)}** | Bakiye: **${getBalance(gid, uid).balance}**` });
+          }
+          if (esya === 'coinboost') {
+            if (hasCoinBoost(gid, uid)) return i.reply({ ephemeral: true, content: '💰 Zaten Kalıcı Coin Boost sahibisin!' });
+            const bal = getBalance(gid, uid);
+            if (bal.balance < 5000) return i.reply({ ephemeral: true, content: `⛔ Yetersiz coin! Gerekli: **5000**, Bakiye: **${bal.balance}**` });
+            addBalance(gid, uid, -5000); setCoinBoost(gid, uid);
+            sendLog(gid, 'market', new EmbedBuilder().setTitle('💰 Coin Boost').setColor(0xF1C40F).addFields({ name: 'Kullanıcı', value: `<@${uid}>`, inline: true }).setTimestamp());
+            return i.reply({ ephemeral: true, content: `💰 **Kalıcı Coin Boost (1.5x)** alındı! Bakiye: **${getBalance(gid, uid).balance}**` });
+          }
+          if (esya === 'xpboost') {
+            if (hasBoost(gid, uid)) return i.reply({ ephemeral: true, content: '⚡ Zaten Kalıcı XP Boost sahibisin!' });
+            const bal = getBalance(gid, uid);
+            if (bal.balance < 4000) return i.reply({ ephemeral: true, content: `⛔ Yetersiz coin! Gerekli: **4000**, Bakiye: **${bal.balance}**` });
+            addBalance(gid, uid, -4000); setBoost(gid, uid);
+            sendLog(gid, 'market', new EmbedBuilder().setTitle('⚡ Kalıcı XP Boost').setColor(0x57F287).addFields({ name: 'Kullanıcı', value: `<@${uid}>`, inline: true }).setTimestamp());
+            return i.reply({ ephemeral: true, content: `⚡ **Kalıcı XP Boost (1.5x)** alındı! Bakiye: **${getBalance(gid, uid).balance}**` });
+          }
+        }
 
-      if (sub === 'esyalar') {
-        const embed = new EmbedBuilder()
-          .setTitle('🎁 Özel Eşyalar & Sistemler')
-          .setColor(0xE67E22)
-          .addFields(
-            { name: '🛡️ Hırsızlık Kalkanı', value: '**450 coin** — 4 saat boyunca `/çal` komutundan korur.\n`/market esya-al` → kalkan' },
-            { name: '⚡ Kalıcı XP Boost (1.5x)', value: '**4000 coin** — Her mesajda 1.5x XP. Geçici boost ile birlikte kullanılamaz.\n`/xpboost`' },
-            { name: '⚡ Geçici XP Boost (2x)', value: '**400 coin** — 50 kullanım hakkı, 2x XP. Kalıcı boost yoksa satın alınabilir.\n`/market esya-al` → gecici_boost' },
-            { name: '💰 Kalıcı Coin Boost (1.5x)', value: '**5000 coin** — Chat, madencilik, odunculuk gibi tüm coin kazanımlarında kalıcı 1.5x.\n`/market esya-al` → coinboost' },
-            { name: '🐾 Pet Sistemi', value: '🐱 **Kedi** 4500c (+%10 XP) | 🐶 **Köpek** 4500c (+%10 Coin) | 🦉 **Baykuş** 6300c (+%10 Günlük)\nHer pet satın alındığında **otomatik aktifleşir**, hepsi aynı anda aktif!\nHer pet Lv5\'e kadar geliştirilebilir (her sev. +%4).\n`/pet al` → kedi/kopek/baykus' },
-            { name: '🏺 Antika Koleksiyonu', value: 'Her gün 2 yeni antika markete düşer. Normal/Nadir/Çok Nadir üç rütbe.\n`/market antikalar` → listele | `/market antika-al` → satın al' },
-            { name: '👑 Kraliyet Eşyaları', value: '4 kraliyet eşyası (Kral Tacı, Kraliçe Tacı, Pelerin, Mücevher). Her satışta fiyat 1000 coin artar.\n`/market kraliyet` → listele | `/market kraliyet-al` → satın al' },
-            { name: '🏠 Mülk Sistemi', value: '🏠 **Ev** 5000c başlangıç (+%2 Coin/sev.) | 🚗 **Araba** 5000c başlangıç (+%2 Coin/sev.). Lv15\'e kadar 5000c/sev.\n`/mulk ev-al` / `/mulk araba-al` → satın al | `/yukselt` → geliştir' },
+        // ── ANTİKALAR ────────────────────────────────────────
+        if (section === 'antikalar') {
+          const rarityLabel = { normal: '🟢 Normal', uncommon: '🟡 Nadir', rare: '🔴 Çok Nadir' };
+          const daily = getDailyAntiqueMarket(gid);
+          const lines = daily.map(a => `${a.emoji} **${a.name}** — ${rarityLabel[a.rarity]} • **${a.price} coin**\n  ↳ +%${a.xpBonus} XP | +%${a.coinBonus} Coin${a.dailyBonus ? ` | +%${a.dailyBonus} Günlük` : ''}`);
+          const antBtns = daily.map(a =>
+            new ButtonBuilder().setCustomId(`mkt_antika_${a.key}_${uid}`).setLabel(`${a.emoji} ${a.name} (${a.price}c)`).setStyle(ButtonStyle.Success)
           );
-        return interaction.reply({ embeds: [embed] });
-      }
+          const row = new ActionRowBuilder().addComponents(...antBtns, new ButtonBuilder().setCustomId(`mkt_back_${uid}`).setLabel('← Geri').setStyle(ButtonStyle.Danger));
+          const e = new EmbedBuilder().setTitle('🏺 Günlük Antika Marketi').setColor(0xE67E22)
+            .setDescription(lines.join('\n\n')).setFooter({ text: 'Her gece yarısı yeni antikalar gelir' });
+          return i.update({ embeds: [e], components: [row] });
+        }
 
-      if (sub === 'esya-al') {
-        const esya = interaction.options.getString('esya');
-        if (esya === 'kalkan') {
-          if (hasShield(gid, uid)) return interaction.reply({ ephemeral: true, content: '🛡️ Zaten aktif bir kalkanın var.' });
+        if (section === 'antika') {
+          const antiqueKey = parts[2];
+          const daily      = getDailyAntiqueMarket(gid);
+          const available  = daily.find(a => a.key === antiqueKey);
+          if (!available) return i.reply({ ephemeral: true, content: '⛔ Bu antika bugünkü markette yok!' });
           const bal = getBalance(gid, uid);
-          if (bal.balance < 450) return interaction.reply({ ephemeral: true, content: `⛔ Yetersiz coin! Gerekli: **450**, Bakiye: **${bal.balance}**` });
-          addBalance(gid, uid, -450);
-          setShield(gid, uid, 4 * 60 * 60 * 1000);
-          sendLog(gid, 'market', new EmbedBuilder().setTitle('🛡️ Hırsızlık Kalkanı Satın Alındı').setColor(0xE67E22)
-            .addFields({ name: 'Kullanıcı', value: `<@${uid}>`, inline: true }).setTimestamp());
-          return interaction.reply('🛡️ **Hırsızlık Kalkanı** aktif! 4 saat boyunca `/oyunlar cal` komutundan korunuyorsun.');
+          if (bal.balance < available.price) return i.reply({ ephemeral: true, content: `⛔ Yetersiz coin! Gerekli: **${available.price}**, Bakiye: **${bal.balance}**` });
+          addBalance(gid, uid, -available.price); addAntique(gid, uid, antiqueKey);
+          sendLog(gid, 'market', new EmbedBuilder().setTitle('🏺 Antika').setColor(0xE67E22).addFields({ name: 'Kullanıcı', value: `<@${uid}>`, inline: true }, { name: 'Antika', value: `${available.emoji} ${available.name}`, inline: true }).setTimestamp());
+          return i.reply({ ephemeral: true, content: `✅ ${available.emoji} **${available.name}** alındı! Aktif: \`/antika aktif-et anahtar:${antiqueKey}\` | Bakiye: **${getBalance(gid, uid).balance}**` });
         }
-        if (esya === 'gecici_boost') {
-          if (hasBoost(gid, uid)) return interaction.reply({ ephemeral: true, content: '⛔ Kalıcı XP Boost sahibisin! Geçici boost ile birlikte kullanılamaz.' });
+
+        // ── KRALİYET ─────────────────────────────────────────
+        if (section === 'kraliyet') {
+          const lines = ROYAL_ITEMS.map(ri => {
+            const r = getRoyalItem(gid, ri.key);
+            return `${ri.emoji} **${ri.name}**\n  Sahibi: ${r.ownerId ? `<@${r.ownerId}>` : '❌ Sahipsiz'} • **${r.price} coin**`;
+          });
+          const kBtns = ROYAL_ITEMS.map(ri => {
+            const r = getRoyalItem(gid, ri.key);
+            return new ButtonBuilder().setCustomId(`mkt_kral_${ri.key}_${uid}`).setLabel(`${ri.emoji} ${ri.name} (${r.price}c)`).setStyle(ButtonStyle.Primary).setDisabled(r.ownerId === uid);
+          });
+          const row1 = new ActionRowBuilder().addComponents(...kBtns.slice(0, 4));
+          const row2 = new ActionRowBuilder().addComponents(new ButtonBuilder().setCustomId(`mkt_back_${uid}`).setLabel('← Geri').setStyle(ButtonStyle.Danger));
+          const e = new EmbedBuilder().setTitle('👑 Kraliyet Marketi').setColor(0xFFD700)
+            .setDescription(lines.join('\n\n')).setFooter({ text: 'Her satışta fiyat 1000 coin artar' });
+          return i.update({ embeds: [e], components: [row1, row2] });
+        }
+
+        if (section === 'kral') {
+          const itemKey = parts[2];
+          const ri      = ROYAL_ITEMS.find(x => x.key === itemKey);
+          if (!ri) return i.reply({ ephemeral: true, content: '⛔ Geçersiz eşya.' });
+          const current = getRoyalItem(gid, itemKey);
+          if (current.ownerId === uid) return i.reply({ ephemeral: true, content: `${ri.emoji} Bu eşya zaten sende!` });
           const bal = getBalance(gid, uid);
-          const price = 400;
-          if (bal.balance < price) return interaction.reply({ ephemeral: true, content: `⛔ Yetersiz coin! Gerekli: **${price}**, Bakiye: **${bal.balance}**` });
-          addBalance(gid, uid, -price);
-          addTempBoostUses(gid, uid, 50);
-          sendLog(gid, 'market', new EmbedBuilder().setTitle('⚡ Geçici XP Boost Satın Alındı').setColor(0xE67E22)
-            .addFields({ name: 'Kullanıcı', value: `<@${uid}>`, inline: true }).setTimestamp());
-          return interaction.reply(`⚡ **Geçici XP Boost (2x)** satın alındı! Kalan kullanım: **${getTempBoostUses(gid, uid)}**`);
+          if (bal.balance < current.price) return i.reply({ ephemeral: true, content: `⛔ Yetersiz coin! Gerekli: **${current.price}**, Bakiye: **${bal.balance}**` });
+          addBalance(gid, uid, -current.price);
+          const { prevOwner, price } = buyRoyalItem(gid, itemKey, uid);
+          const refund = prevOwner ? Math.floor(price / 2) : 0;
+          if (prevOwner) addBalance(gid, prevOwner, refund);
+          sendLog(gid, 'market', new EmbedBuilder().setTitle('👑 Kraliyet El Değişimi').setColor(0xFFD700).addFields({ name: 'Yeni Sahip', value: `<@${uid}>`, inline: true }, { name: 'Eşya', value: `${ri.emoji} ${ri.name}`, inline: true }, { name: 'Ödenen', value: `${price} coin`, inline: true }, { name: 'Eski Sahibine İade', value: prevOwner ? `${refund} coin (%50)` : '—', inline: true }).setTimestamp());
+          return i.reply({ ephemeral: true, content: `✅ ${ri.emoji} **${ri.name}** alındı!${prevOwner ? ` (eski sahibine **${refund}c** iade — ödenenin yarısı)` : ''} | Bakiye: **${getBalance(gid, uid).balance}**` });
         }
-        if (esya === 'coinboost') {
-          if (hasCoinBoost(gid, uid)) return interaction.reply({ ephemeral: true, content: '💰 Zaten kalıcı **Coin Boost (1.5x)** sahibisin!' });
+
+        // ── PET AL ───────────────────────────────────────────
+        if (section === 'pet') {
+          const petLines = PETS.map(p => {
+            const bonus = `+%${p.bonusBase} ${p.bonusType === 'xp' ? 'XP' : p.bonusType === 'coin' ? 'Coin' : 'Günlük'}`;
+            return `${p.emoji} **${p.name}** — **${p.price} coin** | ${bonus}${hasPet(gid, uid, p.key) ? ' ✅' : ''}`;
+          });
+          const petBtns = PETS.map(p =>
+            new ButtonBuilder().setCustomId(`mkt_petbuy_${p.key}_${uid}`).setLabel(`${p.emoji} ${p.name} (${p.price}c)`).setStyle(hasPet(gid, uid, p.key) ? ButtonStyle.Secondary : ButtonStyle.Success).setDisabled(hasPet(gid, uid, p.key))
+          );
+          const row = new ActionRowBuilder().addComponents(...petBtns, new ButtonBuilder().setCustomId(`mkt_back_${uid}`).setLabel('← Geri').setStyle(ButtonStyle.Danger));
+          const e = new EmbedBuilder().setTitle('🐾 Pet Satın Al').setColor(0xEB459E)
+            .setDescription(petLines.join('\n'))
+            .setFooter({ text: '⚠️ Petler her gün beslenmeli! /market → Hayvan Maması' });
+          return i.update({ embeds: [e], components: [row] });
+        }
+
+        if (section === 'petbuy') {
+          const petKey = parts[2];
+          const def    = PETS.find(p => p.key === petKey);
+          if (!def) return i.reply({ ephemeral: true, content: '⛔ Geçersiz pet.' });
+          if (hasPet(gid, uid, petKey)) return i.reply({ ephemeral: true, content: `${def.emoji} Zaten bu pete sahipsin!` });
           const bal = getBalance(gid, uid);
-          if (bal.balance < 5000) return interaction.reply({ ephemeral: true, content: `⛔ Yetersiz coin! Gerekli: **5000**, Bakiye: **${bal.balance}**` });
-          addBalance(gid, uid, -5000);
-          setCoinBoost(gid, uid);
-          sendLog(gid, 'market', new EmbedBuilder().setTitle('💰 Kalıcı Coin Boost Satın Alındı').setColor(0xF1C40F)
-            .addFields({ name: 'Kullanıcı', value: `<@${uid}>`, inline: true }).setTimestamp());
-          return interaction.reply(`💰 **Kalıcı Coin Boost (1.5x)** satın alındı! Artık tüm coin kazanımların 1.5x! 💰 Kalan: **${getBalance(gid, uid).balance} coin**`);
+          if (bal.balance < def.price) return i.reply({ ephemeral: true, content: `⛔ Yetersiz coin! Gerekli: **${def.price}**, Bakiye: **${bal.balance}**` });
+          addBalance(gid, uid, -def.price); buyPet(gid, uid, petKey);
+          sendLog(gid, 'market', new EmbedBuilder().setTitle(`🐾 Pet Alındı: ${def.name}`).setColor(0xEB459E).addFields({ name: 'Kullanıcı', value: `<@${uid}>`, inline: true }).setTimestamp());
+          return i.reply({ ephemeral: true, content: `✅ ${def.emoji} **${def.name}** alındı! +%${def.bonusBase} ${def.bonusType === 'xp' ? 'XP' : def.bonusType === 'coin' ? 'Coin' : 'Günlük'}\n⚠️ Her gün beslemeyi unutma! Bakiye: **${getBalance(gid, uid).balance}**` });
         }
-        return interaction.reply({ ephemeral: true, content: '⛔ Geçersiz eşya.' });
-      }
 
-      // ── Günlük Antika Marketi ─────────────────────────────
-      if (sub === 'antikalar') {
-        const daily = getDailyAntiqueMarket(gid);
-        const rarityLabel = { normal: '🟢 Normal', uncommon: '🟡 Nadir', rare: '🔴 Çok Nadir' };
-        const lines = daily.map(a =>
-          `${a.emoji} **${a.name}** \`${a.key}\`\n  ${rarityLabel[a.rarity]} • **${a.price} coin**\n  +%${a.xpBonus} XP | +%${a.coinBonus} Coin${a.dailyBonus ? ` | +%${a.dailyBonus} Günlük` : ''}\n  Satın al: \`/market antika-al antika:${a.key}\``
-        );
-        const embed = new EmbedBuilder()
-          .setTitle('🏺 Günlük Antika Marketi')
-          .setColor(0xE67E22)
-          .setDescription(lines.join('\n\n'))
-          .setFooter({ text: 'Her gün gece yarısında yeni antikalar gelir' });
-        return interaction.reply({ embeds: [embed] });
-      }
-
-      if (sub === 'antika-al') {
-        const antiqueKey = interaction.options.getString('antika');
-        const daily = getDailyAntiqueMarket(gid);
-        const available = daily.find(a => a.key === antiqueKey);
-        if (!available) {
-          const listed = daily.map(a => `${a.emoji} ${a.name} (\`${a.key}\`)`).join(', ');
-          return interaction.reply({ ephemeral: true, content: `⛔ Bu antika bugünkü markette yok!\nBugün mevcut: **${listed}**\nYarın yeni antikalar gelir.` });
+        // ── RELİKLER ─────────────────────────────────────────
+        if (section === 'relikler') {
+          const ownedKeys = getRelics(gid, uid);
+          const ejderCnt  = EJDER_SET_KEYS.filter(k => ownedKeys.includes(k)).length;
+          const lines = RELICS.map(r => {
+            const owned = ownedKeys.includes(r.key);
+            const isEjder = r.group === 'ejder';
+            const tag = owned ? '✅ **SAHİPSİN**' : isEjder ? '🐉 Oyuncu Pazarı / Şans Eseri' : `**${r.price} coin**`;
+            return `${r.emoji} **${r.name}** — ${tag}\n  ↳ ${r.description}`;
+          });
+          lines.push(`\n🐉 **Ejder Seti** (${ejderCnt}/3): Tümü takılınca **+%30 Coin** + **+%20 XP**\n  ↳ Madencilik/odunculukta **1/1000** şansla düşer ya da \`/pazar listele\`'den satın alınabilir.`);
+          // Sadece single group relikleri satın alınabilir
+          const avail = RELICS.filter(r => r.group === 'single' && !ownedKeys.includes(r.key));
+          const btns  = avail.map(r => new ButtonBuilder().setCustomId(`mkt_relical_${r.key}_${uid}`).setLabel(`${r.emoji} ${r.name.split(' ')[0]} (${r.price}c)`).setStyle(ButtonStyle.Primary));
+          const rows  = [];
+          if (btns.length) rows.push(new ActionRowBuilder().addComponents(...btns.slice(0, 5)));
+          rows.push(new ActionRowBuilder().addComponents(new ButtonBuilder().setCustomId(`mkt_back_${uid}`).setLabel('← Geri').setStyle(ButtonStyle.Danger)));
+          const e = new EmbedBuilder().setTitle('📿 Relikler').setColor(0x9B59B6)
+            .setDescription(lines.join('\n\n'))
+            .setFooter({ text: 'Ejder Seti = sadece oyuncu pazarı veya şans eseri drop' });
+          return i.update({ embeds: [e], components: rows.slice(0, 5) });
         }
-        const bal = getBalance(gid, uid);
-        if (bal.balance < available.price) return interaction.reply({ ephemeral: true, content: `⛔ Yetersiz coin! Gerekli: **${available.price}**, Bakiye: **${bal.balance}**` });
-        addBalance(gid, uid, -available.price);
-        addAntique(gid, uid, antiqueKey);
-        sendLog(gid, 'market', new EmbedBuilder().setTitle('🏺 Antika Satın Alındı').setColor(0xE67E22)
-          .addFields({ name: 'Kullanıcı', value: `<@${uid}>`, inline: true }, { name: 'Antika', value: `${available.emoji} ${available.name}`, inline: true }).setTimestamp());
-        return interaction.reply(`✅ ${available.emoji} **${available.name}** satın alındı!\nAktif etmek için: \`/antika aktif-et anahtar:${antiqueKey}\` | Bakiye: **${getBalance(gid, uid).balance} coin**`);
-      }
 
-      // ── Kraliyet Marketi ──────────────────────────────────
-      if (sub === 'kraliyet') {
-        const lines = ROYAL_ITEMS.map(ri => {
-          const r = getRoyalItem(gid, ri.key);
-          const ownerStr = r.ownerId ? `<@${r.ownerId}>` : '❌ Sahipsiz';
-          return `${ri.emoji} **${ri.name}** \`${ri.key}\`\n  Sahibi: ${ownerStr} • Güncel Fiyat: **${r.price} coin**`;
-        });
-        const embed = new EmbedBuilder()
-          .setTitle('👑 Kraliyet Eşyaları Marketi')
-          .setColor(0xFFD700)
-          .setDescription(lines.join('\n\n'))
-          .setFooter({ text: 'Her satışta fiyat 1000 coin artar • Satın al: /market kraliyet-al' });
-        return interaction.reply({ embeds: [embed] });
-      }
+        if (section === 'relical') {
+          const relicKey = parts[2];
+          const rDef     = RELICS.find(r => r.key === relicKey);
+          if (!rDef) return i.reply({ ephemeral: true, content: '⛔ Geçersiz relik.' });
+          if (rDef.group === 'ejder') return i.reply({ ephemeral: true, content: '🐉 Ejder Seti parçaları marketten satılmaz! `/pazar listele` ile oyuncu pazarından al veya madencilik/odunculukta şans eseri düşmesini bekle.' });
+          if (hasRelic(gid, uid, relicKey)) return i.reply({ ephemeral: true, content: `${rDef.emoji} Bu relike zaten sahipsin!` });
+          const bal = getBalance(gid, uid);
+          if (bal.balance < rDef.price) return i.reply({ ephemeral: true, content: `⛔ Yetersiz coin! Gerekli: **${rDef.price}**, Bakiye: **${bal.balance}**` });
+          addBalance(gid, uid, -rDef.price); buyRelic(gid, uid, relicKey);
+          sendLog(gid, 'market', new EmbedBuilder().setTitle(`📿 Relik: ${rDef.name}`).setColor(0x9B59B6).addFields({ name: 'Kullanıcı', value: `<@${uid}>`, inline: true }).setTimestamp());
+          return i.reply({ ephemeral: true, content: `✅ ${rDef.emoji} **${rDef.name}** alındı!\n↳ ${rDef.description}\nBakiye: **${getBalance(gid, uid).balance}**` });
+        }
 
-      if (sub === 'kraliyet-al') {
-        const itemKey = interaction.options.getString('esya');
-        const ri = ROYAL_ITEMS.find(x => x.key === itemKey);
-        if (!ri) return interaction.reply({ ephemeral: true, content: '⛔ Geçersiz eşya.' });
-        const current = getRoyalItem(gid, itemKey);
-        if (current.ownerId === uid) return interaction.reply({ ephemeral: true, content: `${ri.emoji} Bu eşya zaten sende!` });
-        const bal = getBalance(gid, uid);
-        if (bal.balance < current.price) return interaction.reply({ ephemeral: true, content: `⛔ Yetersiz coin! Gerekli: **${current.price}**, Bakiye: **${bal.balance}**` });
-        addBalance(gid, uid, -current.price);
-        const { prevOwner, price } = buyRoyalItem(gid, itemKey, uid);
-        if (prevOwner) addBalance(gid, prevOwner, price); // eski sahibine iade
-        const nextPrice = price + 1000;
-        sendLog(gid, 'market', new EmbedBuilder().setTitle('👑 Kraliyet Eşyası El Değiştirdi').setColor(0xFFD700)
-          .addFields(
-            { name: 'Yeni Sahip', value: `<@${uid}>`, inline: true },
-            { name: 'Eşya', value: `${ri.emoji} ${ri.name}`, inline: true },
-            { name: 'Ödenen', value: `${price} coin`, inline: true },
-            { name: 'Eski Sahip', value: prevOwner ? `<@${prevOwner}>` : 'Yok', inline: true },
-          ).setTimestamp());
-        const prevMsg = prevOwner ? ` (eski sahibine **${price} coin** iade edildi)` : '';
-        return interaction.reply(`✅ ${ri.emoji} **${ri.name}** satın alındı!${prevMsg}\n💰 Ödenen: **${price} coin** | Yeni fiyat: **${nextPrice} coin** | Bakiye: **${getBalance(gid, uid).balance} coin**`);
-      }
+        // ── HAYVAN MAMASI ─────────────────────────────────────
+        if (section === 'mama') {
+          const petRows = getPetRows(gid, uid);
+          if (!petRows.length) return i.reply({ ephemeral: true, content: '🐾 Hiç petin yok! Önce Pet Al bölümünden bir pet satın al.' });
+          const today = new Date().toLocaleDateString('tr-TR', { timeZone: 'Europe/Istanbul' }).split('.').reverse().join('-');
+          const lines = PET_FOODS.map(f => {
+            const hasPetBool = petRows.some(r => r.petKey === f.petKey);
+            if (!hasPetBool) return `${f.emoji} **${f.name}** — Bu pet sende yok`;
+            const fedDate = getPetFedDate(gid, uid, f.petKey);
+            const alive   = isPetAlive(gid, uid, f.petKey);
+            return `${f.emoji} **${f.name}** — **${f.price} coin** ${fedDate === today ? '✅ Bugün beslendi' : alive ? '⚠️ Beslenmedi!' : '❌ Ölme tehlikesi!'}`;
+          });
+          const foodBtns = PET_FOODS.map(f => {
+            const hasPetBool = petRows.some(r => r.petKey === f.petKey);
+            const fedDate    = getPetFedDate(gid, uid, f.petKey);
+            return new ButtonBuilder().setCustomId(`mkt_mamaver_${f.petKey}_${uid}`).setLabel(`${f.emoji} ${f.name} (${f.price}c)`).setStyle(ButtonStyle.Success).setDisabled(!hasPetBool || fedDate === today);
+          });
+          const row = new ActionRowBuilder().addComponents(...foodBtns, new ButtonBuilder().setCustomId(`mkt_back_${uid}`).setLabel('← Geri').setStyle(ButtonStyle.Danger));
+          const e = new EmbedBuilder().setTitle('🍖 Hayvan Maması').setColor(0xEB459E)
+            .setDescription(lines.join('\n'))
+            .setFooter({ text: '⚠️ 1 gün beslenmezse pet ölür ve yeniden satın alınması gerekir!' });
+          return i.update({ embeds: [e], components: [row] });
+        }
+
+        if (section === 'mamaver') {
+          const petKey = parts[2];
+          const def    = PETS.find(p => p.key === petKey);
+          if (!def || !hasPet(gid, uid, petKey)) return i.reply({ ephemeral: true, content: '⛔ Bu pet sende yok.' });
+          const today   = new Date().toLocaleDateString('tr-TR', { timeZone: 'Europe/Istanbul' }).split('.').reverse().join('-');
+          const fedDate = getPetFedDate(gid, uid, petKey);
+          if (fedDate === today) return i.reply({ ephemeral: true, content: `${def.emoji} **${def.name}** bugün zaten beslendi!` });
+          const foodDef = PET_FOODS.find(f => f.petKey === petKey);
+          const bal     = getBalance(gid, uid);
+          if (bal.balance < foodDef.price) return i.reply({ ephemeral: true, content: `⛔ Yetersiz coin! Gerekli: **${foodDef.price}**, Bakiye: **${bal.balance}**` });
+          addBalance(gid, uid, -foodDef.price);
+          setPetFedDate(gid, uid, petKey, today);
+          return i.reply({ ephemeral: true, content: `${def.emoji} **${def.name}** beslendi! **-${foodDef.price} coin** | Bakiye: **${getBalance(gid, uid).balance}**` });
+        }
+      });
+
+      collector.on('end', () => interaction.editReply({ components: [] }).catch(() => {}));
+      return;
     }
 
     // ─────────────────────────────────────────────────────────
@@ -4655,13 +5069,16 @@ client.on('interactionCreate', async interaction => {
         db.prepare('UPDATE fish_inventory SET count=0 WHERE guildId=? AND userId=? AND fishKey=?').run(gid, uid, row.fishKey);
       }
       if (total === 0) return interaction.reply({ ephemeral: true, content: '🎒 Envanterinde satacak balık yok!' });
-      addBalance(gid, uid, total);
+      // Tüccar Reliği +%10 balık satış bonusu
+      const fishRelicBonus = getRelicFishBonus(gid, uid);
+      const totalEarned = Math.round(total * (1 + fishRelicBonus / 100));
+      addBalance(gid, uid, totalEarned);
       const embed = new EmbedBuilder()
         .setTitle('🐟 Balık Marketi — Tüm Balıklar Satıldı!')
         .setColor(0x1ABC9C)
         .setDescription(lines.join('\n'))
         .addFields(
-          { name: '💰 Toplam Kazanç', value: `**+${total} coin**`, inline: true },
+          { name: '💰 Toplam Kazanç', value: `**+${totalEarned} coin**${fishRelicBonus > 0 ? ` *(+%${fishRelicBonus} Tüccar Reliği)*` : ''}`, inline: true },
           { name: '💳 Yeni Bakiye', value: `**${getBalance(gid, uid).balance} coin**`, inline: true }
         )
         .setTimestamp();
@@ -5105,21 +5522,35 @@ client.on('interactionCreate', async interaction => {
     //  /pet — hayvan dostları
     // ─────────────────────────────────────────────────────────
     if (cmd === 'pet') {
+      // Her pet komutunda açlık kontrolü yap — açlıktan ölen petleri sil
+      const killedByHunger = checkAndKillHungryPets(gid, uid);
+      if (killedByHunger.length) {
+        const killedNames = killedByHunger.map(p => `${p.emoji} **${p.name}**`).join(', ');
+        await interaction.followUp({ ephemeral: true, content: `💀 Beslenmediği için ${killedNames} açlıktan öldü! Yeniden satın almak için: \`/market\` → Pet Al.` }).catch(() => {});
+      }
+
       if (sub === 'bilgi') {
-        const target = interaction.options.getUser('hedef') || interaction.user;
-        const rows = getPetRows(gid, target.id);
-        if (!rows.length) return interaction.reply({ ephemeral: true, content: `🐾 **${target.username}**'in hiç peti yok. Satın almak için: \`/pet al\`` });
+        const target  = interaction.options.getUser('hedef') || interaction.user;
+        const tuid    = target.id;
+        // Hedef için de açlık kontrolü (kendi profili görülürken)
+        if (tuid === uid) checkAndKillHungryPets(gid, tuid);
+        const rows    = getPetRows(gid, tuid);
+        const today   = new Date().toLocaleDateString('tr-TR', { timeZone: 'Europe/Istanbul' }).split('.').reverse().join('-');
+        if (!rows.length) return interaction.reply({ ephemeral: true, content: `🐾 **${target.username}**'in hiç peti yok. \`/market\` → Pet Al` });
         const petLines = rows.map(r => {
           const def = PETS.find(p => p.key === r.petKey);
           if (!def) return null;
-          const bonus = getPetBonusByLevel(def, r.level);
-          return `${def.emoji} **${def.name}** Lv.${r.level} — +%${bonus} ${def.bonusType === 'xp' ? 'XP' : def.bonusType === 'coin' ? 'Coin' : 'Günlük'} ✅ **AKTİF**`;
+          const bonus   = getPetBonusByLevel(def, r.level);
+          const fedDate = getPetFedDate(gid, tuid, def.key);
+          const alive   = isPetAlive(gid, tuid, def.key);
+          const feedStr = fedDate === today ? '✅ Bugün beslendi' : alive ? '⚠️ Bugün beslenmedi!' : '❌ Açlık tehlikesi!';
+          return `${def.emoji} **${def.name}** Lv.${r.level} — +%${bonus} ${def.bonusType === 'xp' ? 'XP' : def.bonusType === 'coin' ? 'Coin' : 'Günlük'} | ${feedStr}`;
         }).filter(Boolean);
         const embed = new EmbedBuilder()
           .setTitle(`🐾 ${target.username} — Petler`)
           .setColor(0xEB459E)
           .setDescription(petLines.join('\n'))
-          .setFooter({ text: 'Tüm petler her zaman aktif — bonuslar otomatik uygulanır.' });
+          .setFooter({ text: '⚠️ Her gün /market → Hayvan Maması ile besle! 1 gün atlarsan ölür.' });
         return interaction.reply({ embeds: [embed] });
       }
       if (sub === 'al') {
@@ -5132,7 +5563,7 @@ client.on('interactionCreate', async interaction => {
         addBalance(gid, uid, -def.price);
         buyPet(gid, uid, petKey);
         const bonus = getPetBonusByLevel(def, 1);
-        return interaction.reply(`✅ ${def.emoji} **${def.name}** satın alındı ve otomatik aktifleşti!\n+%${bonus} ${def.bonusType === 'xp' ? 'XP' : def.bonusType === 'coin' ? 'Coin' : 'Günlük'} bonus kazanmaya başladın. | Bakiye: **${getBalance(gid, uid).balance} coin**`);
+        return interaction.reply(`✅ ${def.emoji} **${def.name}** satın alındı!\n+%${bonus} ${def.bonusType === 'xp' ? 'XP' : def.bonusType === 'coin' ? 'Coin' : 'Günlük'} bonus aktif.\n⚠️ Her gün beslemeyi unutma! (\`/market\` → Hayvan Maması) | Bakiye: **${getBalance(gid, uid).balance} coin**`);
       }
     }
 
@@ -5179,6 +5610,163 @@ client.on('interactionCreate', async interaction => {
         if (!active) return interaction.reply({ ephemeral: true, content: '❌ Zaten aktif antikan yok.' });
         clearActiveAntique(gid, uid);
         return interaction.reply('✅ Aktif antika kaldırıldı.');
+      }
+    }
+
+    // ─────────────────────────────────────────────────────────
+    //  /pazar — oyuncu pazarı
+    // ─────────────────────────────────────────────────────────
+    if (cmd === 'pazar') {
+      if (interaction.channelId !== GAME_CHANNEL_ID)
+        return interaction.reply({ ephemeral: true, content: `⛔ Bu komutu yalnızca <#${GAME_CHANNEL_ID}> kanalında kullanabilirsin.` });
+
+      // ── ENVANTER ─────────────────────────────────────────
+      if (sub === 'envanter') {
+        const tools = getPlayerTools(gid, uid);
+        if (!tools.length) return interaction.reply({ ephemeral: true, content: '🎒 Araç envanteriniz boş.\nMadencilik/odunculukta **1/1000** şansla araç düşebilir!' });
+        const lines = tools.map(t => {
+          const def = ALL_TOOLS.find(x => x.key === t.toolKey);
+          if (!def) return null;
+          return `${def.emoji} **${def.name}** ×${t.quantity} — Satış bonusu +%${def.bonus}`;
+        }).filter(Boolean);
+        const embed = new EmbedBuilder()
+          .setTitle('🎒 Araç Envanteri')
+          .setColor(0x8B4513)
+          .setDescription(lines.join('\n'))
+          .setFooter({ text: 'En yüksek bonuslu araç otomatik aktif olur • /pazar sat ile ilan aç' });
+        return interaction.reply({ ephemeral: true, embeds: [embed] });
+      }
+
+      // ── LİSTELE ──────────────────────────────────────────
+      if (sub === 'listele') {
+        const listings = getMarketListings(gid);
+        if (!listings.length) return interaction.reply({ ephemeral: true, content: '🏪 Oyuncu pazarında aktif ilan yok.\n`/pazar sat` ile ilan açabilirsin!' });
+        const TYPE_LABEL = { kazma: '⛏️ Kazma', balta: '🪓 Balta', ejder: '🐉 Ejder Reliği', antika: '🏺 Antika' };
+        const lines = listings.slice(0, 20).map(l => {
+          const def = ALL_TOOLS.find(x => x.key === l.itemKey)
+            || RELICS.find(x => x.key === l.itemKey)
+            || ANTIQUES.find(x => x.key === l.itemKey);
+          const name  = def ? `${def.emoji} ${def.name}` : l.itemKey;
+          const bonus = def && def.bonus ? ` (+%${def.bonus})` : '';
+          return `**[#${l.id}]** ${name}${bonus} — **${l.price} coin** | Satıcı: <@${l.sellerId}>`;
+        });
+        const embed = new EmbedBuilder()
+          .setTitle('🏪 Oyuncu Pazarı')
+          .setColor(0xE67E22)
+          .setDescription(lines.join('\n'))
+          .setFooter({ text: '/pazar al id:<numara> ile satın al • /pazar sat ile ilan aç' });
+        return interaction.reply({ embeds: [embed] });
+      }
+
+      // ── SAT ──────────────────────────────────────────────
+      if (sub === 'sat') {
+        const tur    = interaction.options.getString('tur');
+        const key    = interaction.options.getString('anahtar').toLowerCase().trim();
+        const price  = interaction.options.getInteger('fiyat');
+
+        if (tur === 'kazma') {
+          const def = MINING_TOOLS.find(x => x.key === key);
+          if (!def) return interaction.reply({ ephemeral: true, content: `⛔ Geçersiz kazma anahtarı!\nGeçerli: ${MINING_TOOLS.map(x => `\`${x.key}\``).join(', ')}` });
+          const row = getPlayerTool(gid, uid, key);
+          if (!row || row.quantity < 1) return interaction.reply({ ephemeral: true, content: `⛔ Envanterinde **${def.name}** yok! \`/pazar envanter\` ile kontrol et.` });
+          removePlayerTool(gid, uid, key, 1);
+          const id = createMarketListing(gid, uid, 'kazma', key, price);
+          return interaction.reply(`✅ ${def.emoji} **${def.name}** **${price} coin**'e ilanı açıldı! İlan #${id}`);
+        }
+
+        if (tur === 'balta') {
+          const def = WOOD_TOOLS.find(x => x.key === key);
+          if (!def) return interaction.reply({ ephemeral: true, content: `⛔ Geçersiz balta anahtarı!\nGeçerli: ${WOOD_TOOLS.map(x => `\`${x.key}\``).join(', ')}` });
+          const row = getPlayerTool(gid, uid, key);
+          if (!row || row.quantity < 1) return interaction.reply({ ephemeral: true, content: `⛔ Envanterinde **${def.name}** yok! \`/pazar envanter\` ile kontrol et.` });
+          removePlayerTool(gid, uid, key, 1);
+          const id = createMarketListing(gid, uid, 'balta', key, price);
+          return interaction.reply(`✅ ${def.emoji} **${def.name}** **${price} coin**'e ilanı açıldı! İlan #${id}`);
+        }
+
+        if (tur === 'ejder') {
+          const def = RELICS.find(x => x.key === key && x.group === 'ejder');
+          if (!def) return interaction.reply({ ephemeral: true, content: `⛔ Geçersiz Ejder Seti anahtarı!\nGeçerli: ${EJDER_SET_KEYS.map(k => `\`${k}\``).join(', ')}` });
+          if (!hasRelic(gid, uid, key)) return interaction.reply({ ephemeral: true, content: `⛔ Bu relike sahip değilsin!` });
+          // Reliği envanterden sil
+          db.prepare('DELETE FROM relics WHERE guildId=? AND userId=? AND relicKey=?').run(gid, uid, key);
+          const id = createMarketListing(gid, uid, 'ejder', key, price);
+          return interaction.reply(`✅ ${def.emoji} **${def.name}** **${price} coin**'e ilanı açıldı! İlan #${id}`);
+        }
+
+        if (tur === 'antika') {
+          const def = ANTIQUES.find(x => x.key === key);
+          if (!def) return interaction.reply({ ephemeral: true, content: `⛔ Geçersiz antika anahtarı! \`/antika envanter\` ile anahtarları gör.` });
+          const inv = getAntiqueInventory(gid, uid);
+          const row = inv.find(r => r.antiqueKey === key);
+          if (!row || row.count < 1) return interaction.reply({ ephemeral: true, content: `⛔ Envanterinde **${def.name}** yok!` });
+          // Antikayi envanterden düşür
+          db.prepare('UPDATE antique_inventory SET count=count-1 WHERE guildId=? AND userId=? AND antiqueKey=?').run(gid, uid, key);
+          db.prepare('DELETE FROM antique_inventory WHERE guildId=? AND userId=? AND antiqueKey=? AND count<=0').run(gid, uid, key);
+          const id = createMarketListing(gid, uid, 'antika', key, price);
+          return interaction.reply(`✅ ${def.emoji} **${def.name}** **${price} coin**'e ilanı açıldı! İlan #${id}`);
+        }
+      }
+
+      // ── AL ───────────────────────────────────────────────
+      if (sub === 'al') {
+        const listingId = interaction.options.getInteger('id');
+        const listing   = getMarketListing(listingId);
+        if (!listing || listing.guildId !== gid)
+          return interaction.reply({ ephemeral: true, content: `⛔ #${listingId} numaralı ilan bulunamadı.` });
+        if (listing.sellerId === uid)
+          return interaction.reply({ ephemeral: true, content: '⛔ Kendi ilanından satın alamazsın.' });
+
+        const bal = getBalance(gid, uid);
+        if (bal.balance < listing.price)
+          return interaction.reply({ ephemeral: true, content: `⛔ Yetersiz coin! Gerekli: **${listing.price}**, Bakiye: **${bal.balance}**` });
+
+        const def = ALL_TOOLS.find(x => x.key === listing.itemKey)
+          || RELICS.find(x => x.key === listing.itemKey)
+          || ANTIQUES.find(x => x.key === listing.itemKey);
+        const name = def ? `${def.emoji} ${def.name}` : listing.itemKey;
+
+        // Para transferi
+        addBalance(gid, uid, -listing.price);
+        addBalance(gid, listing.sellerId, listing.price);
+        deleteMarketListing(listingId);
+
+        // Eşyayı alıcıya ver
+        if (listing.itemType === 'kazma' || listing.itemType === 'balta') {
+          addPlayerTool(gid, uid, listing.itemKey);
+        } else if (listing.itemType === 'ejder') {
+          buyRelic(gid, uid, listing.itemKey);
+          const ejderMsg = hasAllEjderParts(gid, uid) ? '\n🐉 **Ejder Seti tamamlandı!** +%30 Coin ve +%20 XP aktif!' : '';
+          sendLog(gid, 'market', new EmbedBuilder().setTitle('🏪 Oyuncu Pazarı — Alım').setColor(0xE67E22)
+            .addFields({ name: 'Alıcı', value: `<@${uid}>`, inline: true }, { name: 'Satıcı', value: `<@${listing.sellerId}>`, inline: true }, { name: 'Eşya', value: name, inline: true }, { name: 'Fiyat', value: `${listing.price} coin`, inline: true }).setTimestamp());
+          return interaction.reply(`✅ ${name} satın alındı! **-${listing.price} coin** | Bakiye: **${getBalance(gid, uid).balance}**${ejderMsg}`);
+        } else if (listing.itemType === 'antika') {
+          addAntique(gid, uid, listing.itemKey);
+        }
+
+        sendLog(gid, 'market', new EmbedBuilder().setTitle('🏪 Oyuncu Pazarı — Alım').setColor(0xE67E22)
+          .addFields({ name: 'Alıcı', value: `<@${uid}>`, inline: true }, { name: 'Satıcı', value: `<@${listing.sellerId}>`, inline: true }, { name: 'Eşya', value: name, inline: true }, { name: 'Fiyat', value: `${listing.price} coin`, inline: true }).setTimestamp());
+        return interaction.reply(`✅ ${name} satın alındı! **-${listing.price} coin** | Bakiye: **${getBalance(gid, uid).balance}**`);
+      }
+
+      // ── İPTAL ────────────────────────────────────────────
+      if (sub === 'iptal') {
+        const listingId = interaction.options.getInteger('id');
+        const listing   = getMarketListing(listingId);
+        if (!listing || listing.guildId !== gid)
+          return interaction.reply({ ephemeral: true, content: `⛔ #${listingId} numaralı ilan bulunamadı.` });
+        if (listing.sellerId !== uid)
+          return interaction.reply({ ephemeral: true, content: '⛔ Bu ilan sana ait değil.' });
+
+        deleteMarketListing(listingId);
+        // Eşyayı iade et
+        if (listing.itemType === 'kazma' || listing.itemType === 'balta') addPlayerTool(gid, uid, listing.itemKey);
+        else if (listing.itemType === 'ejder') buyRelic(gid, uid, listing.itemKey);
+        else if (listing.itemType === 'antika') addAntique(gid, uid, listing.itemKey);
+
+        const def  = ALL_TOOLS.find(x => x.key === listing.itemKey) || RELICS.find(x => x.key === listing.itemKey) || ANTIQUES.find(x => x.key === listing.itemKey);
+        const name = def ? `${def.emoji} ${def.name}` : listing.itemKey;
+        return interaction.reply({ ephemeral: true, content: `↩️ İlan #${listingId} iptal edildi. ${name} envanterine iade edildi.` });
       }
     }
 
