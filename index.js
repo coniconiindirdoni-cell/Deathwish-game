@@ -17,6 +17,7 @@ const {
   EmbedBuilder, ActionRowBuilder, ButtonBuilder, ButtonStyle,
   StringSelectMenuBuilder, ChannelSelectMenuBuilder, RoleSelectMenuBuilder,
   SlashCommandBuilder, PermissionFlagsBits, ComponentType, ChannelType,
+  ModalBuilder, TextInputBuilder, TextInputStyle,
 } = require('discord.js');
 const Database = require('better-sqlite3');
 const express  = require('express');
@@ -4524,33 +4525,123 @@ client.on('interactionCreate', async interaction => {
         }
 
         // ── RENK AL (herkes kullanabilir) ────────────────────
-        if (section === 'renkal') {
-          const colorRoles = getColorRoles(gid);
-          if (!colorRoles.length) {
-            return i.reply({ ephemeral: true, content: '⛔ Henüz renk rolü eklenmemiş. `/renkrolekle` komutuyla ekleyebilirsin.' });
-          }
+        // NOT: Discord StringSelectMenu'de en fazla 25 seçenek olabilir.
+        // Renk sayısı 25'i geçince fazlası seçilemez hale geliyordu ve
+        // placeholder'daki "ara" ifadesi de gerçek bir arama yapmıyordu
+        // (Discord'un yerleşik filtrelemesi yalnızca o an EKLENMİŞ 25
+        // seçenek arasında çalışır). Aşağıdaki yardımcı, sayfalama (◀ ▶)
+        // ve gerçek bir modal tabanlı arama ekleyerek 25'ten fazla renk
+        // rolü olsa bile TÜMÜNÜN seçilebilir olmasını sağlar.
+        function buildColorPage(member, offset = 0) {
+          const colorRoles  = getColorRoles(gid);
           const guildRoles2 = interaction.guild.roles.cache;
-          const colorOptions = colorRoles.slice(0, 25).map(r => {
+          const page = colorRoles.slice(offset, offset + 25);
+          const colorOptions = page.map(r => {
             const roleObj = guildRoles2.get(r.roleId);
             const label   = roleObj ? roleObj.name : r.roleId;
-            const owned2  = i.member.roles.cache.has(r.roleId);
+            const owned2  = member.roles.cache.has(r.roleId);
             const desc    = `${r.price} coin${owned2 ? ' — Zaten sahipsin' : ''}`;
             return { label: label.slice(0, 100), description: desc.slice(0, 100), value: r.roleId };
           });
           const colorSelect = new StringSelectMenuBuilder()
             .setCustomId(`renkpick_${uid}`)
-            .setPlaceholder('🎨 Renk adına göre ara veya listeden seç...')
+            .setPlaceholder(colorRoles.length > 25 ? `🎨 Listeden seç (${offset + 1}-${offset + page.length}/${colorRoles.length})` : '🎨 Listeden seç...')
             .addOptions(colorOptions);
-          const colorRow = new ActionRowBuilder().addComponents(colorSelect);
-          const backRow  = new ActionRowBuilder().addComponents(
-            new ButtonBuilder().setCustomId(`mkt_back_${uid}`).setLabel('← Geri').setStyle(ButtonStyle.Danger)
-          );
+          const rows = [new ActionRowBuilder().addComponents(colorSelect)];
+
+          const navBtns = [];
+          if (colorRoles.length > 25) {
+            navBtns.push(new ButtonBuilder().setCustomId(`mkt_renkpage_${Math.max(0, offset - 25)}_${uid}`).setLabel('◀ Önceki 25').setStyle(ButtonStyle.Secondary).setDisabled(offset === 0));
+            navBtns.push(new ButtonBuilder().setCustomId(`mkt_renksearch_${uid}`).setLabel('🔍 Ara').setStyle(ButtonStyle.Primary));
+            navBtns.push(new ButtonBuilder().setCustomId(`mkt_renkpage_${offset + 25}_${uid}`).setLabel('Sonraki 25 ▶').setStyle(ButtonStyle.Secondary).setDisabled(offset + 25 >= colorRoles.length));
+          } else {
+            navBtns.push(new ButtonBuilder().setCustomId(`mkt_renksearch_${uid}`).setLabel('🔍 Ara').setStyle(ButtonStyle.Primary));
+          }
+          rows.push(new ActionRowBuilder().addComponents(...navBtns));
+          rows.push(new ActionRowBuilder().addComponents(new ButtonBuilder().setCustomId(`mkt_back_${uid}`).setLabel('← Geri').setStyle(ButtonStyle.Danger)));
+
           const colorEmbed = new EmbedBuilder()
             .setTitle('🎨 Renk Rolü Seç')
             .setColor(0xEB459E)
             .setDescription(colorRoles.map(r => `<@&${r.roleId}> — **${r.price} coin**`).join('\n'))
-            .setFooter({ text: 'Bir renk rolü seç — sadece 1 renk rolüne sahip olabilirsin' });
-          return i.update({ embeds: [colorEmbed], components: [colorRow, backRow] });
+            .setFooter({ text: colorRoles.length > 25
+              ? `Sadece 1 renk rolüne sahip olabilirsin • ${colorRoles.length} renk var — sayfalar arasında gezin ya da 🔍 Ara'ya bas`
+              : 'Bir renk rolü seç — sadece 1 renk rolüne sahip olabilirsin' });
+          return { embeds: [colorEmbed], components: rows.slice(0, 5) };
+        }
+
+        if (section === 'renkal') {
+          const colorRoles = getColorRoles(gid);
+          if (!colorRoles.length) {
+            return i.reply({ ephemeral: true, content: '⛔ Henüz renk rolü eklenmemiş. `/renkrolekle` komutuyla ekleyebilirsin.' });
+          }
+          return i.update(buildColorPage(i.member, 0));
+        }
+
+        // ── RENK SAYFALAMA (◀ Önceki 25 / Sonraki 25 ▶) ──────
+        if (section === 'renkpage') {
+          const offset = parseInt(parts[2], 10) || 0;
+          return i.update(buildColorPage(i.member, offset));
+        }
+
+        // ── RENK ARA (gerçek arama — modal ile) ──────────────
+        if (section === 'renksearch') {
+          const modal = new ModalBuilder().setCustomId(`renksearchmodal_${uid}`).setTitle('🎨 Renk Ara');
+          const input = new TextInputBuilder()
+            .setCustomId('renksearchinput')
+            .setLabel('Renk adı (tam veya kısmi yazabilirsin)')
+            .setStyle(TextInputStyle.Short)
+            .setPlaceholder('örn: Mavi, Kırmızı Siyah...')
+            .setRequired(true)
+            .setMaxLength(50);
+          modal.addComponents(new ActionRowBuilder().addComponents(input));
+          await i.showModal(modal);
+
+          let modalSubmit;
+          try {
+            modalSubmit = await i.awaitModalSubmit({ time: 60_000, filter: m => m.user.id === uid && m.customId === `renksearchmodal_${uid}` });
+          } catch {
+            return; // kullanıcı modal'ı kapattı / zaman aşımı — sessiz geç
+          }
+
+          const query = modalSubmit.fields.getTextInputValue('renksearchinput').trim().toLowerCase();
+          const colorRoles  = getColorRoles(gid);
+          const guildRoles2 = interaction.guild.roles.cache;
+          const matched = colorRoles.filter(r => {
+            const roleObj = guildRoles2.get(r.roleId);
+            const name = (roleObj ? roleObj.name : r.roleId).toLowerCase();
+            return name.includes(query);
+          });
+
+          if (!matched.length) {
+            return modalSubmit.reply({ ephemeral: true, content: `⛔ **"${query}"** ile eşleşen bir renk rolü bulunamadı.` });
+          }
+
+          const page = matched.slice(0, 25);
+          const colorOptions = page.map(r => {
+            const roleObj = guildRoles2.get(r.roleId);
+            const label   = roleObj ? roleObj.name : r.roleId;
+            const owned2  = modalSubmit.member.roles.cache.has(r.roleId);
+            const desc    = `${r.price} coin${owned2 ? ' — Zaten sahipsin' : ''}`;
+            return { label: label.slice(0, 100), description: desc.slice(0, 100), value: r.roleId };
+          });
+          const colorSelect = new StringSelectMenuBuilder()
+            .setCustomId(`renkpick_${uid}`)
+            .setPlaceholder(`🎨 "${query}" sonuçları (${page.length}/${matched.length})`)
+            .addOptions(colorOptions);
+          const resultRows = [
+            new ActionRowBuilder().addComponents(colorSelect),
+            new ActionRowBuilder().addComponents(
+              new ButtonBuilder().setCustomId(`mkt_renkal_${uid}`).setLabel('🔄 Tüm Listeye Dön').setStyle(ButtonStyle.Secondary),
+              new ButtonBuilder().setCustomId(`mkt_back_${uid}`).setLabel('← Geri').setStyle(ButtonStyle.Danger),
+            ),
+          ];
+          const resultEmbed = new EmbedBuilder()
+            .setTitle('🎨 Renk Arama Sonuçları')
+            .setColor(0xEB459E)
+            .setDescription(matched.map(r => `<@&${r.roleId}> — **${r.price} coin**`).join('\n'))
+            .setFooter({ text: matched.length > 25 ? `${matched.length} eşleşme bulundu, ilk 25'i gösteriliyor — aramanı daraltmayı dene` : 'Bir renk rolü seç' });
+          return modalSubmit.update({ embeds: [resultEmbed], components: resultRows });
         }
 
         // ── ÖZEL EŞYALAR ─────────────────────────────────────
