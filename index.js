@@ -1244,6 +1244,13 @@ function getXpMultiplier(gid, uid, consume = true) {
   return m;
 }
 
+// Pet/Antika/Relik XP bonusu — madencilik ve odunculuk XP'sine de uygulanır.
+// (Kalıcı/geçici XP Boost item'ları burada YOK; onlar yalnızca sohbet seviye
+// sistemini etkilemeye devam ediyor. Bu sadece "sahip olunan" pasif bonuslar.)
+function getPassiveXpBonusPct(gid, uid) {
+  return (getAntiqueXpBonus(gid, uid) + getPetXpBonus(gid, uid) + getRelicXpBonus(gid, uid)) / 100;
+}
+
 // Mülk coin bonusu: Ev Lv başına +%2, Araba Lv başına +%2
 function getPropertyCoinBonus(gid, uid) {
   const p = getProperties(gid, uid);
@@ -1536,9 +1543,12 @@ function resolveFishCast(gid, uid, boosted) {
 }
 
 // Blackjack / At Yarışı ortak ödül hesaplayıcı — 2x kazanç (bet kadar kâr)
-function resolveWinAmount(bet) {
-  if (Math.random() < 0.001) return bet * 4;
-  return bet * 2;
+// Coin boost / relik / pet / antika / mülk bonusları artık kazanılan tutara da uygulanıyor.
+function resolveWinAmount(bet, gid, uid) {
+  const base = Math.random() < 0.001 ? bet * 4 : bet * 2;
+  if (!gid || !uid) return base; // gid/uid verilmediyse eski davranış (bonussuz)
+  const bonusPct = getTotalCoinBonusPct(gid, uid);
+  return Math.round(base * (1 + bonusPct / 100));
 }
 
 // ──────────────────────────────────────────────────────────────
@@ -1803,7 +1813,7 @@ async function handleMineButton(interaction) {
     // Madencilik XP (maks seviye: 50 — Challenger)
     let leveledUp = false;
     if (data.miningLevel < MINING_MAX_LEVEL) {
-      data.miningXp += effectiveSend;
+      data.miningXp += Math.round(effectiveSend * (1 + getPassiveXpBonusPct(gid, uid)));
       while (data.miningXp >= getMiningXpNeeded(data.miningLevel) && data.miningLevel < MINING_MAX_LEVEL) {
         data.miningXp -= getMiningXpNeeded(data.miningLevel);
         data.miningLevel++;
@@ -1841,8 +1851,8 @@ async function handleMineButton(interaction) {
     if (justRanOut)   embed.addFields({ name: '🍽️ Yiyecek Bitti!',   value: 'Tüm yiyecek kullanımları tükendi! Marketten yenisini al.',       inline: false });
     if (isHungry)     embed.addFields({ name: '😫 İşçiler Aç!',       value: 'Yiyecek yok — verimlilik %50 düştü! Marketten yemek al.',        inline: false });
 
-    // ── 1/1000 şans eseri drop (gönderme anında) ─────────────
-    if (Math.random() < 0.001) {
+    // ── 1/400 şans eseri drop (gönderme anında) ─────────────
+    if (Math.random() < 1 / 400) {
       const dropMsg = giveRareDrop(gid, uid, MINING_TOOLS);
       embed.addFields({ name: '🎉 Nadir Düşme!', value: dropMsg });
     }
@@ -1928,8 +1938,8 @@ async function handleMineButton(interaction) {
       lines.push(`${ore.emoji} ${ore.name} × ${r.amount} = ${earned} coin`);
     }
     clearMiningInventory(gid, uid);
-    // Madencilik satış değeri %25 azaltıldı + Madenci Reliği +%20 + En iyi kazma bonusu
-    const mineCoinsRaw  = Math.floor(totalValue * 0.75);
+    // Enflasyon kesintisi kaldırıldı — satış değeri artık tam veriliyor. Madenci Reliği +%20 + En iyi kazma bonusu
+    const mineCoinsRaw  = totalValue;
     const mineToolBonus = getBestMiningToolBonus(gid, uid);
     const mineBonus     = getTotalCoinBonusPct(gid, uid) + getRelicMineBonus(gid, uid) + mineToolBonus;
     const mineEarned    = Math.round(mineCoinsRaw * (1 + mineBonus / 100));
@@ -2499,7 +2509,7 @@ async function handleWoodButton(interaction) {
     data.totalLogsCut += effectiveResults.length;
 
     // Odunculuk XP
-    data.woodXp += effectiveResults.length;
+    data.woodXp += Math.round(effectiveResults.length * (1 + getPassiveXpBonusPct(gid, uid)));
     let leveledUp = false;
     while (data.woodXp >= getWoodXpNeeded(data.woodLevel)) {
       data.woodXp -= getWoodXpNeeded(data.woodLevel);
@@ -2543,8 +2553,8 @@ async function handleWoodButton(interaction) {
     if (justRanOut)  embed.addFields({ name: '🍽️ Yiyecek Bitti!',  value: 'Tüm yiyecek kullanımları tükendi! Marketten yenisini al.',      inline: false });
     if (isHungry)    embed.addFields({ name: '😫 Oduncular Aç!',    value: 'Yiyecek yok — verimlilik %50 düştü! Marketten yemek al.',       inline: false });
 
-    // ── 1/1000 şans eseri drop (gönderme anında) ─────────────
-    if (Math.random() < 0.001) {
+    // ── 1/400 şans eseri drop (gönderme anında) ─────────────
+    if (Math.random() < 1 / 400) {
       const dropMsg = giveRareDrop(gid, uid, WOOD_TOOLS);
       embed.addFields({ name: '🎉 Nadir Düşme!', value: dropMsg });
     }
@@ -2615,8 +2625,8 @@ async function handleWoodButton(interaction) {
       lines.push(`${w.emoji} ${w.name} × ${r.amount} = ${earned} coin`);
     }
     clearWoodInventory(gid, uid);
-    // Odunculuk satış değeri %15 azaltıldı + En iyi balta bonusu
-    const woodCoinsRaw  = Math.floor(totalValue * 0.85);
+    // Enflasyon kesintisi kaldırıldı — satış değeri artık tam veriliyor. En iyi balta bonusu
+    const woodCoinsRaw  = totalValue;
     const woodToolBonus = getBestWoodToolBonus(gid, uid);
     const woodBonus     = getTotalCoinBonusPct(gid, uid) + woodToolBonus;
     const woodEarned    = Math.round(woodCoinsRaw * (1 + woodBonus / 100));
@@ -3751,7 +3761,7 @@ client.on('interactionCreate', async interaction => {
               '`/pazar al id:<numara>` — İlandan satın al',
               '`/pazar iptal id:<numara>` — Kendi ilanını geri çek',
               '📌 **Satılabilir:** ⛏️ Kazmalar · 🪓 Baltalar · 🐉 Ejder Seti Relikleri · 🏺 Antikalar',
-              '💡 Kazmalar/baltalar madencilik & odunculukta **1/1000** şansla düşer',
+              '💡 Kazmalar/baltalar madencilik & odunculukta **1/400** şansla düşer',
             ].join('\n'),
           },
           {
@@ -3761,7 +3771,7 @@ client.on('interactionCreate', async interaction => {
               '  ⛏️ Demir +%5 · 🪙 Altın +%10 · 💎 Elmas +%15 · ✨ Büyülü +%20',
               '**Odunculuk Baltaları** (satış bonusu):',
               '  🪓 Demir +%5 · 🪙 Altın +%10 · 💎 Elmas +%15 · ✨ Büyülü +%20',
-              '🎲 Her satışta **1/1000** ihtimalle antika, relik veya araç düşebilir!',
+              '🎲 Her satışta **1/400** ihtimalle antika, relik veya araç düşebilir!',
             ].join('\n'),
           },
           {
@@ -4815,7 +4825,7 @@ client.on('interactionCreate', async interaction => {
               ? `✅ **Lv.${ejderLv} (MAKSİMUM)** ${ejderBar} — **+%${coinBonus} Coin** / **+%${xpBonus} XP**`
               : `✅ **Lv.${ejderLv}** ${ejderBar} — **+%${coinBonus} Coin** / **+%${xpBonus} XP** — Yükselt: **${EJDER_UPGRADE_COST} coin**`;
           }
-          lines.push(`\n🐉 **Ejder Seti** (${ejderCnt}/3): ${ejderStatus}\n  ↳ Madencilik/odunculukta **1/1000** şansla düşer ya da \`/pazar listele\`'den satın alınabilir. Set tamamlanmadan yükseltilemez.`);
+          lines.push(`\n🐉 **Ejder Seti** (${ejderCnt}/3): ${ejderStatus}\n  ↳ Madencilik/odunculukta **1/400** şansla düşer ya da \`/pazar listele\`'den satın alınabilir. Set tamamlanmadan yükseltilemez.`);
           // Satın alma butonları (henüz sahip olunamayanlar)
           const avail   = RELICS.filter(r => r.group === 'single' && !ownedKeys.includes(r.key));
           const buyBtns = avail.map(r => new ButtonBuilder().setCustomId(`mkt_relical_${r.key}_${uid}`).setLabel(`${r.emoji} ${r.name.split(' ')[0]} (${r.price}c)`).setStyle(ButtonStyle.Primary));
@@ -5300,7 +5310,7 @@ client.on('interactionCreate', async interaction => {
 
         if (handValue(player) === 21) {
           activeBlackjack.delete(bkey);
-          const win = resolveWinAmount(bet);
+          const win = resolveWinAmount(bet, gid, uid);
           addBalance(gid, uid, win);
           return await interaction.reply({ embeds: [buildEmbed(true, `🎉 **BLACKJACK!** Kazandın: **+${win} coin**`)] });
         }
@@ -5337,7 +5347,7 @@ client.on('interactionCreate', async interaction => {
               while (handValue(dealer) < 17) dealer.push(drawCard());
               const pv = handValue(player), dv = handValue(dealer);
               if (dv > 21 || pv > dv) {
-                const win = resolveWinAmount(bet);
+                const win = resolveWinAmount(bet, gid, uid);
                 addBalance(gid, uid, win);
                 return await finish(i, `🎉 **Kazandın!** ${pv} vs ${dv}. **+${win} coin**`, true);
               } else if (pv === dv) {
@@ -5407,7 +5417,7 @@ client.on('interactionCreate', async interaction => {
           const winner = Math.floor(Math.random() * 6) + 1;
           const lines = race.participants.map(p => {
             if (p.horse === winner) {
-              const win = resolveWinAmount(p.bet);
+              const win = resolveWinAmount(p.bet, gid, p.uid);
               addBalance(gid, p.uid, win);
               return `🏆 <@${p.uid}> — At ${p.horse} ✅ **+${win} coin**`;
             }
@@ -5800,7 +5810,7 @@ client.on('interactionCreate', async interaction => {
       // ── ENVANTER ─────────────────────────────────────────
       if (sub === 'envanter') {
         const tools = getPlayerTools(gid, uid);
-        if (!tools.length) return interaction.reply({ ephemeral: true, content: '🎒 Araç envanteriniz boş.\nMadencilik/odunculukta **1/1000** şansla araç düşebilir!' });
+        if (!tools.length) return interaction.reply({ ephemeral: true, content: '🎒 Araç envanteriniz boş.\nMadencilik/odunculukta **1/400** şansla araç düşebilir!' });
         const lines = tools.map(t => {
           const def = ALL_TOOLS.find(x => x.key === t.toolKey);
           if (!def) return null;
