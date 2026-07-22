@@ -1930,19 +1930,24 @@ async function handleMineButton(interaction) {
 
     // ── Seviye bazlı craft malzeme düşmesi (her kazılımda) ───
     {
+      // NOT: Bu tabloda CRAFT_MATERIALS'taki HER malzeme bulunmalı, yoksa o
+      // malzeme hiçbir zaman düşmez (altin_cevheri ve elmas_cevheri eksikti,
+      // eklendi). Ayrıca tüm düşme ihtimalleri +%25 artırıldı (kullanıcı isteği).
       const _matDropTable = [
-        { minLevel: 1,  key: 'demir_cevheri',     chance: 0.10, emoji: '⚙️',  name: 'Demir' },
-        { minLevel: 1,  key: 'bakir_cevheri',     chance: 0.10, emoji: '🟤', name: 'Bakır' },
-        { minLevel: 5,  key: 'obsidyen',           chance: 0.08, emoji: '🪨', name: 'Obsidyen' },
-        { minLevel: 10, key: 'saf_kristal',        chance: 0.07, emoji: '🔮', name: 'Saf Kristal' },
-        { minLevel: 10, key: 'lav_tasi',           chance: 0.07, emoji: '🌋', name: 'Lav Taşı' },
-        { minLevel: 15, key: 'ruh_tozu',           chance: 0.06, emoji: '👻', name: 'Ruh Tozu' },
-        { minLevel: 20, key: 'ejder_pulu',         chance: 0.06, emoji: '🐉', name: 'Ejder Pulu' },
-        { minLevel: 20, key: 'ay_tasi',            chance: 0.06, emoji: '🌙', name: 'Ay Taşı' },
-        { minLevel: 25, key: 'karanlik_oz',        chance: 0.05, emoji: '🌑', name: 'Karanlık Öz' },
-        { minLevel: 25, key: 'gunes_parcasi',      chance: 0.05, emoji: '☀️', name: 'Güneş Parçası' },
-        { minLevel: 30, key: 'yildirim_kristali',  chance: 0.05, emoji: '⚡', name: 'Yıldırım Kristali' },
-        { minLevel: 30, key: 'buz_cekirdegi',      chance: 0.05, emoji: '❄️', name: 'Buz Çekirdeği' },
+        { minLevel: 1,  key: 'demir_cevheri',     chance: 0.125, emoji: '⚙️',  name: 'Demir' },
+        { minLevel: 1,  key: 'bakir_cevheri',     chance: 0.125, emoji: '🟤', name: 'Bakır' },
+        { minLevel: 5,  key: 'altin_cevheri',     chance: 0.10,  emoji: '🟡', name: 'Altın' },
+        { minLevel: 5,  key: 'obsidyen',           chance: 0.10,  emoji: '🪨', name: 'Obsidyen' },
+        { minLevel: 10, key: 'elmas_cevheri',      chance: 0.088, emoji: '💎', name: 'Elmas' },
+        { minLevel: 10, key: 'saf_kristal',        chance: 0.088, emoji: '🔮', name: 'Saf Kristal' },
+        { minLevel: 10, key: 'lav_tasi',           chance: 0.088, emoji: '🌋', name: 'Lav Taşı' },
+        { minLevel: 15, key: 'ruh_tozu',           chance: 0.075, emoji: '👻', name: 'Ruh Tozu' },
+        { minLevel: 20, key: 'ejder_pulu',         chance: 0.075, emoji: '🐉', name: 'Ejder Pulu' },
+        { minLevel: 20, key: 'ay_tasi',            chance: 0.075, emoji: '🌙', name: 'Ay Taşı' },
+        { minLevel: 25, key: 'karanlik_oz',        chance: 0.063, emoji: '🌑', name: 'Karanlık Öz' },
+        { minLevel: 25, key: 'gunes_parcasi',      chance: 0.063, emoji: '☀️', name: 'Güneş Parçası' },
+        { minLevel: 30, key: 'yildirim_kristali',  chance: 0.063, emoji: '⚡', name: 'Yıldırım Kristali' },
+        { minLevel: 30, key: 'buz_cekirdegi',      chance: 0.063, emoji: '❄️', name: 'Buz Çekirdeği' },
       ];
       const _matDrops = [];
       for (const md of _matDropTable) {
