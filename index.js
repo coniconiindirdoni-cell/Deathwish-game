@@ -3336,8 +3336,6 @@ const SLASH_COMMANDS = [
     .addSubcommand(s => s.setName('panel').setDescription('[OWNER] Odunculuk panelini kanala gönder'))
     .addSubcommand(s => s.setName('siralama').setDescription('Odunculuk sıralamasını gör')),
 
-  ...MMORPG_SLASH_COMMANDS,
-
 ].map(c => c.toJSON());
 
 // ──────────────────────────────────────────────────────────────
@@ -8271,6 +8269,9 @@ const MMORPG_SLASH_COMMANDS = [
       .addStringOption(o => o.setName('petkey').setDescription('Pet anahtarı').setRequired(true))
       .addStringOption(o => o.setName('hatchedat').setDescription('Kuluçka zamanı').setRequired(true))),
 ].map(c => c.toJSON());
+
+// MMORPG komutlarını ana listeye ekle (tanım yukarıda yapıldıktan sonra push)
+SLASH_COMMANDS.push(...MMORPG_SLASH_COMMANDS);
 
 const MMO_CMDS = new Set([
   'rpg', 'stat', 'zindan', 'envanter', 'sandik', 'yumurta',
