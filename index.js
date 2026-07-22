@@ -1736,7 +1736,7 @@ function getMiningMaxEnergy(data) {
   return 19 + (data.energyLevel ?? 1) + capBonus;
 }
 function getMiningCapacity(level)   { return level >= 40 ? 8 : level >= 30 ? 7 : level >= 20 ? 5 : level >= 10 ? 3 : 2; }
-function getMiningXpNeeded(level)   { return level * 3; }
+function getMiningXpNeeded(level)   { return level * 9; } // %200 zorlaştırıldı (eskiden level*3)
 function getEnergyXpNeeded(level)   { return level * 10; }
 
 const MINING_MAX_LEVEL = 50;
@@ -1936,7 +1936,7 @@ async function handleMineButton(interaction) {
       const _matDropTable = [
         { minLevel: 1,  key: 'demir_cevheri',     chance: 0.125, emoji: '⚙️',  name: 'Demir' },
         { minLevel: 1,  key: 'bakir_cevheri',     chance: 0.125, emoji: '🟤', name: 'Bakır' },
-        { minLevel: 5,  key: 'altin_cevheri',     chance: 0.10,  emoji: '🟡', name: 'Altın' },
+        { minLevel: 5,  key: 'altin_cevheri',     chance: 0.25,  emoji: '🟡', name: 'Altın' },
         { minLevel: 5,  key: 'obsidyen',           chance: 0.10,  emoji: '🪨', name: 'Obsidyen' },
         { minLevel: 10, key: 'elmas_cevheri',      chance: 0.088, emoji: '💎', name: 'Elmas' },
         { minLevel: 10, key: 'saf_kristal',        chance: 0.088, emoji: '🔮', name: 'Saf Kristal' },
@@ -3228,7 +3228,7 @@ const SLASH_COMMANDS = [
     .setDescription('Antika koleksiyon komutları')
     .addSubcommand(s => s.setName('envanter').setDescription('Antika envanterini gör'))
     .addSubcommand(s => s.setName('aktif-et').setDescription('Aktif antika ayarla')
-      .addStringOption(o => o.setName('anahtar').setDescription('Antika anahtarı (envanter\'de gösterilir)').setRequired(true)))
+      .addStringOption(o => o.setName('anahtar').setDescription('Antika anahtarı (envanterinden seç)').setRequired(true).setAutocomplete(true)))
     .addSubcommand(s => s.setName('kaldir').setDescription('Aktif antikayı kaldır')),
 
   // /gelistir — tek panel'den her şeyi yükselt
@@ -3289,7 +3289,7 @@ const SLASH_COMMANDS = [
   // /blackjack — blackjack (21)
   new SlashCommandBuilder()
     .setName('blackjack')
-    .setDescription('Blackjack (21) oyna — botla')
+    .setDescription('Blackjack (21) oyna — botla (günlük max 8 kez)')
     .addIntegerOption(o => o.setName('bahis').setDescription('Bahis miktarı').setRequired(true).setMinValue(1)),
 
   // /atyarisi — at yarışı (çok oyunculu bahis)
@@ -3651,7 +3651,58 @@ client.on('interactionCreate', async interaction => {
     // ── AUTOCOMPLETE ─────────────────────────────────────────
     if (interaction.isAutocomplete()) {
       const { commandName } = interaction;
-      return interaction.respond([]);
+      const focused = interaction.options.getFocused(true); // { name, value }
+      const typed   = (focused.value || '').toLowerCase().trim();
+      const gid2    = interaction.guildId;
+      const uid2    = interaction.user.id;
+
+      let choices = [];
+
+      if (commandName === 'craft' && focused.name === 'item') {
+        const kategori = interaction.options.getString('kategori');
+
+        if (kategori === 'silah') {
+          choices = WEAPON_TYPES.flatMap(t => WEAPON_TIERS.map(r => ({
+            key:   `${t.key}_${r.key}`,
+            label: `${t.emoji} ${t.name} — ${r.emoji}[${r.grade}] ${r.name}`,
+          })));
+        } else if (kategori === 'zirh') {
+          choices = ARMOR_SLOTS.flatMap(s => ARMOR_TIERS.map(t => ({
+            key:   `${s.key}_${t.key}`,
+            label: `${s.emoji} ${s.name} — ${t.emoji}[${t.grade}] ${t.name}`,
+          })));
+        } else if (kategori === 'yumurta') {
+          choices = Object.keys(CRAFT_EGG_RECIPES).map(key => {
+            const def = PET_EGG_TYPES.find(e => e.key === key);
+            return { key, label: def ? `${def.emoji} ${def.name}` : key };
+          });
+        } else if (kategori === 'sandik') {
+          choices = Object.keys(CRAFT_SANDIK_RECIPES).map(key => {
+            const def = MMORPG_CHESTS.find(c => c.key === key);
+            return { key, label: def ? `${def.emoji} ${def.name}` : key };
+          });
+        }
+
+        choices = choices
+          .filter(c => !typed || c.key.toLowerCase().includes(typed) || c.label.toLowerCase().includes(typed))
+          .slice(0, 25)
+          .map(c => ({ name: c.label.slice(0, 100), value: c.key }));
+      }
+
+      else if (commandName === 'antika' && focused.name === 'anahtar') {
+        const inv = getAntiqueInventory(gid2, uid2);
+        choices = inv
+          .map(r => {
+            const def = ANTIQUES.find(a => a.key === r.antiqueKey);
+            return def ? { key: def.key, label: `${def.emoji} ${def.name} ×${r.count}` } : null;
+          })
+          .filter(Boolean)
+          .filter(c => !typed || c.key.toLowerCase().includes(typed) || c.label.toLowerCase().includes(typed))
+          .slice(0, 25)
+          .map(c => ({ name: c.label.slice(0, 100), value: c.key }));
+      }
+
+      return interaction.respond(choices);
     }
 
     // ── KANAL KISITLAMASI ────────────────────────────────────
@@ -4777,13 +4828,13 @@ client.on('interactionCreate', async interaction => {
             .addFields(
               { name: '🛡️ Kalkan',         value: '**900 coin** — 4 saat hırsızlık koruması',   inline: true },
               { name: '⚡ Geçici XP (2x)', value: '**2000 coin** — 50 kullanım',                 inline: true },
-              { name: '💰 Coin Boost',     value: '**5000 coin** — Kalıcı 1.5x coin',            inline: true },
+              { name: '💰 Coin Boost',     value: '**20000 coin** — Kalıcı 1.5x coin',            inline: true },
               { name: '⚡ Kalıcı XP',      value: '**4000 coin** — Kalıcı 1.5x XP',             inline: true },
             );
           const r = new ActionRowBuilder().addComponents(
             new ButtonBuilder().setCustomId(`mkt_esya_kalkan_${uid}`).setLabel('🛡️ Kalkan (900c)').setStyle(ButtonStyle.Primary),
             new ButtonBuilder().setCustomId(`mkt_esya_gecici_${uid}`).setLabel('⚡ Geçici XP (2000c)').setStyle(ButtonStyle.Primary),
-            new ButtonBuilder().setCustomId(`mkt_esya_coinboost_${uid}`).setLabel('💰 Coin Boost (5000c)').setStyle(ButtonStyle.Success),
+            new ButtonBuilder().setCustomId(`mkt_esya_coinboost_${uid}`).setLabel('💰 Coin Boost (20000c)').setStyle(ButtonStyle.Success),
             new ButtonBuilder().setCustomId(`mkt_esya_xpboost_${uid}`).setLabel('⚡ XP Boost (4000c)').setStyle(ButtonStyle.Success),
             new ButtonBuilder().setCustomId(`mkt_back_${uid}`).setLabel('← Geri').setStyle(ButtonStyle.Danger),
           );
@@ -4811,8 +4862,8 @@ client.on('interactionCreate', async interaction => {
           if (esya === 'coinboost') {
             if (hasCoinBoost(gid, uid)) return i.reply({ ephemeral: true, content: '💰 Zaten Kalıcı Coin Boost sahibisin!' });
             const bal = getBalance(gid, uid);
-            if (bal.balance < 5000) return i.reply({ ephemeral: true, content: `⛔ Yetersiz coin! Gerekli: **5000**, Bakiye: **${bal.balance}**` });
-            addBalance(gid, uid, -5000); setCoinBoost(gid, uid);
+            if (bal.balance < 20000) return i.reply({ ephemeral: true, content: `⛔ Yetersiz coin! Gerekli: **20000**, Bakiye: **${bal.balance}**` });
+            addBalance(gid, uid, -20000); setCoinBoost(gid, uid);
             sendLog(gid, 'market', new EmbedBuilder().setTitle('💰 Coin Boost').setColor(0xF1C40F).addFields({ name: 'Kullanıcı', value: `<@${uid}>`, inline: true }).setTimestamp());
             return i.reply({ ephemeral: true, content: `💰 **Kalıcı Coin Boost (1.5x)** alındı! Bakiye: **${getBalance(gid, uid).balance}**` });
           }
@@ -5410,11 +5461,19 @@ client.on('interactionCreate', async interaction => {
       const bet = interaction.options.getInteger('bahis');
       const bkey = `${gid}:${uid}`;
       if (activeBlackjack.has(bkey)) return interaction.reply({ ephemeral: true, content: '⛔ Zaten aktif bir blackjack elin var.' });
+
+      const bjDay   = todayTR();
+      const bjPlays = getDailyCount(gid, uid, bjDay, 'blackjack');
+      if (bjPlays >= BLACKJACK_MAX_DAILY) {
+        return interaction.reply({ ephemeral: true, content: `🃏 Günlük ${BLACKJACK_MAX_DAILY} blackjack hakkın doldu! Yarın tekrar gel.` });
+      }
+
       const bal = getBalance(gid, uid);
       if (bal.balance < bet) return interaction.reply({ ephemeral: true, content: `⛔ Yetersiz coin! Bakiye: **${bal.balance}**` });
 
       let betCharged = false;
       try {
+        incDailyCount(gid, uid, bjDay, 'blackjack');
         addBalance(gid, uid, -bet);
         betCharged = true;
 
@@ -5434,7 +5493,7 @@ client.on('interactionCreate', async interaction => {
               { name: `${interaction.user.username} (${handValue(player)})`, value: cardsStr(player), inline: true },
               { name: `Bot (${reveal ? handValue(dealer) : '?'})`, value: reveal ? cardsStr(dealer) : `${dealer[0]} + ?`, inline: true },
             )
-            .setFooter({ text: `Bahis: ${bet} coin` });
+            .setFooter({ text: `Bahis: ${bet} coin • Hak: ${bjPlays + 1}/${BLACKJACK_MAX_DAILY}` });
           if (desc) e.setDescription(desc);
           return e;
         };
@@ -6880,6 +6939,23 @@ const MMORPG_CHESTS = [
   { key: 'kraliyet', name: 'Kraliyet Sandığı',emoji: '👑', price: 3000, color: 0x9B59B6 },
 ];
 
+// Yumurta craft reçeteleri (top-level: hem handleCraftCommand hem autocomplete kullanır)
+const CRAFT_EGG_RECIPES = {
+  siradan:  { demir_cevheri: 6, bakir_cevheri: 3 },
+  nadir:    { altin_cevheri: 5, obsidyen: 2 },
+  altin:    { saf_kristal: 3, altin_cevheri: 6, elmas_cevheri: 2 },
+  kristal:  { saf_kristal: 6, ejder_pulu: 3, elmas_cevheri: 3 },
+  kraliyet: { ejder_pulu: 9, ay_tasi: 3, gunes_parcasi: 3, karanlik_oz: 2 },
+};
+// Sandık craft reçeteleri (top-level: hem handleCraftCommand hem autocomplete kullanır)
+const CRAFT_SANDIK_RECIPES = {
+  ahsap:    { demir_cevheri: 5 },
+  demir:    { demir_cevheri: 9, obsidyen: 3 },
+  altin:    { altin_cevheri: 6, saf_kristal: 3 },
+  elmas:    { elmas_cevheri: 5, saf_kristal: 5, ejder_pulu: 2 },
+  kraliyet: { ejder_pulu: 6, ay_tasi: 3, karanlik_oz: 3 },
+};
+
 // Sandıktan çıkabilecek ödüller — tier'a göre ağırlıklar farklı
 function openChest(gid, uid, chestType) {
   // Sandık tier değeri
@@ -7492,7 +7568,17 @@ function resolveFight(gid, challengerId, opponentId) {
   const totalPower = challengerPower.total + opponentPower.total || 1;
   const share = challengerPower.total / totalPower; // 0..1
   const challengerChance = Math.max(FIGHT_MIN_CHANCE, Math.min(FIGHT_MAX_CHANCE, Math.round(15 + share * 70)));
-  const challengerWins   = Math.random() * 100 < challengerChance;
+
+  // Şans %60'ın üzerindeyse artık zar atılmıyor, güçlü taraf otomatik kazanıyor.
+  // %40-%60 arası (aradaki güç farkı azken) hâlâ rastgele belirleniyor.
+  let challengerWins;
+  if (challengerChance > 60) {
+    challengerWins = true;
+  } else if (challengerChance < 40) {
+    challengerWins = false;
+  } else {
+    challengerWins = Math.random() * 100 < challengerChance;
+  }
 
   const winnerId = challengerWins ? challengerId : opponentId;
   const loserId  = challengerWins ? opponentId   : challengerId;
@@ -7529,6 +7615,7 @@ const SLOT_SYMBOLS_DEF = [
   { key: 'diamond', emoji: '💎', tier: 5 },
 ];
 const SLOT_MAX_DAILY = 10;
+const BLACKJACK_MAX_DAILY = 8;
 
 // ~50% RTP slot sonucu üret
 // Returns: { reels, multiplier, label }
@@ -8219,7 +8306,7 @@ const MMORPG_SLASH_COMMANDS = [
         { name: '🥚 Yumurta', value: 'yumurta' },
         { name: '📦 Sandık',  value: 'sandik'  },
       ))
-    .addStringOption(o => o.setName('item').setDescription('Üretilecek eşya (örn: kilic_altin / miğfer_kristal)').setRequired(true)),
+    .addStringOption(o => o.setName('item').setDescription('Üretilecek eşya').setRequired(true).setAutocomplete(true)),
 
   // /yukselt — ekipman güçlendirme
   new SlashCommandBuilder()
@@ -9142,16 +9229,8 @@ async function handleCraftCommand(interaction, gid, uid) {
   }
 
   else if (kategori === 'yumurta') {
-    // Yumurta craft reçeteleri
-    const eggRecipes = {
-      siradan:  { demir_cevheri: 6, bakir_cevheri: 3 },
-      nadir:    { altin_cevheri: 5, obsidyen: 2 },
-      altin:    { saf_kristal: 3, altin_cevheri: 6, elmas_cevheri: 2 },
-      kristal:  { saf_kristal: 6, ejder_pulu: 3, elmas_cevheri: 3 },
-      kraliyet: { ejder_pulu: 9, ay_tasi: 3, gunes_parcasi: 3, karanlik_oz: 2 },
-    };
-    const recipe = eggRecipes[itemStr];
-    if (!recipe) return interaction.reply({ ephemeral: true, content: `⛔ Geçerli yumurta türleri: ${Object.keys(eggRecipes).join(', ')}` });
+    const recipe = CRAFT_EGG_RECIPES[itemStr];
+    if (!recipe) return interaction.reply({ ephemeral: true, content: `⛔ Geçerli yumurta türleri: ${Object.keys(CRAFT_EGG_RECIPES).join(', ')}` });
     if (!hasCraftMats(gid, uid, recipe)) {
       const needed = Object.entries(recipe).map(([k,v]) => {
         const d = CRAFT_MATERIALS.find(m => m.key === k);
@@ -9168,15 +9247,8 @@ async function handleCraftCommand(interaction, gid, uid) {
   }
 
   else if (kategori === 'sandik') {
-    const sandikRecipes = {
-      ahsap:    { demir_cevheri: 5 },
-      demir:    { demir_cevheri: 9, obsidyen: 3 },
-      altin:    { altin_cevheri: 6, saf_kristal: 3 },
-      elmas:    { elmas_cevheri: 5, saf_kristal: 5, ejder_pulu: 2 },
-      kraliyet: { ejder_pulu: 6, ay_tasi: 3, karanlik_oz: 3 },
-    };
-    const recipe = sandikRecipes[itemStr];
-    if (!recipe) return interaction.reply({ ephemeral: true, content: `⛔ Geçerli sandık türleri: ${Object.keys(sandikRecipes).join(', ')}` });
+    const recipe = CRAFT_SANDIK_RECIPES[itemStr];
+    if (!recipe) return interaction.reply({ ephemeral: true, content: `⛔ Geçerli sandık türleri: ${Object.keys(CRAFT_SANDIK_RECIPES).join(', ')}` });
     if (!hasCraftMats(gid, uid, recipe)) {
       const needed = Object.entries(recipe).map(([k,v]) => {
         const d = CRAFT_MATERIALS.find(m => m.key === k);
