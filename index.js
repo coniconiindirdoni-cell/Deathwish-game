@@ -9144,11 +9144,11 @@ async function handleCraftCommand(interaction, gid, uid) {
   else if (kategori === 'yumurta') {
     // Yumurta craft reçeteleri
     const eggRecipes = {
-      siradan:  { demir_cevheri: 10, bakir_cevheri: 5 },
-      nadir:    { altin_cevheri: 8, obsidyen: 3 },
-      altin:    { saf_kristal: 5, altin_cevheri: 10, elmas_cevheri: 3 },
-      kristal:  { saf_kristal: 10, ejder_pulu: 5, elmas_cevheri: 5 },
-      kraliyet: { ejder_pulu: 15, ay_tasi: 5, gunes_parcasi: 5, karanlik_oz: 3 },
+      siradan:  { demir_cevheri: 6, bakir_cevheri: 3 },
+      nadir:    { altin_cevheri: 5, obsidyen: 2 },
+      altin:    { saf_kristal: 3, altin_cevheri: 6, elmas_cevheri: 2 },
+      kristal:  { saf_kristal: 6, ejder_pulu: 3, elmas_cevheri: 3 },
+      kraliyet: { ejder_pulu: 9, ay_tasi: 3, gunes_parcasi: 3, karanlik_oz: 2 },
     };
     const recipe = eggRecipes[itemStr];
     if (!recipe) return interaction.reply({ ephemeral: true, content: `⛔ Geçerli yumurta türleri: ${Object.keys(eggRecipes).join(', ')}` });
@@ -9169,11 +9169,11 @@ async function handleCraftCommand(interaction, gid, uid) {
 
   else if (kategori === 'sandik') {
     const sandikRecipes = {
-      ahsap:    { demir_cevheri: 8 },
-      demir:    { demir_cevheri: 15, obsidyen: 5 },
-      altin:    { altin_cevheri: 10, saf_kristal: 5 },
-      elmas:    { elmas_cevheri: 8, saf_kristal: 8, ejder_pulu: 3 },
-      kraliyet: { ejder_pulu: 10, ay_tasi: 5, karanlik_oz: 5 },
+      ahsap:    { demir_cevheri: 5 },
+      demir:    { demir_cevheri: 9, obsidyen: 3 },
+      altin:    { altin_cevheri: 6, saf_kristal: 3 },
+      elmas:    { elmas_cevheri: 5, saf_kristal: 5, ejder_pulu: 2 },
+      kraliyet: { ejder_pulu: 6, ay_tasi: 3, karanlik_oz: 3 },
     };
     const recipe = sandikRecipes[itemStr];
     if (!recipe) return interaction.reply({ ephemeral: true, content: `⛔ Geçerli sandık türleri: ${Object.keys(sandikRecipes).join(', ')}` });
