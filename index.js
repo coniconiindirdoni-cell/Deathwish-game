@@ -2049,42 +2049,61 @@ async function handleMineButton(interaction) {
       embed.addFields({ name: '🎉 Nadir Düşme!', value: dropMsg });
     }
 
-    // ── Seviye bazlı craft malzeme düşmesi (her kazılımda) ───
+    // ── Sabit sayıda craft malzeme düşmesi (her gönderimde) ──
+    // ESKİ SİSTEM: her malzeme kendi başına bağımsız bir ihtimalle "düşer miydi"
+    // diye ayrı ayrı zar atılıyordu (0-14 arası rastgele sayıda malzeme).
+    // YENİ SİSTEM (kullanıcı isteği): her madene gönderişte SABİT 4 adet craft
+    // malzemesi düşer (Şanslı Kazma Reliği ile 2x → 8 adet). HANGİ malzemenin
+    // düşeceği, aşağıdaki `weight` değerine göre ağırlıklı rastgele seçilir —
+    // ağırlıklar eski `chance` değerlerinden türetildi, yani yaygın (tier-1)
+    // cevherler hâlâ en sık, nadir (tier-4) cevherler hâlâ en nadir çıkıyor;
+    // sadece "her seferinde kaç tane düşer" artık şansa değil sabit sayıya bağlı.
     {
-      // NOT: Bu tabloda CRAFT_MATERIALS'taki HER malzeme bulunmalı, yoksa o
-      // malzeme hiçbir zaman düşmez (altin_cevheri ve elmas_cevheri eksikti,
-      // eklendi). Ayrıca tüm düşme ihtimalleri +%25 artırıldı (kullanıcı isteği).
-      // NOT: Tüm oranlar kullanıcı isteğiyle bir kez daha +%15 artırıldı
-      // (önceki değerlerin ×1.15 katı — madenden craft malzemesi düşmesi kolaylaştı).
       const _matDropTable = [
-        { minLevel: 1,  key: 'demir_cevheri',     chance: 0.144, emoji: '⚙️',  name: 'Demir' },
-        { minLevel: 1,  key: 'bakir_cevheri',     chance: 0.144, emoji: '🟤', name: 'Bakır' },
-        { minLevel: 5,  key: 'altin_cevheri',     chance: 0.288, emoji: '🟡', name: 'Altın' },
-        { minLevel: 5,  key: 'obsidyen',           chance: 0.115, emoji: '🪨', name: 'Obsidyen' },
-        { minLevel: 10, key: 'elmas_cevheri',      chance: 0.101, emoji: '💎', name: 'Elmas' },
-        { minLevel: 10, key: 'saf_kristal',        chance: 0.101, emoji: '🔮', name: 'Saf Kristal' },
-        { minLevel: 10, key: 'lav_tasi',           chance: 0.101, emoji: '🌋', name: 'Lav Taşı' },
-        { minLevel: 15, key: 'ruh_tozu',           chance: 0.086, emoji: '👻', name: 'Ruh Tozu' },
-        { minLevel: 20, key: 'ejder_pulu',         chance: 0.086, emoji: '🐉', name: 'Ejder Pulu' },
-        { minLevel: 20, key: 'ay_tasi',            chance: 0.086, emoji: '🌙', name: 'Ay Taşı' },
-        { minLevel: 25, key: 'karanlik_oz',        chance: 0.072, emoji: '🌑', name: 'Karanlık Öz' },
-        { minLevel: 25, key: 'gunes_parcasi',      chance: 0.072, emoji: '☀️', name: 'Güneş Parçası' },
-        { minLevel: 30, key: 'yildirim_kristali',  chance: 0.072, emoji: '⚡', name: 'Yıldırım Kristali' },
-        { minLevel: 30, key: 'buz_cekirdegi',      chance: 0.072, emoji: '❄️', name: 'Buz Çekirdeği' },
+        { minLevel: 1,  key: 'demir_cevheri',     weight: 144, emoji: '⚙️',  name: 'Demir' },
+        { minLevel: 1,  key: 'bakir_cevheri',     weight: 144, emoji: '🟤', name: 'Bakır' },
+        { minLevel: 5,  key: 'altin_cevheri',     weight: 288, emoji: '🟡', name: 'Altın' },
+        { minLevel: 5,  key: 'obsidyen',           weight: 115, emoji: '🪨', name: 'Obsidyen' },
+        { minLevel: 10, key: 'elmas_cevheri',      weight: 101, emoji: '💎', name: 'Elmas' },
+        { minLevel: 10, key: 'saf_kristal',        weight: 101, emoji: '🔮', name: 'Saf Kristal' },
+        { minLevel: 10, key: 'lav_tasi',           weight: 101, emoji: '🌋', name: 'Lav Taşı' },
+        { minLevel: 15, key: 'ruh_tozu',           weight: 86,  emoji: '👻', name: 'Ruh Tozu' },
+        { minLevel: 20, key: 'ejder_pulu',         weight: 86,  emoji: '🐉', name: 'Ejder Pulu' },
+        { minLevel: 20, key: 'ay_tasi',            weight: 86,  emoji: '🌙', name: 'Ay Taşı' },
+        { minLevel: 25, key: 'karanlik_oz',        weight: 72,  emoji: '🌑', name: 'Karanlık Öz' },
+        { minLevel: 25, key: 'gunes_parcasi',      weight: 72,  emoji: '☀️', name: 'Güneş Parçası' },
+        { minLevel: 30, key: 'yildirim_kristali',  weight: 72,  emoji: '⚡', name: 'Yıldırım Kristali' },
+        { minLevel: 30, key: 'buz_cekirdegi',      weight: 72,  emoji: '❄️', name: 'Buz Çekirdeği' },
       ];
-      // Şanslı Kazma Reliği (tek parça, satın alındığı an oto aktif) — tüm craft
-      // malzemesi düşme oranlarını 2 katına çıkarır.
+      const MINE_CRAFT_DROP_COUNT = 4; // gönderim başına sabit düşen malzeme adedi
+
+      // Şanslı Kazma Reliği (tek parça, satın alındığı an oto aktif) artık
+      // düşen malzeme SAYISINI 2 katına çıkarıyor (4 → 8), tek tek şansları değil.
       const _luckyMineRelic = hasRelic(gid, uid, 'sansli_kazma');
-      const _matDrops = [];
-      for (const md of _matDropTable) {
-        const effChance = Math.min(1, md.chance * (_luckyMineRelic ? 2 : 1));
-        if (data.miningLevel >= md.minLevel && Math.random() < effChance) {
-          addCraftMat(gid, uid, md.key, 1);
-          _matDrops.push(`${md.emoji} **${md.name}** × 1`);
+      const dropCount = MINE_CRAFT_DROP_COUNT * (_luckyMineRelic ? 2 : 1);
+
+      const _eligible = _matDropTable.filter(md => data.miningLevel >= md.minLevel);
+      const _totalWeight = _eligible.reduce((s, m) => s + m.weight, 0);
+
+      const _dropCounts = {};
+      for (let i = 0; i < dropCount && _eligible.length; i++) {
+        let r = Math.random() * _totalWeight;
+        let picked = _eligible[_eligible.length - 1];
+        for (const md of _eligible) {
+          if (r < md.weight) { picked = md; break; }
+          r -= md.weight;
         }
+        _dropCounts[picked.key] = (_dropCounts[picked.key] || 0) + 1;
+      }
+
+      const _matDrops = [];
+      for (const [key, qty] of Object.entries(_dropCounts)) {
+        addCraftMat(gid, uid, key, qty);
+        const def = _matDropTable.find(m => m.key === key);
+        _matDrops.push(`${def.emoji} **${def.name}** × ${qty}`);
       }
       if (_matDrops.length) {
-        embed.addFields({ name: '⛏️ Craft Malzeme Düştü!', value: _matDrops.join('\n'), inline: false });
+        embed.addFields({ name: `⛏️ Craft Malzeme Düştü! (${dropCount} adet${_luckyMineRelic ? ' — 2x Şanslı Kazma' : ''})`, value: _matDrops.join('\n'), inline: false });
       }
     }
 
@@ -3289,7 +3308,7 @@ const SLASH_COMMANDS = [
     .setDescription('Market rol yönetimi (yönetici)')
     .setDefaultMemberPermissions(PermissionFlagsBits.Administrator)
     .addSubcommand(s => s.setName('ekle').setDescription('Markete rol ekle').addRoleOption(o => o.setName('rol').setDescription('Rol').setRequired(true)).addIntegerOption(o => o.setName('fiyat').setDescription('Coin fiyatı').setRequired(true).setMinValue(1)).addBooleanOption(o => o.setName('premium').setDescription('Premium?')))
-    .addSubcommand(s => s.setName('cikar').setDescription('Marketten rol çıkar').addRoleOption(o => o.setName('rol').setDescription('Rol').setRequired(true)))
+    .addSubcommand(s => s.setName('cikar').setDescription('Marketten VEYA renk listesinden rol çıkar').addRoleOption(o => o.setName('rol').setDescription('Rol (hâlâ sunucuda mevcutsa)')).addStringOption(o => o.setName('rol_id').setDescription('Rol ID (rol sunucudan silindiyse bunu kullan — /market-yonet liste ile ID öğren)')))
     .addSubcommand(s => s.setName('liste').setDescription('Market rol listesi')),
 
   // /hakkimda — profil komutu (eski /xp seviye yerine)
@@ -3837,12 +3856,41 @@ client.on('interactionCreate', async interaction => {
           .map(c => ({ name: c.label.slice(0, 100), value: c.key }));
       }
 
+      else if (commandName === 'rpg-pet' && focused.name === 'pet') {
+        const pets = getMmoPets(gid2, uid2);
+        const active = getMmoActivePets(gid2, uid2);
+        const rarityStars = ['⭐', '⭐⭐', '⭐⭐⭐', '⭐⭐⭐⭐', '⭐⭐⭐⭐⭐'];
+        choices = pets.map(p => {
+          const def = MMORPG_PETS.find(x => x.key === p.petKey);
+          const isActive = active.find(a => a.petKey === p.petKey && a.petHatchedAt === p.hatchedAt);
+          const stat = RPG_STAT_NAMES[def?.bonusType];
+          const label = `${def?.emoji || '🐾'} ${def?.name || p.petKey} Lv.${p.level} ${rarityStars[def?.rarity || 0]} ${stat?.emoji || ''}${isActive ? ` [Slot ${isActive.slot}]` : ''}`;
+          return { key: `${p.petKey}|${p.hatchedAt}`, label };
+        })
+          .filter(c => !typed || c.label.toLowerCase().includes(typed))
+          .slice(0, 25)
+          .map(c => ({ name: c.label.slice(0, 100), value: c.key }));
+      }
+
       else if (commandName === 'antika' && focused.name === 'anahtar') {
         const inv = getAntiqueInventory(gid2, uid2);
         choices = inv
           .map(r => {
             const def = ANTIQUES.find(a => a.key === r.antiqueKey);
             return def ? { key: def.key, label: `${def.emoji} ${def.name} ×${r.count}` } : null;
+          })
+          .filter(Boolean)
+          .filter(c => !typed || c.key.toLowerCase().includes(typed) || c.label.toLowerCase().includes(typed))
+          .slice(0, 25)
+          .map(c => ({ name: c.label.slice(0, 100), value: c.key }));
+      }
+
+      else if (commandName === 'parcala' && focused.name === 'anahtar') {
+        const owned = getCraftMats(gid2, uid2);
+        choices = ADVANCED_CRAFT_MATERIALS
+          .map(m => {
+            const qty = owned.find(o => o.matKey === m.key)?.quantity || 0;
+            return qty > 0 ? { key: m.key, label: `${m.emoji} ${m.name} ×${qty}` } : null;
           })
           .filter(Boolean)
           .filter(c => !typed || c.key.toLowerCase().includes(typed) || c.label.toLowerCase().includes(typed))
@@ -5292,17 +5340,37 @@ client.on('interactionCreate', async interaction => {
         return interaction.reply(`✅ <@&${role.id}> markete eklendi. Fiyat: **${price} coin**${premium ? ' 👑 Premium' : ''}`);
       }
       if (sub === 'cikar') {
-        const role = interaction.options.getRole('rol');
-        removeMarketRole(gid, role.id);
-        return interaction.reply(`✅ <@&${role.id}> marketten çıkarıldı.`);
+        const role   = interaction.options.getRole('rol');
+        const rawId  = interaction.options.getString('rol_id');
+        const roleId = role ? role.id : (rawId ? rawId.trim() : null);
+        if (!roleId) return interaction.reply({ ephemeral: true, content: '⛔ `rol` veya `rol_id` seçeneklerinden birini gir. Rol sunucudan silinmişse `/market-yonet liste` ile ID\'sini görüp `rol_id` ile gir.' });
+        // NOT: "🎨 Renk Al" bölümünde gösterilen roller market_roles'ta değil,
+        // AYRI bir tabloda (color_roles — /renkrolekle ile eklenir) tutuluyor.
+        // Eskiden bu komut yalnızca market_roles'tan siliyordu, bu yüzden bir
+        // renk rolünü çıkarmaya çalışınca hiçbir şey olmuyormuş gibi
+        // görünüyordu (rol hâlâ /market'ta "🎨 Renk Al" listesinde duruyordu).
+        // Artık ikisini de kontrol edip, hangisinde kayıtlıysa oradan siliyor.
+        const inMarket = getMarketRoles(gid).some(r => r.roleId === roleId);
+        const inColor  = getColorRoles(gid).some(r => r.roleId === roleId);
+        removeMarketRole(gid, roleId);
+        removeColorRole(gid, roleId);
+        if (!inMarket && !inColor) return interaction.reply({ ephemeral: true, content: `⚠️ <@&${roleId}> ne markette ne de renk rolleri listesinde kayıtlıydı.` });
+        const where = [inMarket ? '🛒 Market' : null, inColor ? '🎨 Renk Al' : null].filter(Boolean).join(' + ');
+        return interaction.reply(`✅ <@&${roleId}> **${where}** listesinden çıkarıldı.`);
       }
       if (sub === 'liste') {
-        const roles = getMarketRoles(gid);
-        if (!roles.length) return interaction.reply('🛒 Market boş.');
+        const roles      = getMarketRoles(gid);
+        const colorRoles = getColorRoles(gid);
+        if (!roles.length && !colorRoles.length) return interaction.reply('🛒 Market ve renk listesi boş.');
         const embed = new EmbedBuilder()
           .setTitle('🛒 Market Rolleri')
-          .setColor(0xE67E22)
-          .setDescription(roles.map((r, i) => `**${i + 1}.** <@&${r.roleId}> — **${r.price} coin**${r.isPremium ? ' 👑' : ''}`).join('\n'));
+          .setColor(0xE67E22);
+        if (roles.length) {
+          embed.addFields({ name: '🛒 Market (Eşyalar)', value: roles.map((r, i) => `**${i + 1}.** <@&${r.roleId}> \`(${r.roleId})\` — **${r.price} coin**${r.isPremium ? ' 👑' : ''}`).join('\n'), inline: false });
+        }
+        if (colorRoles.length) {
+          embed.addFields({ name: '🎨 Renk Al', value: colorRoles.map((r, i) => `**${i + 1}.** <@&${r.roleId}> \`(${r.roleId})\` — **${r.price} coin**`).join('\n'), inline: false });
+        }
         return interaction.reply({ embeds: [embed] });
       }
     }
@@ -8240,6 +8308,18 @@ function simulateCombat(A, B) {
   let gapA = 0, gapB = 0; // mesafeyi ne kadar kapattığı (0..1) — sadece yavaş taraf için işler
   const log = [];
 
+  // NOT: Eskiden hasar sadece "inisiyatif payı" (shareA — salt hıza dayalı,
+  // silahsız biri bile temel hız 1.0 ile kılıçlı biriyle eşit çıkabiliyordu)
+  // ile çarpılıyordu; güç farkı (ör. 31 güç vs 10 güç) hasar dağılımına neredeyse
+  // hiç yansımıyordu ve zayıf taraf 5 tur sonunda hâlâ yüksek can ile kalıyordu.
+  // Artık her turda GÜÇ ORANINA dayalı bir "üstünlük çarpanı" da uygulanıyor:
+  // güçlü taraf daha fazla, zayıf taraf daha az hasar veriyor — böylece belirgin
+  // bir silah/ekipman/seviye farkı olduğunda düello gerçekten kararlı bitiyor.
+  const powerShareA = A.power / ((A.power + B.power) || 1);
+  // 0.5 (eşit güç) → çarpan 1.0x/1.0x ; 1.0 (tek taraflı güç) → çarpan ~1.6x/~0.4x
+  const dominanceA = 0.4 + 1.2 * powerShareA;
+  const dominanceB = 0.4 + 1.2 * (1 - powerShareA);
+
   for (let r = 1; r <= ROUNDS; r++) {
     if (hpA <= 0 || hpB <= 0) break;
 
@@ -8252,8 +8332,8 @@ function simulateCombat(A, B) {
     const shareA    = effSpeedA / speedSum; // bu round kim daha çok inisiyatif alıyor
 
     const noise = () => 0.9 + Math.random() * 0.2; // ±%10 varyasyon
-    const dmgToB = Math.round((A.power * shareA       * (1 - (A.dmgType === 'magic' ? B.magicResist : B.physResist)) * noise()) / ROUNDS);
-    const dmgToA = Math.round((B.power * (1 - shareA) * (1 - (B.dmgType === 'magic' ? A.magicResist : A.physResist)) * noise()) / ROUNDS);
+    const dmgToB = Math.round((A.power * shareA       * dominanceA * (1 - (A.dmgType === 'magic' ? B.magicResist : B.physResist)) * noise()) / ROUNDS);
+    const dmgToA = Math.round((B.power * (1 - shareA) * dominanceB * (1 - (B.dmgType === 'magic' ? A.magicResist : A.physResist)) * noise()) / ROUNDS);
 
     hpB -= dmgToB;
     hpA -= dmgToA;
@@ -9062,8 +9142,7 @@ const MMORPG_SLASH_COMMANDS = [
     .addSubcommand(s => s
       .setName('kusan')
       .setDescription('Pet slotuna kuşan')
-      .addStringOption(o => o.setName('petkey').setDescription('Pet anahtarı').setRequired(true))
-      .addStringOption(o => o.setName('hatchedat').setDescription('Kuluçka zamanı (liste\'den kopyala)').setRequired(true))
+      .addStringOption(o => o.setName('pet').setDescription('Kuşanılacak pet').setRequired(true).setAutocomplete(true))
       .addIntegerOption(o => o.setName('slot').setDescription('Slot (1-6)').setRequired(true).setMinValue(1).setMaxValue(6)))
     .addSubcommand(s => s
       .setName('cikar')
@@ -9072,8 +9151,25 @@ const MMORPG_SLASH_COMMANDS = [
     .addSubcommand(s => s
       .setName('yukselt')
       .setDescription('Pet seviye yükselt')
-      .addStringOption(o => o.setName('petkey').setDescription('Pet anahtarı').setRequired(true))
-      .addStringOption(o => o.setName('hatchedat').setDescription('Kuluçka zamanı').setRequired(true))),
+      .addStringOption(o => o.setName('pet').setDescription('Yükseltilecek pet').setRequired(true).setAutocomplete(true))),
+
+  // /parcala — silah/zırh/gelişmiş malzemeyi geri harcanan malzemenin %70'i karşılığında bozar
+  new SlashCommandBuilder()
+    .setName('parcala')
+    .setDescription('Craftlanmış eşyayı boz — harcanan malzemenin %70\'i geri iade edilir')
+    .addSubcommand(s => s
+      .setName('silah')
+      .setDescription('Bir silahı boz (%70 malzeme iadesi)')
+      .addIntegerOption(o => o.setName('id').setDescription('Silah ID (/envanter ile öğren)').setRequired(true)))
+    .addSubcommand(s => s
+      .setName('zirh')
+      .setDescription('Bir zırhı boz (%70 malzeme iadesi)')
+      .addIntegerOption(o => o.setName('id').setDescription('Zırh ID (/envanter ile öğren)').setRequired(true)))
+    .addSubcommand(s => s
+      .setName('gelismis-malzeme')
+      .setDescription('Craftladığın gelişmiş bir malzemeyi boz (%70 iade)')
+      .addStringOption(o => o.setName('anahtar').setDescription('Gelişmiş malzeme').setRequired(true).setAutocomplete(true))
+      .addIntegerOption(o => o.setName('miktar').setDescription('Bozulacak adet (varsayılan 1)').setMinValue(1))),
 ].map(c => c.toJSON());
 
 // MMORPG komutlarını ana listeye ekle (tanım yukarıda yapıldıktan sonra push)
@@ -9081,7 +9177,7 @@ SLASH_COMMANDS.push(...MMORPG_SLASH_COMMANDS);
 
 const MMO_CMDS = new Set([
   'rpg', 'stat', 'sinif', 'statsifirla', 'zindan', 'envanter', 'sandik', 'yumurta',
-  'craft', 'yukselt', 'slot', 'relic-set', 'rpg-pet', 'fight',
+  'craft', 'yukselt', 'slot', 'relic-set', 'rpg-pet', 'fight', 'parcala',
 ]);
 
 // ─────────────────────────────────────────────────────────────────────────
@@ -9279,11 +9375,18 @@ async function handleMMOCommand(interaction, cmd, sub, gid, uid) {
     });
     const msg = await interaction.fetchReply();
     const coll = msg.createMessageComponentCollector({ componentType: ComponentType.Button, time: 60000 });
+    // NOT: Süre dolduğunda mesajın "kabul et/reddet" haliyle takılı kalmaması için
+    // `collected.size === 0` kontrolüne güvenmiyoruz — rakip olmayan biri butona
+    // basarsa bile bu koleksiyona ekleniyordu, bu yüzden zaman aşımı hiç
+    // tetiklenmiyordu. Bunun yerine düellonun gerçekten çözülüp çözülmediğini
+    // ayrı bir bayrakla (`resolvedFlag`) takip ediyoruz.
+    let resolvedFlag = false;
 
     coll.on('collect', async i => {
       if (i.user.id !== opponent.id) {
         return i.reply({ ephemeral: true, content: '⛔ Bu düello teklifi sana ait değil.' });
       }
+      resolvedFlag = true;
       coll.stop('resolved');
 
       if (i.customId === declineId) {
@@ -9371,7 +9474,7 @@ async function handleMMOCommand(interaction, cmd, sub, gid, uid) {
     });
 
     coll.on('end', (collected, reason) => {
-      if (collected.size === 0) {
+      if (!resolvedFlag) {
         interaction.editReply({ content: '⌛ Düello teklifi zaman aşımına uğradı.', components: [] }).catch(() => {});
       }
     });
@@ -9473,6 +9576,76 @@ async function handleMMOCommand(interaction, cmd, sub, gid, uid) {
         .map(([k,v]) => { const d = CRAFT_MATERIALS.find(m=>m.key===k); return `${d?.emoji||''} ${d?.name||k} x${v}`; })
         .join(', ');
       return interaction.reply({ content: `💥 **Başarısız!** Eşya **+${result.enh}** kalmaya devam ediyor. (-${result.cost} coin, ${mats}${advStr} malzeme harcandı.)` });
+    }
+  }
+
+  // ── /parcala ──────────────────────────────────────────────────────────
+  // Craftlanmış silah/zırh/gelişmiş malzemeyi bozar, temel craft reçetesindeki
+  // malzemelerin %70'ini (küsurat aşağı yuvarlanır) geri iade eder. Not:
+  // eşya +geliştirme (yukselt) için harcanan EK malzemeler iade edilmez —
+  // sadece o eşyanın taban tier reçetesi baz alınır.
+  const PARCALA_REFUND_PCT = 0.70;
+  function refundRecipe(recipe) {
+    const refunded = {};
+    for (const [matKey, qty] of Object.entries(recipe || {})) {
+      const back = Math.floor(qty * PARCALA_REFUND_PCT);
+      if (back > 0) {
+        addCraftMat(gid, uid, matKey, back);
+        refunded[matKey] = back;
+      }
+    }
+    return refunded;
+  }
+  function formatRefund(refunded) {
+    const entries = Object.entries(refunded);
+    if (!entries.length) return '*(iade edilecek malzeme yok — bu tier hiç malzeme gerektirmiyor)*';
+    return entries.map(([k, v]) => {
+      const d = findAnyCraftMaterial(k);
+      return `${d?.emoji || '🔩'} **${d?.name || k}** × ${v}`;
+    }).join('\n');
+  }
+
+  if (cmd === 'parcala') {
+    if (sub === 'silah') {
+      const itemId = interaction.options.getInteger('id');
+      const row = db.prepare('SELECT * FROM mmo_weapons WHERE id=? AND guildId=? AND userId=?').get(itemId, gid, uid);
+      if (!row) return interaction.reply({ ephemeral: true, content: `⛔ #${itemId} sana ait bir silah değil.` });
+      const { tier } = parseWeaponKey(row.weaponKey);
+      if (!tier) return interaction.reply({ ephemeral: true, content: '⛔ Bu silahın reçetesi bulunamadı.' });
+      const refunded = refundRecipe(tier.craft);
+      db.prepare('DELETE FROM mmo_weapons WHERE id=?').run(itemId);
+      return interaction.reply({
+        content: `🔨 **${getWeaponName(row.weaponKey)}** (+${row.enhancement}) bozuldu!\n📦 **%70 İade:**\n${formatRefund(refunded)}${row.enhancement > 0 ? '\n⚠️ Geliştirme (+' + row.enhancement + ') için harcanan ek malzemeler iade edilmedi.' : ''}`,
+      });
+    }
+
+    if (sub === 'zirh') {
+      const itemId = interaction.options.getInteger('id');
+      const row = db.prepare('SELECT * FROM mmo_armors WHERE id=? AND guildId=? AND userId=?').get(itemId, gid, uid);
+      if (!row) return interaction.reply({ ephemeral: true, content: `⛔ #${itemId} sana ait bir zırh değil.` });
+      const tierKey = row.armorKey.split('_')[1] || row.armorKey;
+      const tier = ARMOR_TIERS.find(t => t.key === tierKey);
+      if (!tier) return interaction.reply({ ephemeral: true, content: '⛔ Bu zırhın reçetesi bulunamadı.' });
+      const refunded = refundRecipe(tier.craft);
+      db.prepare('DELETE FROM mmo_armors WHERE id=?').run(itemId);
+      return interaction.reply({
+        content: `🔨 **${getArmorName(row.slot, tierKey)}** (+${row.enhancement}) bozuldu!\n📦 **%70 İade:**\n${formatRefund(refunded)}${row.enhancement > 0 ? '\n⚠️ Geliştirme (+' + row.enhancement + ') için harcanan ek malzemeler iade edilmedi.' : ''}`,
+      });
+    }
+
+    if (sub === 'gelismis-malzeme') {
+      const key    = interaction.options.getString('anahtar');
+      const miktar = interaction.options.getInteger('miktar') || 1;
+      const def    = ADVANCED_CRAFT_MATERIALS.find(m => m.key === key);
+      if (!def) return interaction.reply({ ephemeral: true, content: '⛔ Geçersiz gelişmiş malzeme anahtarı.' });
+      const owned = getCraftMats(gid, uid).find(m => m.matKey === key)?.quantity || 0;
+      if (owned < miktar) return interaction.reply({ ephemeral: true, content: `⛔ Envanterinde yeterli **${def.name}** yok! Mevcut: ${owned}, İstenen: ${miktar}` });
+      consumeCraftMat(gid, uid, key, miktar);
+      const scaledRecipe = Object.fromEntries(Object.entries(def.craft).map(([k, v]) => [k, v * miktar]));
+      const refunded = refundRecipe(scaledRecipe);
+      return interaction.reply({
+        content: `🔨 ${def.emoji} **${def.name}** × ${miktar} bozuldu!\n📦 **%70 İade:**\n${formatRefund(refunded)}`,
+      });
     }
   }
 
@@ -9681,10 +9854,11 @@ async function handleMMOCommand(interaction, cmd, sub, gid, uid) {
     }
 
     if (sub === 'kusan') {
-      const petKey    = interaction.options.getString('petkey');
-      const hatchedAt = interaction.options.getString('hatchedat');
+      const petCombo  = interaction.options.getString('pet');
+      const [petKey, hatchedAt] = (petCombo || '').split('|');
       const slot      = interaction.options.getInteger('slot');
 
+      if (!petKey || !hatchedAt) return interaction.reply({ ephemeral: true, content: '⛔ Listeden bir pet seç (yazmaya başlayınca öneriler çıkar).' });
       const owns = db.prepare('SELECT * FROM mmo_pets WHERE guildId=? AND userId=? AND petKey=? AND hatchedAt=?').get(gid, uid, petKey, hatchedAt);
       if (!owns) return interaction.reply({ ephemeral: true, content: '⛔ Bu pet sende yok veya ID hatalı.' });
 
@@ -9707,8 +9881,9 @@ async function handleMMOCommand(interaction, cmd, sub, gid, uid) {
     }
 
     if (sub === 'yukselt') {
-      const petKey    = interaction.options.getString('petkey');
-      const hatchedAt = interaction.options.getString('hatchedat');
+      const petCombo  = interaction.options.getString('pet');
+      const [petKey, hatchedAt] = (petCombo || '').split('|');
+      if (!petKey || !hatchedAt) return interaction.reply({ ephemeral: true, content: '⛔ Listeden bir pet seç (yazmaya başlayınca öneriler çıkar).' });
       const result    = upgradeMmoPet(gid, uid, petKey, hatchedAt);
       const def       = MMORPG_PETS.find(p => p.key === petKey);
 
@@ -9918,7 +10093,7 @@ function buildInventoryEmbed(gid, uid, tab, tabs) {
     const setLines  = Object.entries(RELIC_SETS).map(([key, def]) => {
       const cnt  = def.pieces.filter(p => ownedKeys.includes(p.key)).length;
       const isEquipped = equippedSets.includes(key);
-      return `${def.emoji} **${def.name}** ${cnt}/${def.pieces.length}${isEquipped ? ' 🟢 KUŞANILI' : ''}`;
+      return `${def.emoji} **${def.name}** [${def.tier}] ${cnt}/${def.pieces.length}${isEquipped ? ' 🟢 KUŞANILI' : ''}`;
     }).join('\n');
 
     embed.addFields(
@@ -10017,7 +10192,7 @@ async function handleCraftCommand(interaction, gid, uid) {
 
     if (!hasCraftMats(gid, uid, wTier.craft)) {
       const needed = Object.entries(wTier.craft).map(([k,v]) => {
-        const d = CRAFT_MATERIALS.find(m => m.key === k);
+        const d = findAnyCraftMaterial(k);
         const have = getCraftMats(gid, uid).find(m => m.matKey === k)?.quantity || 0;
         return `${d?.emoji} ${d?.name}: ${have}/${v}`;
       }).join('\n');
@@ -10056,7 +10231,7 @@ async function handleCraftCommand(interaction, gid, uid) {
 
     if (!hasCraftMats(gid, uid, aTier.craft)) {
       const needed = Object.entries(aTier.craft).map(([k,v]) => {
-        const d = CRAFT_MATERIALS.find(m => m.key === k);
+        const d = findAnyCraftMaterial(k);
         const have = getCraftMats(gid, uid).find(m => m.matKey === k)?.quantity || 0;
         return `${d?.emoji} ${d?.name}: ${have}/${v}`;
       }).join('\n');
@@ -10078,7 +10253,7 @@ async function handleCraftCommand(interaction, gid, uid) {
     if (!recipe) return interaction.reply({ ephemeral: true, content: `⛔ Geçerli yumurta türleri: ${Object.keys(CRAFT_EGG_RECIPES).join(', ')}` });
     if (!hasCraftMats(gid, uid, recipe)) {
       const needed = Object.entries(recipe).map(([k,v]) => {
-        const d = CRAFT_MATERIALS.find(m => m.key === k);
+        const d = findAnyCraftMaterial(k);
         const have = getCraftMats(gid, uid).find(m => m.matKey === k)?.quantity || 0;
         return `${d?.emoji} ${d?.name}: ${have}/${v}`;
       }).join('\n');
@@ -10096,7 +10271,7 @@ async function handleCraftCommand(interaction, gid, uid) {
     if (!recipe) return interaction.reply({ ephemeral: true, content: `⛔ Geçerli sandık türleri: ${Object.keys(CRAFT_SANDIK_RECIPES).join(', ')}` });
     if (!hasCraftMats(gid, uid, recipe)) {
       const needed = Object.entries(recipe).map(([k,v]) => {
-        const d = CRAFT_MATERIALS.find(m => m.key === k);
+        const d = findAnyCraftMaterial(k);
         const have = getCraftMats(gid, uid).find(m => m.matKey === k)?.quantity || 0;
         return `${d?.emoji} ${d?.name}: ${have}/${v}`;
       }).join('\n');
@@ -10116,7 +10291,7 @@ async function handleCraftCommand(interaction, gid, uid) {
 
     if (!hasCraftMats(gid, uid, def.craft)) {
       const needed = Object.entries(def.craft).map(([k, v]) => {
-        const d = CRAFT_MATERIALS.find(m => m.key === k);
+        const d = findAnyCraftMaterial(k);
         const have = getCraftMats(gid, uid).find(m => m.matKey === k)?.quantity || 0;
         return `${d?.emoji || ''} ${d?.name || k}: ${have}/${v}`;
       }).join('\n');
