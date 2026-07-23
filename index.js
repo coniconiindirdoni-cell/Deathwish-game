@@ -108,6 +108,7 @@ function ensureSchema() {
 
     -- ── Yeni özellikler ──────────────────────────────────────
     CREATE TABLE IF NOT EXISTS theft_shields (guildId TEXT, userId TEXT, expiresAt INTEGER, PRIMARY KEY(guildId,userId));
+    CREATE TABLE IF NOT EXISTS theft_levels (guildId TEXT, userId TEXT, level INTEGER DEFAULT 0, xp INTEGER DEFAULT 0, PRIMARY KEY(guildId,userId));
     CREATE TABLE IF NOT EXISTS temp_xp_boosts (guildId TEXT, userId TEXT, expiresAt INTEGER, PRIMARY KEY(guildId,userId));
     CREATE TABLE IF NOT EXISTS color_roles (guildId TEXT, roleId TEXT, price INTEGER DEFAULT 50, PRIMARY KEY(guildId,roleId));
     CREATE TABLE IF NOT EXISTS fish_inventory (guildId TEXT, userId TEXT, fishKey TEXT, count INTEGER DEFAULT 0, PRIMARY KEY(guildId,userId,fishKey));
@@ -687,6 +688,44 @@ function hasShield(gid, uid) {
 }
 function setShield(gid, uid, ms) { db.prepare('INSERT OR REPLACE INTO theft_shields(guildId,userId,expiresAt)VALUES(?,?,?)').run(gid, uid, Date.now() + ms); }
 
+// ── Hırsızlık Seviyesi (/çal ve /oyunlar cal başarılı olunca 3 XP kazanılır) ──
+// Lv0->Lv1: 30xp, sonraki her seviye +6xp gerektirir (Lv1->Lv2: 36, Lv2->Lv3: 42, ...).
+// Maks seviye 20. Lv10+'da çalınan miktar 100'den 200'e, Lv20 (maks) 300'e çıkar.
+const THEFT_MAX_LEVEL   = 20;
+const THEFT_XP_PER_WIN  = 3;
+const THEFT_BASE_XP_NEED = 30;
+const THEFT_XP_NEED_STEP = 6;
+function getTheftXpNeeded(level) { return THEFT_BASE_XP_NEED + THEFT_XP_NEED_STEP * level; } // level = mevcut (henüz atlanmamış) seviye
+function getTheftLevel(gid, uid) {
+  const r = db.prepare('SELECT level,xp FROM theft_levels WHERE guildId=? AND userId=?').get(gid, uid);
+  return r || { level: 0, xp: 0 };
+}
+function addTheftXp(gid, uid, amt = THEFT_XP_PER_WIN) {
+  db.prepare('INSERT OR IGNORE INTO theft_levels(guildId,userId,level,xp)VALUES(?,?,0,0)').run(gid, uid);
+  let d = getTheftLevel(gid, uid);
+  if (d.level >= THEFT_MAX_LEVEL) return { leveled: false, newLevel: d.level };
+  db.prepare('UPDATE theft_levels SET xp=xp+? WHERE guildId=? AND userId=?').run(amt, gid, uid);
+  d = getTheftLevel(gid, uid);
+  let leveled = false;
+  while (d.level < THEFT_MAX_LEVEL && d.xp >= getTheftXpNeeded(d.level)) {
+    const needed = getTheftXpNeeded(d.level);
+    d.xp -= needed;
+    d.level += 1;
+    leveled = true;
+  }
+  if (leveled) {
+    db.prepare('UPDATE theft_levels SET level=?, xp=? WHERE guildId=? AND userId=?').run(d.level, d.level >= THEFT_MAX_LEVEL ? 0 : d.xp, gid, uid);
+  }
+  return { leveled, newLevel: d.level };
+}
+// Hırsızlık seviyesine göre çalınan coin miktarı: Lv1-9 → 100, Lv10-19 → 200, Lv20 (maks) → 300
+function getTheftStealAmount(gid, uid) {
+  const { level } = getTheftLevel(gid, uid);
+  if (level >= THEFT_MAX_LEVEL) return 300;
+  if (level >= 10) return 200;
+  return 100;
+}
+
 // Geçici XP Boost — süreye değil kullanım hakkına dayanır (2000 coin, 50 kullanım, 2x)
 function getTempBoostUses(gid, uid) { const r = db.prepare('SELECT usesLeft FROM temp_xp_boosts WHERE guildId=? AND userId=?').get(gid, uid); return r ? (r.usesLeft || 0) : 0; }
 function hasTempBoost(gid, uid) { return getTempBoostUses(gid, uid) > 0; }
@@ -927,6 +966,8 @@ const RELICS = [
     description: 'Tüm XP kazanımları **+%15** artar.' },
   { key: 'tuccar',        name: 'Tüccar Reliği',   emoji: '💰', price: 10000, group: 'single',
     description: 'Balık ve maden satışından **+%10** coin kazanırsın. Pazar vergisi **%50** azalır.' },
+  { key: 'sansli_kazma',  name: 'Şanslı Kazma Reliği', emoji: '🍀', price: 10000, group: 'single',
+    description: 'Madende craft malzemesi düşme oranı **2 kat (x2)** artar. Set değil, tek parça — satın alındığı an otomatik aktif olur.' },
   { key: 'ejder_pence',   name: 'Ejder Pençesi',   emoji: '🐉', price: 10000, group: 'ejder',
     description: 'Ejder Setinin bir parçası. Tüm 3 parça takılınca aktifleşir.' },
   { key: 'ejder_disi',    name: 'Ejder Dişi',      emoji: '🦷', price: 10000, group: 'ejder',
@@ -1166,6 +1207,70 @@ function getMarketListings(gid)         { return db.prepare('SELECT * FROM playe
 function getMarketListing(id)           { return db.prepare('SELECT * FROM player_market WHERE id=?').get(id); }
 function deleteMarketListing(id)        { db.prepare('DELETE FROM player_market WHERE id=?').run(id); }
 
+// Hem ham hem gelişmiş craft malzemelerinde arama yapar (pazar/craft ortak kullanır)
+function findAnyCraftMaterial(key) {
+  return CRAFT_MATERIALS.find(m => m.key === key) || ADVANCED_CRAFT_MATERIALS.find(m => m.key === key);
+}
+
+// Pazar ilanının görüntülenecek adını çözer — silah/zırh/pet/malzeme JSON
+// payload olarak itemKey içinde saklanır (enhancement/level gibi durumu
+// korumak için); diğerleri (kazma/balta/ejder/antika/relic) düz anahtar.
+function describeMarketItem(l) {
+  try {
+    if (l.itemType === 'silah') {
+      const p = JSON.parse(l.itemKey);
+      return `${getWeaponName(p.weaponKey)} (+${p.enhancement})`;
+    }
+    if (l.itemType === 'zirh') {
+      const p = JSON.parse(l.itemKey);
+      return `${getArmorName(p.slot, p.armorKey.split('_')[1] || '')} (+${p.enhancement})`;
+    }
+    if (l.itemType === 'pet') {
+      const p = JSON.parse(l.itemKey);
+      const def = MMORPG_PETS.find(x => x.key === p.petKey);
+      return `${def?.emoji || '🐾'} **${def?.name || p.petKey}** Lv.${p.level}`;
+    }
+    if (l.itemType === 'malzeme') {
+      const p = JSON.parse(l.itemKey);
+      const def = findAnyCraftMaterial(p.matKey);
+      return `${def?.emoji || '🔩'} **${def?.name || p.matKey}** × ${p.quantity}`;
+    }
+  } catch { /* eski/bozuk payload — anahtarı olduğu gibi göster */ }
+
+  if (l.itemType === 'relic') {
+    const def = RELICS.find(x => x.key === l.itemKey) || ALL_NEW_RELIC_PIECES.find(x => x.key === l.itemKey);
+    return def ? `${def.emoji} ${def.name}` : l.itemKey;
+  }
+  const def = ALL_TOOLS.find(x => x.key === l.itemKey)
+    || RELICS.find(x => x.key === l.itemKey)
+    || ANTIQUES.find(x => x.key === l.itemKey);
+  return def ? `${def.emoji} ${def.name}` : l.itemKey;
+}
+// İlan alım/iptal iadesinde eşyayı alıcının/satıcının envanterine geri koyar
+function grantMarketItem(gid, uid, listing) {
+  if (listing.itemType === 'kazma' || listing.itemType === 'balta') {
+    addPlayerTool(gid, uid, listing.itemKey);
+  } else if (listing.itemType === 'ejder') {
+    buyRelic(gid, uid, listing.itemKey);
+  } else if (listing.itemType === 'antika') {
+    addAntique(gid, uid, listing.itemKey);
+  } else if (listing.itemType === 'relic') {
+    buyRelic(gid, uid, listing.itemKey);
+  } else if (listing.itemType === 'malzeme') {
+    const p = JSON.parse(listing.itemKey);
+    addCraftMat(gid, uid, p.matKey, p.quantity);
+  } else if (listing.itemType === 'silah') {
+    const p = JSON.parse(listing.itemKey);
+    db.prepare('INSERT INTO mmo_weapons(guildId,userId,weaponKey,enhancement)VALUES(?,?,?,?)').run(gid, uid, p.weaponKey, p.enhancement);
+  } else if (listing.itemType === 'zirh') {
+    const p = JSON.parse(listing.itemKey);
+    db.prepare('INSERT INTO mmo_armors(guildId,userId,armorKey,slot,enhancement)VALUES(?,?,?,?,?)').run(gid, uid, p.armorKey, p.slot, p.enhancement);
+  } else if (listing.itemType === 'pet') {
+    const p = JSON.parse(listing.itemKey);
+    db.prepare('INSERT OR IGNORE INTO mmo_pets(guildId,userId,petKey,level,hatchedAt)VALUES(?,?,?,?,?)').run(gid, uid, p.petKey, p.level, `${Date.now()}_${Math.floor(Math.random()*1000)}`);
+  }
+}
+
 // ──────────────────────────────────────────────────────────────
 //  RELİK YARDIMCILARI
 // ──────────────────────────────────────────────────────────────
@@ -1337,6 +1442,7 @@ function getTotalDailyBonusPct(gid, uid) { return getAntiqueDailyBonus(gid, uid)
 // ── Tarih / Saat yardımcıları ─────────────────────────────────
 function todayTR()    { return new Date().toLocaleDateString('tr-TR', { timeZone: 'Europe/Istanbul' }).split('.').reverse().join('-'); }
 function nowTR()      { return new Date().toLocaleString('tr-TR', { timeZone: 'Europe/Istanbul' }); }
+function sleep(ms)    { return new Promise(resolve => setTimeout(resolve, ms)); }
 function fmtVoice(s)  { return `${Math.floor(s / 3600)}sa ${Math.floor((s % 3600) / 60)}dk ${s % 60}sn`; }
 function fmtMin(s)    { return `${Math.floor(s / 60)} dk ${s % 60} sn`; }
 function pick(arr)    { return arr[Math.floor(Math.random() * arr.length)]; }
@@ -1739,9 +1845,11 @@ function getMiningCapacity(level)   { return level >= 40 ? 8 : level >= 30 ? 7 :
 function getMiningXpNeeded(level)   { return level * 9; } // %200 zorlaştırıldı (eskiden level*3)
 function getEnergyXpNeeded(level)   { return level * 10; }
 
-const MINING_MAX_LEVEL = 50;
+const MINING_MAX_LEVEL = 100;
+const MINE_TRIP_COST   = 3; // gezi başına işçi başına ödenen coin (odunculukla aynı ücret)
 
 function getMiningRank(level) {
+  if (level >= 100) return { name: 'Godslayer',  emoji: '👑', color: 0x000000 };
   if (level >= 50) return { name: 'Challenger', emoji: '🔥', color: 0xFF0000 };
   if (level >= 45) return { name: 'Legendary',  emoji: '⭐', color: 0xFF6B00 };
   if (level >= 40) return { name: 'Grandmaster',emoji: '🏆', color: 0x9B59B6 };
@@ -1799,6 +1907,7 @@ function buildMiningPanel() {
       '🔒 Tüm oyun verilerin yalnızca sana görünür.\n' +
       '⏱️ Her eylem için **10 saniye** bekleme süresi var.\n' +
       '⚡ Enerji her **2 dakikada bir** 1 adet yenilenir.\n' +
+      '💸 Her gezi için işçi başına **3 coin** ücret ödenir.\n' +
       '🍽️ Madencilerin aç kalırsa verim düşer!'
     )
     .addFields(
@@ -1809,7 +1918,7 @@ function buildMiningPanel() {
       { name: '🛒 Market',         value: 'İşçi, enerji ve yemek satın al',       inline: true },
       { name: '📊 Profil',         value: 'Madencilik istatistiklerini gör',      inline: true },
     )
-    .setFooter({ text: 'Başlangıç: 2 işçi | Rütbeler: Bronze(Lv5) • Iron(Lv10) • Gold(Lv15) • Master(Lv20) • Platinum(Lv25) • Emerald(Lv30) • Diamond(Lv35) • Grandmaster(Lv40) • Legendary(Lv45) • Challenger(Lv50)' });
+    .setFooter({ text: 'Başlangıç: 2 işçi | Rütbeler: Bronze(Lv5) • Iron(Lv10) • Gold(Lv15) • Master(Lv20) • Platinum(Lv25) • Emerald(Lv30) • Diamond(Lv35) • Grandmaster(Lv40) • Legendary(Lv45) • Challenger(Lv50) • Godslayer(Lv100)' });
 
   const row1 = new ActionRowBuilder().addComponents(
     new ButtonBuilder().setCustomId('mine_dig').setLabel('⛏️ Madene Gönder').setStyle(ButtonStyle.Primary),
@@ -1859,6 +1968,17 @@ async function handleMineButton(interaction) {
       });
     }
 
+    // Gezi ücreti kontrolü (odunculukla aynı mantık: işçi başına sabit ücret)
+    const tripCost = sendCount * MINE_TRIP_COST;
+    const bal = getBalance(gid, uid).balance;
+    if (bal < tripCost) {
+      return interaction.reply({
+        ephemeral: true,
+        content: `💸 Gezi ücreti ödenemedi!\n**${sendCount}** işçi × **${MINE_TRIP_COST} coin** = **${tripCost} coin** gerekli. Bakiye: **${bal} coin**`,
+      });
+    }
+    addBalance(gid, uid, -tripCost);
+
     // Açlık kontrolü: yiyecek kullanım hakkı kalmamışsa aç
     const totalFoodUses = (data.breadUses || 0) + (data.soupUses || 0) + (data.meatUses || 0);
     const isHungry = totalFoodUses <= 0;
@@ -1881,7 +2001,7 @@ async function handleMineButton(interaction) {
     for (const ore of results) addMiningOre(gid, uid, ore.key, 1);
     data.totalOresMined += effectiveSend;
 
-    // Madencilik XP (maks seviye: 50 — Challenger)
+    // Madencilik XP (maks seviye: 100 — Godslayer)
     let leveledUp = false;
     if (data.miningLevel < MINING_MAX_LEVEL) {
       data.miningXp += Math.round(effectiveSend * (1 + getPassiveXpBonusPct(gid, uid)));
@@ -1915,15 +2035,16 @@ async function handleMineButton(interaction) {
         { name: '🏅 Rütbe / Seviye',       value: `${rank.emoji} **${rank.name}** Lv.${data.miningLevel}${data.miningLevel >= MINING_MAX_LEVEL ? ' 🔥 MAX' : ''}`, inline: true },
         { name: '📈 Madencilik XP',        value: data.miningLevel >= MINING_MAX_LEVEL ? '**MAX SEVİYE** 🔥' : `${data.miningXp} / ${getMiningXpNeeded(data.miningLevel)}`, inline: true },
         { name: '🍽️ İşçi Durumu',        value: foodStr,                                                 inline: true },
+        { name: '💸 Ödenen Ücret',       value: `**-${tripCost} coin**`,                                inline: true },
       );
 
     if (leveledUp && data.miningLevel < MINING_MAX_LEVEL) embed.addFields({ name: '🎉 SEVİYE ATLADI!', value: `Madencilik Lv.**${data.miningLevel}** oldun! ${getMiningRank(data.miningLevel).emoji} **${getMiningRank(data.miningLevel).name}**`, inline: false });
-    if (leveledUp && data.miningLevel >= MINING_MAX_LEVEL) embed.addFields({ name: '🏆 MAKSİMUM SEVİYE!', value: `🔥 **Challenger** oldun! Lv.50 — Madenciliğin zirvesine ulaştın! Artık XP kazanımı durdu.`, inline: false });
+    if (leveledUp && data.miningLevel >= MINING_MAX_LEVEL) embed.addFields({ name: '🏆 MAKSİMUM SEVİYE!', value: `👑 **Godslayer** oldun! Lv.100 — Madenciliğin zirvesine ulaştın! Artık XP kazanımı durdu.`, inline: false });
     if (justRanOut)   embed.addFields({ name: '🍽️ Yiyecek Bitti!',   value: 'Tüm yiyecek kullanımları tükendi! Marketten yenisini al.',       inline: false });
     if (isHungry)     embed.addFields({ name: '😫 İşçiler Aç!',       value: 'Yiyecek yok — verimlilik %50 düştü! Marketten yemek al.',        inline: false });
 
-    // ── 1/50 şans eseri drop (gönderme anında) ──────────────
-    if (Math.random() < 1 / 50) {
+    // ── 1/20 şans eseri drop (gönderme anında) ──────────────
+    if (Math.random() < 1 / 20) {
       const dropMsg = giveRareDrop(gid, uid, MINING_TOOLS);
       embed.addFields({ name: '🎉 Nadir Düşme!', value: dropMsg });
     }
@@ -1933,25 +2054,31 @@ async function handleMineButton(interaction) {
       // NOT: Bu tabloda CRAFT_MATERIALS'taki HER malzeme bulunmalı, yoksa o
       // malzeme hiçbir zaman düşmez (altin_cevheri ve elmas_cevheri eksikti,
       // eklendi). Ayrıca tüm düşme ihtimalleri +%25 artırıldı (kullanıcı isteği).
+      // NOT: Tüm oranlar kullanıcı isteğiyle bir kez daha +%15 artırıldı
+      // (önceki değerlerin ×1.15 katı — madenden craft malzemesi düşmesi kolaylaştı).
       const _matDropTable = [
-        { minLevel: 1,  key: 'demir_cevheri',     chance: 0.125, emoji: '⚙️',  name: 'Demir' },
-        { minLevel: 1,  key: 'bakir_cevheri',     chance: 0.125, emoji: '🟤', name: 'Bakır' },
-        { minLevel: 5,  key: 'altin_cevheri',     chance: 0.25,  emoji: '🟡', name: 'Altın' },
-        { minLevel: 5,  key: 'obsidyen',           chance: 0.10,  emoji: '🪨', name: 'Obsidyen' },
-        { minLevel: 10, key: 'elmas_cevheri',      chance: 0.088, emoji: '💎', name: 'Elmas' },
-        { minLevel: 10, key: 'saf_kristal',        chance: 0.088, emoji: '🔮', name: 'Saf Kristal' },
-        { minLevel: 10, key: 'lav_tasi',           chance: 0.088, emoji: '🌋', name: 'Lav Taşı' },
-        { minLevel: 15, key: 'ruh_tozu',           chance: 0.075, emoji: '👻', name: 'Ruh Tozu' },
-        { minLevel: 20, key: 'ejder_pulu',         chance: 0.075, emoji: '🐉', name: 'Ejder Pulu' },
-        { minLevel: 20, key: 'ay_tasi',            chance: 0.075, emoji: '🌙', name: 'Ay Taşı' },
-        { minLevel: 25, key: 'karanlik_oz',        chance: 0.063, emoji: '🌑', name: 'Karanlık Öz' },
-        { minLevel: 25, key: 'gunes_parcasi',      chance: 0.063, emoji: '☀️', name: 'Güneş Parçası' },
-        { minLevel: 30, key: 'yildirim_kristali',  chance: 0.063, emoji: '⚡', name: 'Yıldırım Kristali' },
-        { minLevel: 30, key: 'buz_cekirdegi',      chance: 0.063, emoji: '❄️', name: 'Buz Çekirdeği' },
+        { minLevel: 1,  key: 'demir_cevheri',     chance: 0.144, emoji: '⚙️',  name: 'Demir' },
+        { minLevel: 1,  key: 'bakir_cevheri',     chance: 0.144, emoji: '🟤', name: 'Bakır' },
+        { minLevel: 5,  key: 'altin_cevheri',     chance: 0.288, emoji: '🟡', name: 'Altın' },
+        { minLevel: 5,  key: 'obsidyen',           chance: 0.115, emoji: '🪨', name: 'Obsidyen' },
+        { minLevel: 10, key: 'elmas_cevheri',      chance: 0.101, emoji: '💎', name: 'Elmas' },
+        { minLevel: 10, key: 'saf_kristal',        chance: 0.101, emoji: '🔮', name: 'Saf Kristal' },
+        { minLevel: 10, key: 'lav_tasi',           chance: 0.101, emoji: '🌋', name: 'Lav Taşı' },
+        { minLevel: 15, key: 'ruh_tozu',           chance: 0.086, emoji: '👻', name: 'Ruh Tozu' },
+        { minLevel: 20, key: 'ejder_pulu',         chance: 0.086, emoji: '🐉', name: 'Ejder Pulu' },
+        { minLevel: 20, key: 'ay_tasi',            chance: 0.086, emoji: '🌙', name: 'Ay Taşı' },
+        { minLevel: 25, key: 'karanlik_oz',        chance: 0.072, emoji: '🌑', name: 'Karanlık Öz' },
+        { minLevel: 25, key: 'gunes_parcasi',      chance: 0.072, emoji: '☀️', name: 'Güneş Parçası' },
+        { minLevel: 30, key: 'yildirim_kristali',  chance: 0.072, emoji: '⚡', name: 'Yıldırım Kristali' },
+        { minLevel: 30, key: 'buz_cekirdegi',      chance: 0.072, emoji: '❄️', name: 'Buz Çekirdeği' },
       ];
+      // Şanslı Kazma Reliği (tek parça, satın alındığı an oto aktif) — tüm craft
+      // malzemesi düşme oranlarını 2 katına çıkarır.
+      const _luckyMineRelic = hasRelic(gid, uid, 'sansli_kazma');
       const _matDrops = [];
       for (const md of _matDropTable) {
-        if (data.miningLevel >= md.minLevel && Math.random() < md.chance) {
+        const effChance = Math.min(1, md.chance * (_luckyMineRelic ? 2 : 1));
+        if (data.miningLevel >= md.minLevel && Math.random() < effChance) {
           addCraftMat(gid, uid, md.key, 1);
           _matDrops.push(`${md.emoji} **${md.name}** × 1`);
         }
@@ -2283,6 +2410,7 @@ async function handleMineButton(interaction) {
           value: [
             'İşçilerini madene yollar, maden çıkarırsın.',
             '• Her gezi **işçi başına 1 enerji** harcar',
+            '• Her gezide işçi başına **3 coin** ücret ödenir',
             '• Lv.1-9: gezi başına **2 maden** | Lv.10-19: **3** | Lv.20+: **5**',
             '• Kaç işçin varsa o kadar maden çıkar (kapasite kadar)',
             '• %40 ihtimalle işçiler acıkır → verim **yarıya düşer**',
@@ -2332,7 +2460,7 @@ async function handleMineButton(interaction) {
             '⛏️ Beginner(Lv1) → 🥉 Bronze(Lv5) → ⚙️ Iron(Lv10) → 🥇 Gold(Lv15)',
             '👑 Master(Lv20) → 🔮 Platinum(Lv25) → 💚 Emerald(Lv30)',
             '💎 Diamond(Lv35) → 🏆 Grandmaster(Lv40) → ⭐ Legendary(Lv45)',
-            '🔥 **Challenger (Lv.50 — MAKSİMUM)**',
+            '🔥 Challenger(Lv50) → 👑 **Godslayer (Lv.100 — MAKSİMUM)**',
           ].join('\n'),
         },
         {
@@ -2379,7 +2507,7 @@ async function handleMineButton(interaction) {
         { name: '📦 Toplam Maden',        value: `**${data.totalOresMined}** adet`,                     inline: true },
         { name: '💰 Sonraki İşçi',        value: `**${tier.price}** coin (Lv.${tier.minLevel})`,        inline: true },
       )
-      .setFooter({ text: 'Rütbeler: Bronze(Lv5) • Iron(Lv10) • Gold(Lv15) • Master(Lv20) • Platinum(Lv25) • Emerald(Lv30) • Diamond(Lv35) • Grandmaster(Lv40) • Legendary(Lv45) • 🔥Challenger(Lv50)' });
+      .setFooter({ text: 'Rütbeler: Bronze(Lv5) • Iron(Lv10) • Gold(Lv15) • Master(Lv20) • Platinum(Lv25) • Emerald(Lv30) • Diamond(Lv35) • Grandmaster(Lv40) • Legendary(Lv45) • 🔥Challenger(Lv50) • 👑Godslayer(Lv100)' });
 
     return interaction.reply({ ephemeral: true, embeds: [embed] });
   }
@@ -2390,7 +2518,7 @@ async function handleMineButton(interaction) {
 // ──────────────────────────────────────────────────────────────
 const WOODCUTTING_CHANNEL_ID = '1526334843552796683';
 const WOOD_EMPTY_CHANCE = 0.10; // her işçi için %10 boş dönme şansı
-const WOOD_TRIP_COST    = 10;   // gezi başına işçi başına ödenen coin
+const WOOD_TRIP_COST    = 3;    // gezi başına işçi başına ödenen coin
 
 const WOODS = [
   { key: 'pine',   name: 'Çam',         emoji: '🌲', value: 8,   weight: 30 },
@@ -2519,7 +2647,7 @@ function buildWoodPanel() {
       '🔒 Tüm oyun verilerin yalnızca sana görünür.\n' +
       '⏱️ Her eylem için **10 saniye** bekleme süresi var.\n' +
       '⚡ Enerji her **2 dakikada bir** 1 adet yenilenir.\n' +
-      '💸 Her gezi için işçi başına **10 coin** ücret ödenir.\n' +
+      '💸 Her gezi için işçi başına **3 coin** ücret ödenir.\n' +
       '🎲 Her oduncunun **%10 ihtimalle** eli boş dönme şansı var!\n' +
       '🍽️ Oduncuların aç kalırsa verim düşer!'
     )
@@ -2658,8 +2786,8 @@ async function handleWoodButton(interaction) {
     if (justRanOut)  embed.addFields({ name: '🍽️ Yiyecek Bitti!',  value: 'Tüm yiyecek kullanımları tükendi! Marketten yenisini al.',      inline: false });
     if (isHungry)    embed.addFields({ name: '😫 Oduncular Aç!',    value: 'Yiyecek yok — verimlilik %50 düştü! Marketten yemek al.',       inline: false });
 
-    // ── 1/50 şans eseri drop (gönderme anında) ──────────────
-    if (Math.random() < 1 / 50) {
+    // ── 1/20 şans eseri drop (gönderme anında) ──────────────
+    if (Math.random() < 1 / 20) {
       const dropMsg = giveRareDrop(gid, uid, WOOD_TOOLS);
       embed.addFields({ name: '🎉 Nadir Düşme!', value: dropMsg });
     }
@@ -2958,7 +3086,7 @@ async function handleWoodButton(interaction) {
           value: [
             'Oduncularını ormana yollar, odun kesersin.',
             '• Her gezi **işçi başına 1 enerji** harcar',
-            '• Her gezide işçi başına **10 coin** ücret ödenir',
+            '• Her gezide işçi başına **3 coin** ücret ödenir',
             '• Her oduncunun **%10 ihtimalle** eli boş dönme şansı var',
             '• Aç oduncuların verimi **%50 düşer**',
           ].join('\n'),
@@ -3191,7 +3319,7 @@ const SLASH_COMMANDS = [
   // /pazar — oyuncu pazarı
   new SlashCommandBuilder()
     .setName('pazar')
-    .setDescription('Oyuncu pazarı — araç, ejder reliği ve antika al/sat')
+    .setDescription('Oyuncu pazarı — araç, ekipman, pet, relic ve malzeme al/sat')
     .addSubcommand(s => s.setName('listele').setDescription('Aktif ilanları gör'))
     .addSubcommand(s => s.setName('envanter').setDescription('Araç envanterini gör'))
     .addSubcommand(s => s.setName('sat').setDescription('İlan aç')
@@ -3201,9 +3329,15 @@ const SLASH_COMMANDS = [
           { name: '🪓 Balta (odunculuk aracı)',  value: 'balta'  },
           { name: '🐉 Ejder Seti Reliği',         value: 'ejder'  },
           { name: '🏺 Antika',                    value: 'antika' },
+          { name: '🔩 Craft/Gelişmiş Malzeme',    value: 'malzeme' },
+          { name: '📿 Relic (Tekli/Set Parçası)', value: 'relic' },
+          { name: '⚔️ Silah (Envanter ID)',       value: 'silah' },
+          { name: '🛡️ Zırh (Envanter ID)',        value: 'zirh' },
+          { name: '🐾 MMORPG Pet',                value: 'pet' },
         ))
-      .addStringOption(o => o.setName('anahtar').setDescription('Eşya anahtarı (örn: demir_kazma, ejder_pence, antika_key)').setRequired(true))
-      .addIntegerOption(o => o.setName('fiyat').setDescription('Satış fiyatı (coin)').setRequired(true).setMinValue(1)))
+      .addStringOption(o => o.setName('anahtar').setDescription('Eşya anahtarı / ID / (pet için petkey|hatchedat)').setRequired(true))
+      .addIntegerOption(o => o.setName('fiyat').setDescription('Satış fiyatı (coin, ilanın TAMAMI için)').setRequired(true).setMinValue(1))
+      .addIntegerOption(o => o.setName('miktar').setDescription('Miktar (yalnızca craft/gelişmiş malzeme için, varsayılan 1)').setMinValue(1)))
     .addSubcommand(s => s.setName('al').setDescription('İlandan satın al')
       .addIntegerOption(o => o.setName('id').setDescription('İlan ID numarası').setRequired(true)))
     .addSubcommand(s => s.setName('iptal').setDescription('Kendi ilanını iptal et')
@@ -3681,6 +3815,12 @@ client.on('interactionCreate', async interaction => {
             const def = MMORPG_CHESTS.find(c => c.key === key);
             return { key, label: def ? `${def.emoji} ${def.name}` : key };
           });
+        } else if (kategori === 'malzeme') {
+          choices = ADVANCED_CRAFT_MATERIALS.map(m => ({ key: m.key, label: `${m.emoji} ${m.name}` }));
+        } else if (kategori === 'set') {
+          choices = Object.entries(RELIC_SETS).map(([key, def]) => ({
+            key, label: `${def.emoji} ${def.name} [${def.tier}]${def.classKey ? ' 🔒' : ''}`,
+          }));
         }
 
         choices = choices
@@ -3816,6 +3956,13 @@ client.on('interactionCreate', async interaction => {
     }
 
     // ── MMORPG Komutları ───────────────────────────────────────
+    // Sınıf seçmeden (/sinif) oyunun geri kalanı oynanamaz.
+    if (MMO_CMDS.has(cmd) && cmd !== 'sinif' && gid && !getPlayerClass(gid, uid)) {
+      return interaction.reply({
+        ephemeral: true,
+        content: '🧭 Önce bir savaş yolu (sınıf) seçmen gerekiyor! `/sinif` ile Şövalye ⚔️, Nişancı 🏹 veya Büyücü 🪄 seç.',
+      });
+    }
     if (MMO_CMDS.has(cmd)) return handleMMOCommand(interaction, cmd, sub, gid, uid);
 
     if (cmd === 'banka') {
@@ -3929,7 +4076,7 @@ client.on('interactionCreate', async interaction => {
               '`/pazar al id:<numara>` — İlandan satın al',
               '`/pazar iptal id:<numara>` — Kendi ilanını geri çek',
               '📌 **Satılabilir:** ⛏️ Kazmalar · 🪓 Baltalar · 🐉 Ejder Seti Relikleri · 🏺 Antikalar',
-              '💡 Kazmalar/baltalar madencilik & odunculukta **1/50** şansla düşer',
+              '💡 Kazmalar/baltalar madencilik & odunculukta **1/20** şansla düşer',
             ].join('\n'),
           },
           {
@@ -3939,7 +4086,7 @@ client.on('interactionCreate', async interaction => {
               '  ⛏️ Demir +%5 · 🪙 Altın +%10 · 💎 Elmas +%15 · ✨ Büyülü +%20',
               '**Odunculuk Baltaları** (satış bonusu):',
               '  🪓 Demir +%5 · 🪙 Altın +%10 · 💎 Elmas +%15 · ✨ Büyülü +%20',
-              '🎲 Her satışta **1/50** ihtimalle antika, relik, araç veya craft malzeme düşebilir!',
+              '🎲 Her satışta **1/20** ihtimalle antika, relik, araç veya craft malzeme düşebilir!',
             ].join('\n'),
           },
           {
@@ -3986,7 +4133,7 @@ client.on('interactionCreate', async interaction => {
               '`📊 Profil` — Madencilik profilini gör',
               '',
               '**Maden değerleri:** Kömür/Bakır=1🪙 • Demir/Gümüş/Çelik=2🪙 • Altın=3🪙 • Linyit=5🪙 • Elmas=7🪙 • Uranyum=10🪙',
-              '**Rütbeler (Maks: Lv50):** ⛏️Beginner → 🥉Bronze(5) → ⚙️Iron(10) → 🥇Gold(15) → 👑Master(20) → 🔮Platinum(25) → 💚Emerald(30) → 💎Diamond(35) → 🏆Grandmaster(40) → ⭐Legendary(45) → 🔥Challenger(50)',
+              '**Rütbeler (Maks: Lv100):** ⛏️Beginner → 🥉Bronze(5) → ⚙️Iron(10) → 🥇Gold(15) → 👑Master(20) → 🔮Platinum(25) → 💚Emerald(30) → 💎Diamond(35) → 🏆Grandmaster(40) → ⭐Legendary(45) → 🔥Challenger(50) → 👑Godslayer(100)',
             ].join('\n'),
           }
         )
@@ -4993,7 +5140,7 @@ client.on('interactionCreate', async interaction => {
               ? `✅ **Lv.${ejderLv} (MAKSİMUM)** ${ejderBar} — **+%${coinBonus} Coin** / **+%${xpBonus} XP**`
               : `✅ **Lv.${ejderLv}** ${ejderBar} — **+%${coinBonus} Coin** / **+%${xpBonus} XP** — Yükselt: **${EJDER_UPGRADE_COST} coin**`;
           }
-          lines.push(`\n🐉 **Ejder Seti** (${ejderCnt}/3): ${ejderStatus}\n  ↳ Madencilik/odunculukta **1/50** şansla düşer ya da \`/pazar listele\`'den satın alınabilir. Set tamamlanmadan yükseltilemez.`);
+          lines.push(`\n🐉 **Ejder Seti** (${ejderCnt}/3): ${ejderStatus}\n  ↳ Madencilik/odunculukta **1/20** şansla düşer ya da \`/pazar listele\`'den satın alınabilir. Set tamamlanmadan yükseltilemez.`);
           // Satın alma butonları (henüz sahip olunamayanlar)
           const avail   = RELICS.filter(r => r.group === 'single' && !ownedKeys.includes(r.key));
           const buyBtns = avail.map(r => new ButtonBuilder().setCustomId(`mkt_relical_${r.key}_${uid}`).setLabel(`${r.emoji} ${r.name.split(' ')[0]} (${r.price}c)`).setStyle(ButtonStyle.Primary));
@@ -5196,7 +5343,8 @@ client.on('interactionCreate', async interaction => {
         const alreadyThieving = [...activeSteals].some(k => k.startsWith(`${uid}:`));
         if (alreadyThieving) return interaction.reply({ ephemeral: true, content: '⛔ Zaten aktif bir hırsızlık işlemin var! Önce o bitsin.' });
         const key = `${uid}:${victim.id}`;
-        if (getBalance(gid, victim.id).balance < 100) return interaction.reply({ ephemeral: true, content: 'Hedefin coin\'i yetersiz.' });
+        const stealAmount = getTheftStealAmount(gid, uid);
+        if (getBalance(gid, victim.id).balance < stealAmount) return interaction.reply({ ephemeral: true, content: 'Hedefin coin\'i yetersiz.' });
         activeSteals.add(key);
         const cancelId = `cancel_steal_${Date.now()}_${uid}`;
         // Gölge Seti — Hırsızlık başarı bonusu: hedefin iptal etmek için ayrılan süre kısalır
@@ -5207,7 +5355,7 @@ client.on('interactionCreate', async interaction => {
           new ButtonBuilder().setCustomId(cancelId).setLabel(`İptal Et (${stealWindowSec}s)`).setStyle(ButtonStyle.Danger).setEmoji('⛔')
         );
         await interaction.reply({
-          content: `${victim}, **${interaction.user.username}** senden **100 coin** çalmaya çalışıyor! ${stealWindowSec} saniye içinde butona basmazsan para gider 😈`,
+          content: `${victim}, **${interaction.user.username}** senden **${stealAmount} coin** çalmaya çalışıyor! ${stealWindowSec} saniye içinde butona basmazsan para gider 😈`,
           components: [row],
         });
         const m2 = await interaction.fetchReply();
@@ -5225,9 +5373,11 @@ client.on('interactionCreate', async interaction => {
         coll.on('end', async () => {
           if (prevented) return;
           activeSteals.delete(key);
-          if (getBalance(gid, victim.id).balance < 100) return m2.edit({ content: '⚠️ Hedef zaten fakirleşmiş.', components: [] });
-          transfer(gid, victim.id, uid, 100);
-          await m2.edit({ content: `💰 **${interaction.user.username}**, **${victim.username}**'den **100 coin** çaldı!`, components: [] });
+          if (getBalance(gid, victim.id).balance < stealAmount) return m2.edit({ content: '⚠️ Hedef zaten fakirleşmiş.', components: [] });
+          transfer(gid, victim.id, uid, stealAmount);
+          const theftResult = addTheftXp(gid, uid);
+          const levelUpMsg = theftResult.leveled ? ` 📈 Hırsızlık seviyen **${theftResult.newLevel}** oldu!` : '';
+          await m2.edit({ content: `💰 **${interaction.user.username}**, **${victim.username}**'den **${stealAmount} coin** çaldı! (+${THEFT_XP_PER_WIN} hırsızlık XP)${levelUpMsg}`, components: [] });
           stealUseCounter++;
           if (stealUseCounter >= 50) {
             stealUseCounter = 0;
@@ -5263,7 +5413,8 @@ client.on('interactionCreate', async interaction => {
       const alreadyThieving2 = [...activeSteals].some(k => k.startsWith(`${uid}:`));
       if (alreadyThieving2) return interaction.reply({ ephemeral: true, content: '⛔ Zaten aktif bir hırsızlık işlemin var! Önce o bitsin.' });
       const key = `${uid}:${victim.id}`;
-      if (getBalance(gid, victim.id).balance < 100) return interaction.reply({ ephemeral: true, content: 'Hedefin coin\'i yetersiz.' });
+      const stealAmount = getTheftStealAmount(gid, uid);
+      if (getBalance(gid, victim.id).balance < stealAmount) return interaction.reply({ ephemeral: true, content: 'Hedefin coin\'i yetersiz.' });
       activeSteals.add(key);
       const cancelId = `cancel_steal_${Date.now()}_${uid}`;
       // Gölge Seti — Hırsızlık başarı bonusu: hedefin iptal etmek için ayrılan süre kısalır
@@ -5274,7 +5425,7 @@ client.on('interactionCreate', async interaction => {
         new ButtonBuilder().setCustomId(cancelId).setLabel(`İptal Et (${stealWindowSec}s)`).setStyle(ButtonStyle.Danger).setEmoji('⛔')
       );
       await interaction.reply({
-        content: `${victim}, **${interaction.user.username}** senden **100 coin** çalmaya çalışıyor! ${stealWindowSec} saniye içinde butona basmazsan para gider 😈`,
+        content: `${victim}, **${interaction.user.username}** senden **${stealAmount} coin** çalmaya çalışıyor! ${stealWindowSec} saniye içinde butona basmazsan para gider 😈`,
         files: [STEAL_START_GIF],
         components: [row],
       });
@@ -5293,9 +5444,11 @@ client.on('interactionCreate', async interaction => {
       coll.on('end', async () => {
         if (prevented) return;
         activeSteals.delete(key);
-        if (getBalance(gid, victim.id).balance < 100) return m2.edit({ content: '⚠️ Hedef zaten fakirleşmiş.', components: [] });
-        transfer(gid, victim.id, uid, 100);
-        await m2.edit({ content: `💰 **${interaction.user.username}**, **${victim.username}**'den **100 coin** çaldı!`, files: [STEAL_SUCCESS_GIF], components: [] });
+        if (getBalance(gid, victim.id).balance < stealAmount) return m2.edit({ content: '⚠️ Hedef zaten fakirleşmiş.', components: [] });
+        transfer(gid, victim.id, uid, stealAmount);
+        const theftResult = addTheftXp(gid, uid);
+        const levelUpMsg = theftResult.leveled ? ` 📈 Hırsızlık seviyen **${theftResult.newLevel}** oldu!` : '';
+        await m2.edit({ content: `💰 **${interaction.user.username}**, **${victim.username}**'den **${stealAmount} coin** çaldı! (+${THEFT_XP_PER_WIN} hırsızlık XP)${levelUpMsg}`, files: [STEAL_SUCCESS_GIF], components: [] });
         stealUseCounter++;
         if (stealUseCounter >= 50) {
           stealUseCounter = 0;
@@ -5679,7 +5832,7 @@ client.on('interactionCreate', async interaction => {
           .setTitle('⛏️ Madencilik Sıralaması')
           .setColor(0x8B4513)
           .setDescription(lines.join('\n'))
-          .setFooter({ text: 'Rütbeler: Bronze(5) • Iron(10) • Gold(15) • Master(20) • Platinum(25) • Emerald(30) • Diamond(35) • Grandmaster(40) • Legendary(45) • 🔥Challenger(50)' });
+          .setFooter({ text: 'Rütbeler: Bronze(5) • Iron(10) • Gold(15) • Master(20) • Platinum(25) • Emerald(30) • Diamond(35) • Grandmaster(40) • Legendary(45) • 🔥Challenger(50) • 👑Godslayer(100)' });
         return interaction.reply({ ephemeral: true, embeds: [embed] });
       }
     }
@@ -6024,7 +6177,7 @@ client.on('interactionCreate', async interaction => {
       // ── ENVANTER ─────────────────────────────────────────
       if (sub === 'envanter') {
         const tools = getPlayerTools(gid, uid);
-        if (!tools.length) return interaction.reply({ ephemeral: true, content: '🎒 Araç envanteriniz boş.\nMadencilik/odunculukta **1/50** şansla araç, relic parçası veya craft malzeme düşebilir!' });
+        if (!tools.length) return interaction.reply({ ephemeral: true, content: '🎒 Araç envanteriniz boş.\nMadencilik/odunculukta **1/20** şansla araç, relic parçası veya craft malzeme düşebilir!' });
         const lines = tools.map(t => {
           const def = ALL_TOOLS.find(x => x.key === t.toolKey);
           if (!def) return null;
@@ -6042,14 +6195,9 @@ client.on('interactionCreate', async interaction => {
       if (sub === 'listele') {
         const listings = getMarketListings(gid);
         if (!listings.length) return interaction.reply({ ephemeral: true, content: '🏪 Oyuncu pazarında aktif ilan yok.\n`/pazar sat` ile ilan açabilirsin!' });
-        const TYPE_LABEL = { kazma: '⛏️ Kazma', balta: '🪓 Balta', ejder: '🐉 Ejder Reliği', antika: '🏺 Antika' };
         const lines = listings.slice(0, 20).map(l => {
-          const def = ALL_TOOLS.find(x => x.key === l.itemKey)
-            || RELICS.find(x => x.key === l.itemKey)
-            || ANTIQUES.find(x => x.key === l.itemKey);
-          const name  = def ? `${def.emoji} ${def.name}` : l.itemKey;
-          const bonus = def && def.bonus ? ` (+%${def.bonus})` : '';
-          return `**[#${l.id}]** ${name}${bonus} — **${l.price} coin** | Satıcı: <@${l.sellerId}>`;
+          const name = describeMarketItem(l);
+          return `**[#${l.id}]** ${name} — **${l.price} coin** | Satıcı: <@${l.sellerId}>`;
         });
         const embed = new EmbedBuilder()
           .setTitle('🏪 Oyuncu Pazarı')
@@ -6108,6 +6256,65 @@ client.on('interactionCreate', async interaction => {
           const id = createMarketListing(gid, uid, 'antika', key, price);
           return interaction.reply(`✅ ${def.emoji} **${def.name}** **${price} coin**'e ilanı açıldı! İlan #${id}`);
         }
+
+        if (tur === 'malzeme') {
+          const def = findAnyCraftMaterial(key);
+          if (!def) return interaction.reply({ ephemeral: true, content: `⛔ Geçersiz malzeme anahtarı! (craft/gelişmiş malzeme anahtarlarını \`/envanter\` craft sekmesinden gör)` });
+          const qty = interaction.options.getInteger('miktar') || 1;
+          const owned = getCraftMats(gid, uid).find(m => m.matKey === key)?.quantity || 0;
+          if (owned < qty) return interaction.reply({ ephemeral: true, content: `⛔ Envanterinde yeterli **${def.name}** yok! Mevcut: ${owned}, İstenen: ${qty}` });
+          consumeCraftMat(gid, uid, key, qty);
+          const payload = JSON.stringify({ matKey: key, quantity: qty });
+          const id = createMarketListing(gid, uid, 'malzeme', payload, price);
+          return interaction.reply(`✅ ${def.emoji} **${def.name}** × ${qty} **${price} coin**'e ilanı açıldı! İlan #${id}`);
+        }
+
+        if (tur === 'relic') {
+          const single = RELICS.find(x => x.key === key && x.group !== 'ejder');
+          const piece  = ALL_NEW_RELIC_PIECES.find(p => p.key === key);
+          const def = single || piece;
+          if (!def) return interaction.reply({ ephemeral: true, content: `⛔ Geçersiz relic anahtarı! (Ejder Seti için \`tur:ejder\` kullan)` });
+          if (!hasRelic(gid, uid, key)) return interaction.reply({ ephemeral: true, content: `⛔ Bu relike sahip değilsin!` });
+          db.prepare('DELETE FROM relics WHERE guildId=? AND userId=? AND relicKey=?').run(gid, uid, key);
+          invalidateRelicsCache(gid, uid);
+          const id = createMarketListing(gid, uid, 'relic', key, price);
+          return interaction.reply(`✅ ${def.emoji} **${def.name}** **${price} coin**'e ilanı açıldı! İlan #${id}`);
+        }
+
+        if (tur === 'silah') {
+          const itemId = parseInt(key, 10);
+          if (!itemId) return interaction.reply({ ephemeral: true, content: `⛔ Geçerli bir silah **ID** gir (\`/envanter\` ile öğren).` });
+          const row = db.prepare('SELECT * FROM mmo_weapons WHERE id=? AND guildId=? AND userId=?').get(itemId, gid, uid);
+          if (!row) return interaction.reply({ ephemeral: true, content: `⛔ #${itemId} sana ait bir silah değil.` });
+          db.prepare('DELETE FROM mmo_weapons WHERE id=?').run(itemId);
+          const payload = JSON.stringify({ weaponKey: row.weaponKey, enhancement: row.enhancement });
+          const id = createMarketListing(gid, uid, 'silah', payload, price);
+          return interaction.reply(`✅ ${getWeaponName(row.weaponKey)} (+${row.enhancement}) **${price} coin**'e ilanı açıldı! İlan #${id}`);
+        }
+
+        if (tur === 'zirh') {
+          const itemId = parseInt(key, 10);
+          if (!itemId) return interaction.reply({ ephemeral: true, content: `⛔ Geçerli bir zırh **ID** gir (\`/envanter\` ile öğren).` });
+          const row = db.prepare('SELECT * FROM mmo_armors WHERE id=? AND guildId=? AND userId=?').get(itemId, gid, uid);
+          if (!row) return interaction.reply({ ephemeral: true, content: `⛔ #${itemId} sana ait bir zırh değil.` });
+          db.prepare('DELETE FROM mmo_armors WHERE id=?').run(itemId);
+          const payload = JSON.stringify({ armorKey: row.armorKey, slot: row.slot, enhancement: row.enhancement });
+          const id = createMarketListing(gid, uid, 'zirh', payload, price);
+          return interaction.reply(`✅ ${getArmorName(row.slot, row.armorKey.split('_')[1] || '')} (+${row.enhancement}) **${price} coin**'e ilanı açıldı! İlan #${id}`);
+        }
+
+        if (tur === 'pet') {
+          const [petKey, hatchedAt] = interaction.options.getString('anahtar').trim().split('|');
+          if (!petKey || !hatchedAt) return interaction.reply({ ephemeral: true, content: `⛔ Format: \`petkey|hatchedat\` (\`/rpg-pet liste\`'den kopyala).` });
+          const row = db.prepare('SELECT * FROM mmo_pets WHERE guildId=? AND userId=? AND petKey=? AND hatchedAt=?').get(gid, uid, petKey, hatchedAt);
+          if (!row) return interaction.reply({ ephemeral: true, content: `⛔ Bu pet sende yok.` });
+          db.prepare('DELETE FROM mmo_active_pets WHERE guildId=? AND userId=? AND petKey=? AND petHatchedAt=?').run(gid, uid, petKey, hatchedAt);
+          db.prepare('DELETE FROM mmo_pets WHERE guildId=? AND userId=? AND petKey=? AND hatchedAt=?').run(gid, uid, petKey, hatchedAt);
+          const payload = JSON.stringify({ petKey: row.petKey, level: row.level });
+          const id = createMarketListing(gid, uid, 'pet', payload, price);
+          const def = MMORPG_PETS.find(p => p.key === petKey);
+          return interaction.reply(`✅ ${def?.emoji || '🐾'} **${def?.name || petKey}** Lv.${row.level} **${price} coin**'e ilanı açıldı! İlan #${id}`);
+        }
       }
 
       // ── AL ───────────────────────────────────────────────
@@ -6123,10 +6330,7 @@ client.on('interactionCreate', async interaction => {
         if (bal.balance < listing.price)
           return interaction.reply({ ephemeral: true, content: `⛔ Yetersiz coin! Gerekli: **${listing.price}**, Bakiye: **${bal.balance}**` });
 
-        const def = ALL_TOOLS.find(x => x.key === listing.itemKey)
-          || RELICS.find(x => x.key === listing.itemKey)
-          || ANTIQUES.find(x => x.key === listing.itemKey);
-        const name = def ? `${def.emoji} ${def.name}` : listing.itemKey;
+        const name = describeMarketItem(listing);
 
         // Para transferi
         addBalance(gid, uid, -listing.price);
@@ -6134,16 +6338,13 @@ client.on('interactionCreate', async interaction => {
         deleteMarketListing(listingId);
 
         // Eşyayı alıcıya ver
-        if (listing.itemType === 'kazma' || listing.itemType === 'balta') {
-          addPlayerTool(gid, uid, listing.itemKey);
-        } else if (listing.itemType === 'ejder') {
-          buyRelic(gid, uid, listing.itemKey);
+        grantMarketItem(gid, uid, listing);
+
+        if (listing.itemType === 'ejder') {
           const ejderMsg = hasAllEjderParts(gid, uid) ? `\n🐉 **Ejder Seti tamamlandı!** +%${getEjderCoinBonus(gid, uid)} Coin ve +%${getEjderXpBonus(gid, uid)} XP aktif! (\`/market\` → Relikler'den yükseltebilirsin)` : '';
           sendLog(gid, 'market', new EmbedBuilder().setTitle('🏪 Oyuncu Pazarı — Alım').setColor(0xE67E22)
             .addFields({ name: 'Alıcı', value: `<@${uid}>`, inline: true }, { name: 'Satıcı', value: `<@${listing.sellerId}>`, inline: true }, { name: 'Eşya', value: name, inline: true }, { name: 'Fiyat', value: `${listing.price} coin`, inline: true }).setTimestamp());
           return interaction.reply(`✅ ${name} satın alındı! **-${listing.price} coin** | Bakiye: **${getBalance(gid, uid).balance}**${ejderMsg}`);
-        } else if (listing.itemType === 'antika') {
-          addAntique(gid, uid, listing.itemKey);
         }
 
         sendLog(gid, 'market', new EmbedBuilder().setTitle('🏪 Oyuncu Pazarı — Alım').setColor(0xE67E22)
@@ -6162,12 +6363,9 @@ client.on('interactionCreate', async interaction => {
 
         deleteMarketListing(listingId);
         // Eşyayı iade et
-        if (listing.itemType === 'kazma' || listing.itemType === 'balta') addPlayerTool(gid, uid, listing.itemKey);
-        else if (listing.itemType === 'ejder') buyRelic(gid, uid, listing.itemKey);
-        else if (listing.itemType === 'antika') addAntique(gid, uid, listing.itemKey);
+        grantMarketItem(gid, uid, listing);
 
-        const def  = ALL_TOOLS.find(x => x.key === listing.itemKey) || RELICS.find(x => x.key === listing.itemKey) || ANTIQUES.find(x => x.key === listing.itemKey);
-        const name = def ? `${def.emoji} ${def.name}` : listing.itemKey;
+        const name = describeMarketItem(listing);
         return interaction.reply({ ephemeral: true, content: `↩️ İlan #${listingId} iptal edildi. ${name} envanterine iade edildi.` });
       }
     }
@@ -6818,6 +7016,12 @@ function ensureMMORPGSchema() {
       PRIMARY KEY(guildId, userId, slot)
     );
 
+    -- Sınıf/yol sistemi: sovalye / nisanci / buyucu
+    CREATE TABLE IF NOT EXISTS rpg_class (
+      guildId TEXT, userId TEXT, class TEXT,
+      PRIMARY KEY(guildId, userId)
+    );
+
     -- Slot makinesi günlük oynama sayısı
     CREATE TABLE IF NOT EXISTS mmo_slot_daily (
       guildId TEXT, userId TEXT,
@@ -6859,6 +7063,41 @@ const RPG_STAT_NAMES = {
   mana:     { name: 'Mana',       emoji: '🔮' },
   magic:    { name: 'Büyücülük',  emoji: '✨' },
 };
+
+// ── Sınıf/yol sistemi ────────────────────────────────────────────────────
+// Her sınıf yalnızca kendi statlarıyla eşleşen silah/zırh/pet kullanabilir.
+// Eşleştirme WEAPON_TYPES.stat, ARMOR_SLOTS.stat ve MMORPG_PETS.bonusType
+// alanlarıyla birebir uyumlu — hepsi RPG_STAT_NAMES anahtarlarını kullanıyor.
+const RPG_CLASSES = [
+  { key: 'sovalye', name: 'Şövalye', emoji: '⚔️', stats: ['attack', 'defense', 'hp'] },
+  { key: 'nisanci', name: 'Nişancı', emoji: '🏹', stats: ['critical', 'speed'] },
+  { key: 'buyucu',  name: 'Büyücü',  emoji: '🪄', stats: ['magic', 'mana'] },
+];
+// Sınıfların dövüş profilleri — /fight ve /zindan'daki round-bazlı simülasyonda kullanılır.
+// speedMult: zırhın ağırlığına bağlı hareket hızı çarpanı (ağır zırh = yavaş ama dayanıklı)
+// physResist/magicResist: gelen hasarın kaç katı azaltılacağı (0..1 arası oran)
+// closeGapPerRound: menzil dezavantajını her round ne kadar kapattığı (mesafe kapatma)
+const CLASS_COMBAT_PROFILE = {
+  sovalye: { speedMult: 0.55, physResist: 0.35, magicResist: 0.05, closeGapPerRound: 0.35 }, // ağır zırh, çok yavaş ama fiziksele dayanıklı, mesafeyi hızla kapatır
+  nisanci: { speedMult: 1.55, physResist: 0.08, magicResist: 0.12, closeGapPerRound: 0.05 }, // hafif zırh, çok hızlı, uzaktan avantajlı ama az dayanıklı
+  buyucu:  { speedMult: 0.95, physResist: 0.08, magicResist: 0.42, closeGapPerRound: 0.15 }, // orta hız, büyüye karşı çok dirençli
+};
+function getPlayerClass(gid, uid) {
+  const r = db.prepare('SELECT class FROM rpg_class WHERE guildId=? AND userId=?').get(gid, uid);
+  return r ? r.class : null;
+}
+function setPlayerClass(gid, uid, cls) {
+  db.prepare('INSERT OR REPLACE INTO rpg_class(guildId,userId,class)VALUES(?,?,?)').run(gid, uid, cls);
+}
+function clearPlayerClass(gid, uid) {
+  db.prepare('DELETE FROM rpg_class WHERE guildId=? AND userId=?').run(gid, uid);
+}
+// Sınıf seçilmemişse (eski oyuncular / henüz seçmemişler) kısıtlama uygulanmaz.
+function classAllowsStat(cls, statKey) {
+  if (!cls) return true;
+  const def = RPG_CLASSES.find(c => c.key === cls);
+  return def ? def.stats.includes(statKey) : true;
+}
 const RPG_MAX_LEVEL      = 50;
 const RPG_MAX_STAT_LEVEL = 50;
 // Stat yükseltme maliyeti (current_level+1'e göre)
@@ -6883,7 +7122,7 @@ const PET_EGG_TYPES = [
   { key: 'kraliyet',name: 'Kraliyet Yumurtası',emoji: '👑', price: 8100, color: 0x9B59B6 },
 ];
 
-// 14 MMORPG Pet — nadirlik: 0=yaygın … 4=efsanevi
+// 27 MMORPG Pet — nadirlik: 0=yaygın … 4=efsanevi
 const MMORPG_PETS = [
   { key: 'akrep',      name: 'Akrep',            emoji: '🦂', rarity: 0, bonusType: 'attack',   bonusBase: 3,  eggPools: ['siradan','nadir'] },
   { key: 'lav_kert',   name: 'Lav Kertenkelesi', emoji: '🦎', rarity: 1, bonusType: 'defense',  bonusBase: 4,  eggPools: ['siradan','nadir','altin'] },
@@ -6906,6 +7145,14 @@ const MMORPG_PETS = [
   { key: 'buz_perisi', name: 'Buz Perisi',         emoji: '🧚', rarity: 2, bonusType: 'magic',    bonusBase: 7,  eggPools: ['nadir','altin'] },
   { key: 'simsek_kus', name: 'Şimşek Kuşu',       emoji: '⚡', rarity: 3, bonusType: 'critical', bonusBase: 11, eggPools: ['kristal','kraliyet'] },
   { key: 'deniz_canh', name: 'Deniz Canavarı',     emoji: '🐙', rarity: 2, bonusType: 'defense',  bonusBase: 7,  eggPools: ['nadir','altin'] },
+
+  // ── 6 yeni pet — mevcut nadirlik/bonus/egg pool mantığı korunarak eklendi ──
+  { key: 'buzul_ayi',    name: 'Buzul Ayısı',      emoji: '🐻‍❄️', rarity: 1, bonusType: 'defense',  bonusBase: 5,  eggPools: ['nadir','altin'] },
+  { key: 'zehir_orumcek',name: 'Zehir Örümceği',   emoji: '🕷️', rarity: 1, bonusType: 'critical', bonusBase: 4,  eggPools: ['siradan','nadir'] },
+  { key: 'firtina_sahin',name: 'Fırtına Şahini',   emoji: '🐦‍⬛', rarity: 2, bonusType: 'speed',    bonusBase: 7,  eggPools: ['altin','kristal'] },
+  { key: 'mercan_yilan', name: 'Mercan Yılanı',    emoji: '🐍', rarity: 2, bonusType: 'attack',   bonusBase: 8,  eggPools: ['altin','kristal'] },
+  { key: 'zumrut_kaplan',name: 'Zümrüt Kaplan',    emoji: '🐅', rarity: 3, bonusType: 'attack',   bonusBase: 11, eggPools: ['kristal','kraliyet'] },
+  { key: 'gokyuzu_ejder',name: 'Gökyüzü Ejderi',   emoji: '🐲', rarity: 4, bonusType: 'magic',    bonusBase: 21, eggPools: ['kraliyet'] },
 ];
 const MMO_PET_MAX_LEVEL    = 10;
 const MMO_PET_BONUS_PER_LV = 5; // her seviyede +5%
@@ -6942,18 +7189,18 @@ const MMORPG_CHESTS = [
 // Yumurta craft reçeteleri (top-level: hem handleCraftCommand hem autocomplete kullanır)
 const CRAFT_EGG_RECIPES = {
   siradan:  { demir_cevheri: 6, bakir_cevheri: 3 },
-  nadir:    { altin_cevheri: 5, obsidyen: 2 },
-  altin:    { saf_kristal: 3, altin_cevheri: 6, elmas_cevheri: 2 },
-  kristal:  { saf_kristal: 6, ejder_pulu: 3, elmas_cevheri: 3 },
-  kraliyet: { ejder_pulu: 9, ay_tasi: 3, gunes_parcasi: 3, karanlik_oz: 2 },
+  nadir:    { altin_cevheri: 5, obsidyen: 1 },
+  altin:    { saf_kristal: 2, altin_cevheri: 6, elmas_cevheri: 1 },
+  kristal:  { saf_kristal: 4, ejder_pulu: 2, elmas_cevheri: 2 },
+  kraliyet: { ejder_pulu: 6, ay_tasi: 3, gunes_parcasi: 3, karanlik_oz: 2 },
 };
 // Sandık craft reçeteleri (top-level: hem handleCraftCommand hem autocomplete kullanır)
 const CRAFT_SANDIK_RECIPES = {
   ahsap:    { demir_cevheri: 5 },
-  demir:    { demir_cevheri: 9, obsidyen: 3 },
-  altin:    { altin_cevheri: 6, saf_kristal: 3 },
-  elmas:    { elmas_cevheri: 5, saf_kristal: 5, ejder_pulu: 2 },
-  kraliyet: { ejder_pulu: 6, ay_tasi: 3, karanlik_oz: 3 },
+  demir:    { demir_cevheri: 9, obsidyen: 2 },
+  altin:    { altin_cevheri: 6, saf_kristal: 2 },
+  elmas:    { elmas_cevheri: 4, saf_kristal: 4, ejder_pulu: 1 },
+  kraliyet: { ejder_pulu: 4, ay_tasi: 3, karanlik_oz: 3 },
 };
 
 // Sandıktan çıkabilecek ödüller — tier'a göre ağırlıklar farklı
@@ -7058,6 +7305,31 @@ const CRAFT_MATERIALS = [
 ];
 
 // ─────────────────────────────────────────────────────────────────────────
+//  GELİŞMİŞ CRAFT MALZEMELERİ (madenden DÜŞMEZ — yalnızca /craft ile üretilir)
+// ─────────────────────────────────────────────────────────────────────────
+// Bu 4 malzeme hiçbir maden/zindan/sandık drop tablosunda yer almaz; tek elde
+// etme yolu `/craft kategori:malzeme` ile yukarıdaki tier-4 cevherlerden
+// üretmektir. Her biri, tek bir S tier (Ejder) kılıç üretmek için gereken
+// toplam malzeme miktarına (180 adet) eşit zorlukta craftlanır — yani "kolay
+// bulunan" bir şey değil, başlı başına ağır bir üretim hedefi.
+// Kullanım alanları: SSS tier silah/zırh/relic set üretiminde (2-3 adet) VE
+// +5'ten sonraki her ekipman geliştirmesinde (bkz. ADVANCED_ENHANCEMENT_MAT_COST).
+const ADVANCED_CRAFT_MATERIALS = [
+  // NOT: Bu 4 malzemenin tüm reçete miktarları kullanıcı isteğiyle +%15 daha
+  // kolaylaştırıldı (craftlamak çok zordu) — aşağıdaki sayılar bu ekstra
+  // %15 indirimi zaten içeriyor.
+  { key: 'kaos_ozu',        name: 'Kaos Özü',        emoji: '🌀', tier: 5, sellValue: 90, advanced: true,
+    craft: { ejder_pulu: 30, karanlik_oz: 43, obsidyen: 24, saf_kristal: 24 } },
+  { key: 'zaman_kumu',      name: 'Zaman Kumu',      emoji: '⏳', tier: 5, sellValue: 90, advanced: true,
+    craft: { ay_tasi: 43, gunes_parcasi: 43, elmas_cevheri: 24, saf_kristal: 24 } },
+  { key: 'yildiz_tozu',     name: 'Yıldız Tozu',     emoji: '🌠', tier: 5, sellValue: 90, advanced: true,
+    craft: { yildirim_kristali: 43, buz_cekirdegi: 43, ejder_pulu: 24, altin_cevheri: 34 } },
+  { key: 'kozmik_kristal',  name: 'Kozmik Kristal',  emoji: '💠', tier: 5, sellValue: 90, advanced: true,
+    craft: { elmas_cevheri: 30, saf_kristal: 30, ruh_tozu: 34, lav_tasi: 34 } },
+];
+const ADVANCED_MAT_KEYS = ADVANCED_CRAFT_MATERIALS.map(m => m.key);
+
+// ─────────────────────────────────────────────────────────────────────────
 //  MMORPG SABİTLERİ — Silahlar
 // ─────────────────────────────────────────────────────────────────────────
 const WEAPON_TYPES = [
@@ -7067,8 +7339,19 @@ const WEAPON_TYPES = [
   { key: 'hancer',   name: 'Çift Hançer', emoji: '🗡️', stat: 'speed'    },
   { key: 'tirpan',   name: 'Tırpan',      emoji: '🪃', stat: 'attack'   },
 ];
-// Tier harfleri: E (en düşük) < C < B < A < S (en nadir/en güçlü)
-const GEAR_GRADE_MULTIPLIER = { E: 1.0, C: 1.3, B: 1.7, A: 2.3, S: 3.2 };
+// Silah tipi taban saldırı hızı — /fight'ta menzil/inisiyatif hesabında kullanılır.
+// Yay uzaktan başlar (en hızlı), kılıç/tırpan mesafe kapatması gereken ağır silahlar (en yavaş).
+const WEAPON_SPEED_BASE = {
+  yay:    2.0,
+  hancer: 1.6,
+  asa:    1.3,
+  kilic:  1.0,
+  tirpan: 0.8,
+};
+// Tier harfleri: E (en düşük) < C < B < A < S < SSS (Godslayer, en nadir/en güçlü)
+const GEAR_GRADE_MULTIPLIER = { E: 1.0, C: 1.3, B: 1.7, A: 2.3, S: 3.2, SSS: 3.2 };
+// Tier arttıkça silahın vuruş hızı da artar (daha iyi işçilik = daha çevik silah)
+const TIER_SPEED_MULT = { deri: 1.0, demir: 1.1, altin: 1.2, kristal: 1.35, ejder: 1.5, godslayer: 1.65 };
 // Her +1 geliştirme seviyesi taban gücü/savunmayı %10 artırır (+10 → +%100)
 const GEAR_ENHANCEMENT_BONUS_PER_LV = 0.10;
 const WEAPON_TIERS = [
@@ -7076,12 +7359,19 @@ const WEAPON_TIERS = [
     craft: { demir_cevheri: 5 },              canBuy: true  },
   { key: 'demir',   name: 'Demir',   grade: 'C', emoji: '⚙️',  power: 12, price: 3500,
     craft: { demir_cevheri: 10, bakir_cevheri: 5 }, canBuy: true  },
+  // B tier — 3 kat zorlaştırıldı
   { key: 'altin',   name: 'Altın',   grade: 'B', emoji: '🥇', power: 22, price: 0,
-    craft: { altin_cevheri: 8, demir_cevheri: 5, obsidyen: 3 }, canBuy: false },
+    craft: { altin_cevheri: 24, demir_cevheri: 15, obsidyen: 6 }, canBuy: false },
+  // A tier — 4 kat zorlaştırıldı
   { key: 'kristal', name: 'Kristal', grade: 'A', emoji: '💎', power: 35, price: 0,
-    craft: { saf_kristal: 10, altin_cevheri: 8, elmas_cevheri: 5 }, canBuy: false },
+    craft: { saf_kristal: 28, altin_cevheri: 32, elmas_cevheri: 14 }, canBuy: false },
+  // S tier — 6 kat zorlaştırıldı
   { key: 'ejder',   name: 'Ejder',   grade: 'S', emoji: '🐉', power: 55, price: 0,
-    craft: { ejder_pulu: 10, elmas_cevheri: 10, obsidyen: 5, saf_kristal: 5 }, canBuy: false },
+    craft: { ejder_pulu: 42, elmas_cevheri: 42, obsidyen: 21, saf_kristal: 21 }, canBuy: false },
+  // SSS tier — GODSLAYER: S tier'den %50 daha güçlü, S tier'in (zorlaştırılmış) maliyetinden 10 kat daha zor
+  // Ayrıca 3 adet gelişmiş (yalnızca craftlanan) malzeme gerektirir — bkz. ADVANCED_CRAFT_MATERIALS.
+  { key: 'godslayer', name: 'Godslayer', grade: 'SSS', emoji: '👑', power: 83, price: 0,
+    craft: { ejder_pulu: 420, elmas_cevheri: 420, obsidyen: 210, saf_kristal: 210, kaos_ozu: 2, zaman_kumu: 1 }, canBuy: false },
 ];
 
 // weaponKey formatı: `{type}_{tier}` örn: `kilic_altin`
@@ -7111,26 +7401,49 @@ function getWeaponBattlePower(weaponKey, enhancement = 0) {
 // ─────────────────────────────────────────────────────────────────────────
 //  MMORPG SABİTLERİ — Zırh
 // ─────────────────────────────────────────────────────────────────────────
+// Zırh slot tier'i — /fight'ta ekstra bir güç çarpanı katıyor (bkz. ARMOR_SLOT_TIER_MULT).
+// Büyücü'nün eskiden tek zırh slotu (kolye) vardı; dengelemek için hem yeni slotlar
+// eklendi hem de kolye'ye en yüksek tier (SSS) verildi.
+const ARMOR_SLOT_TIER_MULT = { B: 1.10, A: 1.25, S: 1.45, SSS: 1.75, cope: 1.0 };
 const ARMOR_SLOTS = [
-  { key: 'miğfer',    name: 'Miğfer',    emoji: '⛑️',  stat: 'defense' },
-  { key: 'gogusulk',  name: 'Göğüslük',  emoji: '🛡️', stat: 'hp'      },
-  { key: 'eldiven',   name: 'Eldiven',   emoji: '🧤', stat: 'attack'  },
-  { key: 'pantolon',  name: 'Pantolon',  emoji: '👖', stat: 'speed'   },
-  { key: 'bot',       name: 'Bot',       emoji: '👢', stat: 'speed'   },
-  { key: 'yuzuk',     name: 'Yüzük',     emoji: '💍', stat: 'critical'},
-  { key: 'kolye',     name: 'Kolye',     emoji: '📿', stat: 'mana'    },
+  // ── Orijinal 7 slot — B/A/S/SSS olarak tierlendirildi (3B/3A/3S/3SSS kotasının parçası) ──
+  { key: 'miğfer',    name: 'Miğfer',    emoji: '⛑️',  stat: 'defense', tier: 'B'   },
+  { key: 'gogusulk',  name: 'Göğüslük',  emoji: '🛡️', stat: 'hp',      tier: 'B'   },
+  { key: 'eldiven',   name: 'Eldiven',   emoji: '🧤', stat: 'attack',  tier: 'B'   },
+  { key: 'pantolon',  name: 'Pantolon',  emoji: '👖', stat: 'speed',   tier: 'A'   },
+  { key: 'bot',       name: 'Bot',       emoji: '👢', stat: 'speed',   tier: 'A'   },
+  { key: 'yuzuk',     name: 'Yüzük',     emoji: '💍', stat: 'critical',tier: 'S'   },
+  { key: 'kolye',     name: 'Kolye',     emoji: '📿', stat: 'mana',    tier: 'SSS' }, // Büyücü'nün TEK slotu — kotayı dengelemek için SSS verildi
+  // ── 10 yeni slot — sınıf slot sayılarını dengelemek için eklendi (sovalye+3, nisanci+3, buyucu+4) ──
+  { key: 'pelerin',   name: 'Pelerin',    emoji: '🧥', stat: 'defense', tier: 'cope' }, // sovalye
+  { key: 'kalkan',    name: 'Kalkan',     emoji: '🛡️', stat: 'attack',  tier: 'cope' }, // sovalye
+  { key: 'kemer',     name: 'Kemer',      emoji: '🥋', stat: 'hp',      tier: 'cope' }, // sovalye
+  { key: 'sadak',     name: 'Sadak',      emoji: '🏹', stat: 'speed',   tier: 'cope' }, // nişancı
+  { key: 'pence',     name: 'Pençelik',   emoji: '🧤', stat: 'critical',tier: 'cope' }, // nişancı
+  { key: 'gozluk',    name: 'Nişan Gözlüğü', emoji: '🥽', stat: 'speed', tier: 'cope' }, // nişancı
+  { key: 'asakini',   name: 'Asa Kını',   emoji: '🪄', stat: 'magic',   tier: 'cope' }, // büyücü
+  { key: 'buyucubaget', name: 'Büyücü Çubuğu', emoji: '✨', stat: 'magic', tier: 'cope' }, // büyücü
+  { key: 'muskalik',  name: 'Muskalık',   emoji: '🧿', stat: 'mana',    tier: 'cope' }, // büyücü
+  { key: 'buyukitap', name: 'Büyü Kitabı', emoji: '📖', stat: 'mana', tier: 'cope' }, // büyücü
 ];
 const ARMOR_TIERS = [
   { key: 'deri',    name: 'Deri',    grade: 'E', emoji: '🥉', defense: 3,  price: 1200,
     craft: { demir_cevheri: 3 },                canBuy: true  },
   { key: 'demir',   name: 'Demir',   grade: 'C', emoji: '⚙️',  defense: 7,  price: 2800,
     craft: { demir_cevheri: 8 },                canBuy: true  },
+  // B tier — 3 kat zorlaştırıldı
   { key: 'altin',   name: 'Altın',   grade: 'B', emoji: '🥇', defense: 13, price: 0,
-    craft: { altin_cevheri: 6, demir_cevheri: 4 }, canBuy: false },
+    craft: { altin_cevheri: 18, demir_cevheri: 12 }, canBuy: false },
+  // A tier — 4 kat zorlaştırıldı
   { key: 'kristal', name: 'Kristal', grade: 'A', emoji: '💎', defense: 22, price: 0,
-    craft: { saf_kristal: 8, altin_cevheri: 5 }, canBuy: false },
+    craft: { saf_kristal: 22, altin_cevheri: 20 }, canBuy: false },
+  // S tier — 6 kat zorlaştırıldı
   { key: 'ejder',   name: 'Ejder',   grade: 'S', emoji: '🐉', defense: 35, price: 0,
-    craft: { ejder_pulu: 8, elmas_cevheri: 8, saf_kristal: 4 }, canBuy: false },
+    craft: { ejder_pulu: 34, elmas_cevheri: 34, saf_kristal: 17 }, canBuy: false },
+  // SSS tier — GODSLAYER: S tier'den %50 daha güçlü, S tier'in (zorlaştırılmış) maliyetinden 10 kat daha zor
+  // Ayrıca 3 adet gelişmiş (yalnızca craftlanan) malzeme gerektirir — bkz. ADVANCED_CRAFT_MATERIALS.
+  { key: 'godslayer', name: 'Godslayer', grade: 'SSS', emoji: '👑', defense: 53, price: 0,
+    craft: { ejder_pulu: 336, elmas_cevheri: 336, saf_kristal: 168, kozmik_kristal: 2, yildiz_tozu: 1 }, canBuy: false },
 ];
 
 // armorKey formatı: `{slot}_{tier}` örn: `miğfer_altin`
@@ -7141,11 +7454,13 @@ function getArmorName(slotKey, tierKey) {
   return `[${tier.grade}] ${tier.emoji} ${tier.name} ${slot.emoji} ${slot.name}`;
 }
 // Dövüş gücü: taban savunma × tier'ın nadirlik çarpanı (E/C/B/A/S) × geliştirme bonusu
-function getArmorBattlePower(tierKey, enhancement = 0) {
+function getArmorBattlePower(tierKey, enhancement = 0, slotKey = null) {
   const tier = ARMOR_TIERS.find(t => t.key === tierKey);
   if (!tier) return 0;
   const mult = GEAR_GRADE_MULTIPLIER[tier.grade] || 1;
-  return Math.round(tier.defense * mult * (1 + enhancement * GEAR_ENHANCEMENT_BONUS_PER_LV));
+  const slot = slotKey ? ARMOR_SLOTS.find(s => s.key === slotKey) : null;
+  const slotMult = slot ? (ARMOR_SLOT_TIER_MULT[slot.tier] || 1) : 1;
+  return Math.round(tier.defense * mult * slotMult * (1 + enhancement * GEAR_ENHANCEMENT_BONUS_PER_LV));
 }
 
 // ─────────────────────────────────────────────────────────────────────────
@@ -7157,6 +7472,19 @@ const ENHANCEMENT_COIN_COST = [500, 800, 1200, 1800, 2500, 3500, 5000, 7000, 100
 // Başarısızlıkta kaybedilen craft malzemesi (tier bazlı)
 const ENHANCEMENT_MAT_COST = { demir_cevheri: 3, altin_cevheri: 2, saf_kristal: 1 };
 
+// +5'ten SONRAKİ her geliştirme (yani +5→+6, +6→+7, ... +9→+10) ayrıca
+// yukarıdaki ADVANCED_CRAFT_MATERIALS'tan da malzeme ister (madenden düşmez,
+// yalnızca /craft kategori:malzeme ile üretilir). Anahtar = mevcut seviye
+// (yükseltmenin BAŞLADIĞI seviye, enh), değer = gereken adet (1-3 arası,
+// seviye arttıkça zorlaşır). Kullanılan malzeme türü seviyeye göre döner.
+const ADVANCED_ENHANCEMENT_MAT_COST = { 5: 1, 6: 1, 7: 2, 8: 2, 9: 3 };
+function getAdvancedEnhanceRequirement(enh) {
+  if (enh < 5) return null;
+  const qty = ADVANCED_ENHANCEMENT_MAT_COST[enh] || 3;
+  const matKey = ADVANCED_MAT_KEYS[enh % ADVANCED_MAT_KEYS.length];
+  return { [matKey]: qty };
+}
+
 // ─────────────────────────────────────────────────────────────────────────
 //  MMORPG SABİTLERİ — Yeni Relic Setleri
 // ─────────────────────────────────────────────────────────────────────────
@@ -7165,76 +7493,290 @@ const ENHANCEMENT_MAT_COST = { demir_cevheri: 3, altin_cevheri: 2, saf_kristal: 
 // hesaba katılacağını sınırlar. Kuşanma: /relic-set ekranındaki
 // "Kuşan"/"Çıkar" butonları (mmo_equipset_ / mmo_unequipset_).
 const RELIC_SET_MAX_EQUIPPED = 2;
+// Parça fiyatı — artık tüm tier'lerde eşit (satın alma yerine craftlamayı özendirmek için).
+// Tüm tier'ler artık aynı fiyatta: 6 parça × 20.000 = set başına 120.000 coin.
+// Amaç: satın almayı caydırıp herkesi craftlamaya (bkz. getRelicSetCraftRecipe) yönlendirmek.
+const RELIC_TIER_PRICE = { B: 20000, A: 20000, S: 20000, SSS: 20000 };
+// Tam set craft reçetesi — kılıç (WEAPON_TIERS) craft reçetesinden örnek alınır,
+// aynı tier'in kılıcına göre %60 DAHA ZOR (×1.6) olacak şekilde ölçeklenir.
+// SSS tier setler ayrıca 2-3 adet gelişmiş (yalnızca craftlanan) malzeme ister.
+const RELIC_SET_TIER_TO_WEAPON_TIER = { B: 'altin', A: 'kristal', S: 'ejder', SSS: 'godslayer' };
+const RELIC_SET_CRAFT_HARDER_MULT = 1.6;
+function getRelicSetCraftRecipe(tierGrade) {
+  const wKey  = RELIC_SET_TIER_TO_WEAPON_TIER[tierGrade];
+  const wTier = WEAPON_TIERS.find(t => t.key === wKey);
+  if (!wTier) return {};
+  const recipe = {};
+  for (const [mat, qty] of Object.entries(wTier.craft)) {
+    // Kılıcın kendi gelişmiş malzeme gereksinimi varsa (godslayer) onu da
+    // aynı ×1.6 oranıyla ölçekle; yoksa aşağıda ayrıca ekleniyor.
+    recipe[mat] = Math.ceil(qty * RELIC_SET_CRAFT_HARDER_MULT);
+  }
+  if (tierGrade === 'SSS') {
+    // 2-3 adet gelişmiş malzeme şartı (godslayer kılıcınkinden bağımsız, sete özel)
+    recipe.kaos_ozu       = (recipe.kaos_ozu || 0) + 1;
+    recipe.kozmik_kristal = (recipe.kozmik_kristal || 0) + 1;
+    recipe.yildiz_tozu    = (recipe.yildiz_tozu || 0) + 1;
+  }
+  return recipe;
+}
+// 6 parçalı bir seti tek satırda üretir — Lav/Buz/Fırtına/Gölge/Güneş ile
+// aynı isimlendirme kalıbını (Tacı/Kolyesi/Yüzüğü/Kristali/Mührü/Çekirdeği) kullanır.
+function mkRelicPieces(prefix, theme, emoji, price) {
+  return [
+    { key: `${prefix}_tac`,      name: `${theme} Tacı`,      price, emoji },
+    { key: `${prefix}_kolye`,    name: `${theme} Kolyesi`,   price, emoji },
+    { key: `${prefix}_yuzuk`,    name: `${theme} Yüzüğü`,    price, emoji },
+    { key: `${prefix}_kristal`,  name: `${theme} Kristali`,  price, emoji },
+    { key: `${prefix}_muhur`,    name: `${theme} Mührü`,     price, emoji },
+    { key: `${prefix}_cekirdek`, name: `${theme} Çekirdeği`, price, emoji },
+  ];
+}
 const RELIC_SETS = {
   lav: {
-    name: 'Lav Seti', emoji: '🌋', color: 0xFF4500,
+    name: 'Lav Seti', emoji: '🌋', color: 0xFF4500, tier: 'A',
     pieces: [
-      { key: 'lav_tac',      name: 'Lav Tacı',      price: 8000, emoji: '🌋' },
-      { key: 'lav_kolye',    name: 'Lav Kolyesi',   price: 8000, emoji: '🌋' },
-      { key: 'lav_yuzuk',    name: 'Lav Yüzüğü',   price: 8000, emoji: '🌋' },
-      { key: 'lav_kristal',  name: 'Lav Kristali',  price: 8000, emoji: '🌋' },
-      { key: 'lav_muhur',    name: 'Lav Mührü',     price: 8000, emoji: '🌋' },
-      { key: 'lav_cekirdek', name: 'Lav Çekirdeği', price: 8000, emoji: '🌋' },
+      { key: 'lav_tac',      name: 'Lav Tacı',      price: 20000, emoji: '🌋' },
+      { key: 'lav_kolye',    name: 'Lav Kolyesi',   price: 20000, emoji: '🌋' },
+      { key: 'lav_yuzuk',    name: 'Lav Yüzüğü',   price: 20000, emoji: '🌋' },
+      { key: 'lav_kristal',  name: 'Lav Kristali',  price: 20000, emoji: '🌋' },
+      { key: 'lav_muhur',    name: 'Lav Mührü',     price: 20000, emoji: '🌋' },
+      { key: 'lav_cekirdek', name: 'Lav Çekirdeği', price: 20000, emoji: '🌋' },
     ],
     bonus2: { desc: '+%10 Coin kazanımı',                       coinPct: 10 },
     bonus4: { desc: '+%20 Coin & +%8 XP kazanımı',              coinPct: 20, xpPct: 8 },
     bonusFull: { desc: '+%35 Coin & +%15 XP & Zindan coin +%25', coinPct: 35, xpPct: 15, dungeonCoinPct: 25 },
   },
   buz: {
-    name: 'Buz Seti', emoji: '❄️', color: 0x00BFFF,
+    name: 'Buz Seti', emoji: '❄️', color: 0x00BFFF, tier: 'S',
     pieces: [
-      { key: 'buz_tac',      name: 'Buz Tacı',      price: 8000, emoji: '❄️' },
-      { key: 'buz_kolye',    name: 'Buz Kolyesi',   price: 8000, emoji: '❄️' },
-      { key: 'buz_yuzuk',    name: 'Buz Yüzüğü',   price: 8000, emoji: '❄️' },
-      { key: 'buz_kristal',  name: 'Buz Kristali',  price: 8000, emoji: '❄️' },
-      { key: 'buz_muhur',    name: 'Buz Mührü',     price: 8000, emoji: '❄️' },
-      { key: 'buz_cekirdek', name: 'Buz Çekirdeği', price: 8000, emoji: '❄️' },
+      { key: 'buz_tac',      name: 'Buz Tacı',      price: 20000, emoji: '❄️' },
+      { key: 'buz_kolye',    name: 'Buz Kolyesi',   price: 20000, emoji: '❄️' },
+      { key: 'buz_yuzuk',    name: 'Buz Yüzüğü',   price: 20000, emoji: '❄️' },
+      { key: 'buz_kristal',  name: 'Buz Kristali',  price: 20000, emoji: '❄️' },
+      { key: 'buz_muhur',    name: 'Buz Mührü',     price: 20000, emoji: '❄️' },
+      { key: 'buz_cekirdek', name: 'Buz Çekirdeği', price: 20000, emoji: '❄️' },
     ],
-    bonus2: { desc: '+%10 XP kazanımı',                         xpPct: 10 },
-    bonus4: { desc: '+%20 XP & +%8 Coin kazanımı',              xpPct: 20, coinPct: 8 },
-    bonusFull: { desc: '+%35 XP & +%15 Coin & Zindan XP +%25',  xpPct: 35, coinPct: 15, dungeonXpPct: 25 },
+    bonus2: { desc: '+%13 XP kazanımı',                         xpPct: 13 },
+    bonus4: { desc: '+%26 XP & +%10 Coin kazanımı',             xpPct: 26, coinPct: 10 },
+    bonusFull: { desc: '+%46 XP & +%20 Coin & Zindan XP +%32',  xpPct: 46, coinPct: 20, dungeonXpPct: 32 },
   },
   firtina: {
-    name: 'Fırtına Seti', emoji: '⚡', color: 0xF1C40F,
+    name: 'Fırtına Seti', emoji: '⚡', color: 0xF1C40F, tier: 'S',
     pieces: [
-      { key: 'firtina_tac',      name: 'Fırtına Tacı',      price: 8000, emoji: '⚡' },
-      { key: 'firtina_kolye',    name: 'Fırtına Kolyesi',   price: 8000, emoji: '⚡' },
-      { key: 'firtina_yuzuk',    name: 'Fırtına Yüzüğü',   price: 8000, emoji: '⚡' },
-      { key: 'firtina_kristal',  name: 'Fırtına Kristali',  price: 8000, emoji: '⚡' },
-      { key: 'firtina_muhur',    name: 'Fırtına Mührü',     price: 8000, emoji: '⚡' },
-      { key: 'firtina_cekirdek', name: 'Fırtına Çekirdeği', price: 8000, emoji: '⚡' },
+      { key: 'firtina_tac',      name: 'Fırtına Tacı',      price: 20000, emoji: '⚡' },
+      { key: 'firtina_kolye',    name: 'Fırtına Kolyesi',   price: 20000, emoji: '⚡' },
+      { key: 'firtina_yuzuk',    name: 'Fırtına Yüzüğü',   price: 20000, emoji: '⚡' },
+      { key: 'firtina_kristal',  name: 'Fırtına Kristali',  price: 20000, emoji: '⚡' },
+      { key: 'firtina_muhur',    name: 'Fırtına Mührü',     price: 20000, emoji: '⚡' },
+      { key: 'firtina_cekirdek', name: 'Fırtına Çekirdeği', price: 20000, emoji: '⚡' },
     ],
-    bonus2: { desc: '+%10 Kritik şansı (zindan/boss)',            critPct: 10 },
-    bonus4: { desc: '+%20 Kritik & +%10 Günlük bonus',            critPct: 20, dailyPct: 10 },
-    bonusFull: { desc: '+%35 Kritik & +%20 Günlük & Slot +%15',   critPct: 35, dailyPct: 20, slotPct: 15 },
+    bonus2: { desc: '+%13 Kritik şansı (zindan/boss)',            critPct: 13 },
+    bonus4: { desc: '+%26 Kritik & +%13 Günlük bonus',            critPct: 26, dailyPct: 13 },
+    bonusFull: { desc: '+%46 Kritik & +%26 Günlük & Slot +%20',   critPct: 46, dailyPct: 26, slotPct: 20 },
   },
   golge: {
-    name: 'Gölge Seti', emoji: '🌑', color: 0x2C3E50,
+    name: 'Gölge Seti', emoji: '🌑', color: 0x2C3E50, tier: 'SSS',
     pieces: [
-      { key: 'golge_tac',      name: 'Gölge Tacı',      price: 8000, emoji: '🌑' },
-      { key: 'golge_kolye',    name: 'Gölge Kolyesi',   price: 8000, emoji: '🌑' },
-      { key: 'golge_yuzuk',    name: 'Gölge Yüzüğü',   price: 8000, emoji: '🌑' },
-      { key: 'golge_kristal',  name: 'Gölge Kristali',  price: 8000, emoji: '🌑' },
-      { key: 'golge_muhur',    name: 'Gölge Mührü',     price: 8000, emoji: '🌑' },
-      { key: 'golge_cekirdek', name: 'Gölge Çekirdeği', price: 8000, emoji: '🌑' },
+      { key: 'golge_tac',      name: 'Gölge Tacı',      price: 20000, emoji: '🌑' },
+      { key: 'golge_kolye',    name: 'Gölge Kolyesi',   price: 20000, emoji: '🌑' },
+      { key: 'golge_yuzuk',    name: 'Gölge Yüzüğü',   price: 20000, emoji: '🌑' },
+      { key: 'golge_kristal',  name: 'Gölge Kristali',  price: 20000, emoji: '🌑' },
+      { key: 'golge_muhur',    name: 'Gölge Mührü',     price: 20000, emoji: '🌑' },
+      { key: 'golge_cekirdek', name: 'Gölge Çekirdeği', price: 20000, emoji: '🌑' },
     ],
-    bonus2: { desc: '+%10 Hırsızlık başarı şansı',               stealPct: 10 },
-    bonus4: { desc: '+%20 Hırsızlık & +%10 Madencilik satışı',   stealPct: 20, minePct: 10 },
-    bonusFull: { desc: '+%35 Hırsızlık & +%20 Madencilik & Boss drop +%20', stealPct: 35, minePct: 20, bossPct: 20 },
+    bonus2: { desc: '+%16 Hırsızlık başarı şansı',               stealPct: 16 },
+    bonus4: { desc: '+%32 Hırsızlık & +%16 Madencilik satışı',   stealPct: 32, minePct: 16 },
+    bonusFull: { desc: '+%56 Hırsızlık & +%32 Madencilik & Boss drop +%32', stealPct: 56, minePct: 32, bossPct: 32 },
   },
   gunes: {
-    name: 'Güneş Seti', emoji: '☀️', color: 0xFFD700,
+    name: 'Güneş Seti', emoji: '☀️', color: 0xFFD700, tier: 'SSS',
     pieces: [
-      { key: 'gunes_tac',      name: 'Güneş Tacı',      price: 8000, emoji: '☀️' },
-      { key: 'gunes_kolye',    name: 'Güneş Kolyesi',   price: 8000, emoji: '☀️' },
-      { key: 'gunes_yuzuk',    name: 'Güneş Yüzüğü',   price: 8000, emoji: '☀️' },
-      { key: 'gunes_kristal',  name: 'Güneş Kristali',  price: 8000, emoji: '☀️' },
-      { key: 'gunes_muhur',    name: 'Güneş Mührü',     price: 8000, emoji: '☀️' },
-      { key: 'gunes_cekirdek', name: 'Güneş Çekirdeği', price: 8000, emoji: '☀️' },
+      { key: 'gunes_tac',      name: 'Güneş Tacı',      price: 20000, emoji: '☀️' },
+      { key: 'gunes_kolye',    name: 'Güneş Kolyesi',   price: 20000, emoji: '☀️' },
+      { key: 'gunes_yuzuk',    name: 'Güneş Yüzüğü',   price: 20000, emoji: '☀️' },
+      { key: 'gunes_kristal',  name: 'Güneş Kristali',  price: 20000, emoji: '☀️' },
+      { key: 'gunes_muhur',    name: 'Güneş Mührü',     price: 20000, emoji: '☀️' },
+      { key: 'gunes_cekirdek', name: 'Güneş Çekirdeği', price: 20000, emoji: '☀️' },
     ],
-    bonus2: { desc: '+%10 Balıkçılık değeri',                     fishPct: 10 },
-    bonus4: { desc: '+%20 Balıkçılık & +%10 Odunculuk satışı',    fishPct: 20, woodPct: 10 },
-    bonusFull: { desc: '+%35 Balık & +%20 Odunculuk & Pet XP +%25', fishPct: 35, woodPct: 20, petXpPct: 25 },
+    bonus2: { desc: '+%16 Balıkçılık değeri',                     fishPct: 16 },
+    bonus4: { desc: '+%32 Balıkçılık & +%16 Odunculuk satışı',    fishPct: 32, woodPct: 16 },
+    bonusFull: { desc: '+%56 Balık & +%32 Odunculuk & Pet XP +%40', fishPct: 56, woodPct: 32, petXpPct: 40 },
+  },
+
+  // ── 10 ek relic seti — düzgün isimlendirildi ve gerçek tier'lere (B/A/S/SSS)
+  // dağıtıldı. Fiyat ve bonus büyüklüğü, silah/zırh tier sistemindeki (WEAPON_TIERS/
+  // GEAR_GRADE_MULTIPLIER) mantıkla aynı doğrultuda tier arttıkça büyüyor:
+  //   B  → bonus2:%7  | bonus4:%14 (+%6)  | bonusFull:%25 (+%10 +%10) | fiyat 120.000 (set)
+  //   A  → bonus2:%10 | bonus4:%20 (+%8)  | bonusFull:%35 (+%15 +%15) | fiyat 120.000 (set)
+  //   S  → bonus2:%13 | bonus4:%26 (+%11) | bonusFull:%46 (+%21 +%21) | fiyat 120.000 (set)
+  //   SSS→ bonus2:%16 | bonus4:%32 (+%14) | bonusFull:%56 (+%27 +%27) | fiyat 120.000 (set)
+  // Dağılım: B=Toprak,Ay,Demir(3) • A=Rüzgar,Su,Yıldız(3) • S=Zehir,Kan(2) • SSS=Elmas,Altın(2)
+  toprak: {
+    name: 'Toprak Seti', emoji: '🪨', color: 0x8B5A2B, tier: 'B',
+    pieces: mkRelicPieces('toprak', 'Toprak', '🪨', RELIC_TIER_PRICE.B),
+    bonus2: { desc: '+%7 Madencilik satışı', minePct: 7 },
+    bonus4: { desc: '+%14 Madencilik satışı & +%6 Coin', minePct: 14, coinPct: 6 },
+    bonusFull: { desc: '+%25 Madencilik satışı & +%10 Coin & Boss drop +%10', minePct: 25, coinPct: 10, bossPct: 10 },
+  },
+  ay: {
+    name: 'Ay Seti', emoji: '🌙', color: 0x5D6D7E, tier: 'B',
+    pieces: mkRelicPieces('ay', 'Ay', '🌙', RELIC_TIER_PRICE.B),
+    bonus2: { desc: '+%7 Slot kazancı', slotPct: 7 },
+    bonus4: { desc: '+%14 Slot & +%6 Coin', slotPct: 14, coinPct: 6 },
+    bonusFull: { desc: '+%25 Slot & +%10 Coin & Madencilik +%10', slotPct: 25, coinPct: 10, minePct: 10 },
+  },
+  demirset: {
+    name: 'Demir Seti', emoji: '⚙️', color: 0x7F8C8D, tier: 'B',
+    pieces: mkRelicPieces('dmrset', 'Demir', '⚙️', RELIC_TIER_PRICE.B),
+    bonus2: { desc: '+%7 Pet XP', petXpPct: 7 },
+    bonus4: { desc: '+%14 Pet XP & +%6 XP', petXpPct: 14, xpPct: 6 },
+    bonusFull: { desc: '+%25 Pet XP & +%10 XP & Odunculuk +%10', petXpPct: 25, xpPct: 10, woodPct: 10 },
+  },
+  ruzgar: {
+    name: 'Rüzgar Seti', emoji: '🌪️', color: 0x87CEEB, tier: 'A',
+    pieces: mkRelicPieces('ruzgar', 'Rüzgar', '🌪️', RELIC_TIER_PRICE.A),
+    bonus2: { desc: '+%10 Odunculuk satışı', woodPct: 10 },
+    bonus4: { desc: '+%20 Odunculuk & +%8 XP', woodPct: 20, xpPct: 8 },
+    bonusFull: { desc: '+%35 Odunculuk & +%15 XP & Pet XP +%15', woodPct: 35, xpPct: 15, petXpPct: 15 },
+  },
+  su: {
+    name: 'Su Seti', emoji: '🌊', color: 0x1E90FF, tier: 'A',
+    pieces: mkRelicPieces('su', 'Su', '🌊', RELIC_TIER_PRICE.A),
+    bonus2: { desc: '+%10 Balıkçılık değeri', fishPct: 10 },
+    bonus4: { desc: '+%20 Balıkçılık & +%8 XP', fishPct: 20, xpPct: 8 },
+    bonusFull: { desc: '+%35 Balıkçılık & +%15 XP & Zindan coin +%15', fishPct: 35, xpPct: 15, dungeonCoinPct: 15 },
+  },
+  yildiz: {
+    name: 'Yıldız Seti', emoji: '⭐', color: 0xF39C12, tier: 'A',
+    pieces: mkRelicPieces('yildiz', 'Yıldız', '⭐', RELIC_TIER_PRICE.A),
+    bonus2: { desc: '+%10 Günlük bonus', dailyPct: 10 },
+    bonus4: { desc: '+%20 Günlük & +%8 XP', dailyPct: 20, xpPct: 8 },
+    bonusFull: { desc: '+%35 Günlük & +%15 XP & Zindan XP +%15', dailyPct: 35, xpPct: 15, dungeonXpPct: 15 },
+  },
+  zehir: {
+    name: 'Zehir Seti', emoji: '☠️', color: 0x2ECC71, tier: 'S',
+    pieces: mkRelicPieces('zehir', 'Zehir', '☠️', RELIC_TIER_PRICE.S),
+    bonus2: { desc: '+%13 Hırsızlık başarı şansı', stealPct: 13 },
+    bonus4: { desc: '+%26 Hırsızlık & +%11 Kritik', stealPct: 26, critPct: 11 },
+    bonusFull: { desc: '+%46 Hırsızlık & +%21 Kritik & Slot +%21', stealPct: 46, critPct: 21, slotPct: 21 },
+  },
+  kan: {
+    name: 'Kan Seti', emoji: '🩸', color: 0xC0392B, tier: 'S',
+    pieces: mkRelicPieces('kan', 'Kan', '🩸', RELIC_TIER_PRICE.S),
+    bonus2: { desc: '+%13 Kritik şansı', critPct: 13 },
+    bonus4: { desc: '+%26 Kritik & +%11 Günlük bonus', critPct: 26, dailyPct: 11 },
+    bonusFull: { desc: '+%46 Kritik & +%21 Günlük & Boss drop +%21', critPct: 46, dailyPct: 21, bossPct: 21 },
+  },
+  elmas: {
+    name: 'Elmas Seti', emoji: '💎', color: 0x9B59B6, tier: 'SSS',
+    pieces: mkRelicPieces('elmas', 'Elmas', '💎', RELIC_TIER_PRICE.SSS),
+    bonus2: { desc: '+%16 XP kazanımı', xpPct: 16 },
+    bonus4: { desc: '+%32 XP & +%14 Coin', xpPct: 32, coinPct: 14 },
+    bonusFull: { desc: '+%56 XP & +%27 Coin & Pet XP +%27', xpPct: 56, coinPct: 27, petXpPct: 27 },
+  },
+  altinset: {
+    name: 'Altın Seti', emoji: '🥇', color: 0xFFC300, tier: 'SSS',
+    pieces: mkRelicPieces('altnset', 'Altın', '🥇', RELIC_TIER_PRICE.SSS),
+    bonus2: { desc: '+%16 Coin kazanımı', coinPct: 16 },
+    bonus4: { desc: '+%32 Coin & +%14 Zindan coin', coinPct: 32, dungeonCoinPct: 14 },
+    bonusFull: { desc: '+%56 Coin & +%27 Zindan coin & Madencilik +%27', coinPct: 56, dungeonCoinPct: 27, minePct: 27 },
+  },
+
+  // ── Büyücü'ye özel 4 yeni relic seti — yalnızca /sinif ile "Büyücü" seçen
+  // oyuncular kuşanabilir (classKey kontrolü equipRelicSet() içinde yapılır).
+  // Parça sahipliği herkese açık (madenden/zindandan da düşebilir), ama bonusun
+  // aktif olması için oyuncunun sınıfı büyücü olmalı. Aynı B/A/S/SSS ölçeği kullanılır.
+  muska: {
+    name: 'Muska Seti', emoji: '🧿', color: 0x1ABC9C, tier: 'B', classKey: 'buyucu',
+    pieces: mkRelicPieces('muska', 'Muska', '🧿', RELIC_TIER_PRICE.B),
+    bonus2: { desc: '+%7 Günlük bonus', dailyPct: 7 },
+    bonus4: { desc: '+%14 Günlük & +%6 XP', dailyPct: 14, xpPct: 6 },
+    bonusFull: { desc: '+%25 Günlük & +%10 XP & Pet XP +%10 & Büyü direnci +%8', dailyPct: 25, xpPct: 10, petXpPct: 10, magicResistPct: 8 },
+  },
+  buyu: {
+    name: 'Büyü Seti', emoji: '🪄', color: 0x6C3483, tier: 'A', classKey: 'buyucu',
+    pieces: mkRelicPieces('buyu', 'Büyü', '🪄', RELIC_TIER_PRICE.A),
+    bonus2: { desc: '+%10 XP kazanımı', xpPct: 10 },
+    bonus4: { desc: '+%20 XP & +%8 Kritik', xpPct: 20, critPct: 8 },
+    bonusFull: { desc: '+%35 XP & +%15 Kritik & Zindan XP +%15 & Büyü direnci +%12', xpPct: 35, critPct: 15, dungeonXpPct: 15, magicResistPct: 12 },
+  },
+  sihir: {
+    name: 'Sihir Seti', emoji: '✨', color: 0x8E44AD, tier: 'S', classKey: 'buyucu',
+    pieces: mkRelicPieces('sihir', 'Sihir', '✨', RELIC_TIER_PRICE.S),
+    bonus2: { desc: '+%13 Kritik şansı (büyü)', critPct: 13 },
+    bonus4: { desc: '+%26 Kritik & +%11 XP', critPct: 26, xpPct: 11 },
+    bonusFull: { desc: '+%46 Kritik & +%21 XP & Zindan coin +%21 & Büyü direnci +%17', critPct: 46, xpPct: 21, dungeonCoinPct: 21, magicResistPct: 17 },
+  },
+  kadim: {
+    name: 'Kadim Seti', emoji: '📜', color: 0x4A235A, tier: 'SSS', classKey: 'buyucu',
+    pieces: mkRelicPieces('kadim', 'Kadim', '📜', RELIC_TIER_PRICE.SSS),
+    bonus2: { desc: '+%16 Zindan XP', dungeonXpPct: 16 },
+    bonus4: { desc: '+%32 Zindan XP & +%14 XP', dungeonXpPct: 32, xpPct: 14 },
+    bonusFull: { desc: '+%56 Zindan XP & +%27 XP & Boss drop +%27 & Büyü direnci +%22', dungeonXpPct: 56, xpPct: 27, bossPct: 27, magicResistPct: 22 },
+  },
+
+  // ── Şövalye'ye özel 4 yeni relic seti — Büyücü'nün Muska/Büyü/Sihir/Kadim
+  // setleriyle aynı mantık: parça sahipliği herkese açık, bonusun aktif olması
+  // için oyuncunun sınıfı Şövalye olmalı. Aynı B/A/S/SSS ölçeği kullanılır.
+  sovalye_zirh: {
+    name: 'Zırh Seti', emoji: '🛡️', color: 0x566573, tier: 'B', classKey: 'sovalye',
+    pieces: mkRelicPieces('svzirh', 'Zırh', '🛡️', RELIC_TIER_PRICE.B),
+    bonus2: { desc: '+%7 Zindan coin kazanımı', dungeonCoinPct: 7 },
+    bonus4: { desc: '+%14 Zindan coin & +%6 Coin', dungeonCoinPct: 14, coinPct: 6 },
+    bonusFull: { desc: '+%25 Zindan coin & +%10 Coin & Boss drop +%10 & Fiziksel direnç +%8', dungeonCoinPct: 25, coinPct: 10, bossPct: 10, physResistPct: 8 },
+  },
+  sovalye_savas: {
+    name: 'Savaş Seti', emoji: '⚔️', color: 0x943126, tier: 'A', classKey: 'sovalye',
+    pieces: mkRelicPieces('svsavas', 'Savaş', '⚔️', RELIC_TIER_PRICE.A),
+    bonus2: { desc: '+%10 Boss drop şansı', bossPct: 10 },
+    bonus4: { desc: '+%20 Boss drop & +%8 XP', bossPct: 20, xpPct: 8 },
+    bonusFull: { desc: '+%35 Boss drop & +%15 XP & Zindan XP +%15 & Fiziksel direnç +%12', bossPct: 35, xpPct: 15, dungeonXpPct: 15, physResistPct: 12 },
+  },
+  sovalye_kale: {
+    name: 'Kale Seti', emoji: '🏰', color: 0x717D7E, tier: 'S', classKey: 'sovalye',
+    pieces: mkRelicPieces('svkale', 'Kale', '🏰', RELIC_TIER_PRICE.S),
+    bonus2: { desc: '+%13 Kritik şansı', critPct: 13 },
+    bonus4: { desc: '+%26 Kritik & +%11 Günlük bonus', critPct: 26, dailyPct: 11 },
+    bonusFull: { desc: '+%46 Kritik & +%21 Günlük & Zindan coin +%21 & Fiziksel direnç +%17', critPct: 46, dailyPct: 21, dungeonCoinPct: 21, physResistPct: 17 },
+  },
+  sovalye_kahraman: {
+    name: 'Kahraman Seti', emoji: '🦁', color: 0xB7950B, tier: 'SSS', classKey: 'sovalye',
+    pieces: mkRelicPieces('svkahr', 'Kahraman', '🦁', RELIC_TIER_PRICE.SSS),
+    bonus2: { desc: '+%16 Boss drop şansı', bossPct: 16 },
+    bonus4: { desc: '+%32 Boss drop & +%14 Coin', bossPct: 32, coinPct: 14 },
+    bonusFull: { desc: '+%56 Boss drop & +%27 Coin & Zindan coin +%27 & Fiziksel direnç +%22', bossPct: 56, coinPct: 27, dungeonCoinPct: 27, physResistPct: 22 },
+  },
+
+  // ── Nişancı'ya özel 4 yeni relic seti — aynı mantık, Nişancı'nın kritik/hız
+  // temasına uygun bonuslarla. Aynı B/A/S/SSS ölçeği kullanılır.
+  nisanci_ok: {
+    name: 'Ok Seti', emoji: '🏹', color: 0x784212, tier: 'B', classKey: 'nisanci',
+    pieces: mkRelicPieces('nsok', 'Ok', '🏹', RELIC_TIER_PRICE.B),
+    bonus2: { desc: '+%7 Kritik şansı', critPct: 7 },
+    bonus4: { desc: '+%14 Kritik & +%6 Coin', critPct: 14, coinPct: 6 },
+    bonusFull: { desc: '+%25 Kritik & +%10 Coin & Slot +%10 & Hareket hızı +%8', critPct: 25, coinPct: 10, slotPct: 10, speedPct: 8 },
+  },
+  nisanci_nisan: {
+    name: 'Nişan Seti', emoji: '🎯', color: 0xCB4335, tier: 'A', classKey: 'nisanci',
+    pieces: mkRelicPieces('nsnisan', 'Nişan', '🎯', RELIC_TIER_PRICE.A),
+    bonus2: { desc: '+%10 Slot kazancı', slotPct: 10 },
+    bonus4: { desc: '+%20 Slot & +%8 XP', slotPct: 20, xpPct: 8 },
+    bonusFull: { desc: '+%35 Slot & +%15 XP & Kritik +%15 & Hareket hızı +%12', slotPct: 35, xpPct: 15, critPct: 15, speedPct: 12 },
+  },
+  nisanci_sahin: {
+    name: 'Şahin Seti', emoji: '🦅', color: 0x6E2C00, tier: 'S', classKey: 'nisanci',
+    pieces: mkRelicPieces('nssahin', 'Şahin', '🦅', RELIC_TIER_PRICE.S),
+    bonus2: { desc: '+%13 Hırsızlık başarı şansı', stealPct: 13 },
+    bonus4: { desc: '+%26 Hırsızlık & +%11 Kritik', stealPct: 26, critPct: 11 },
+    bonusFull: { desc: '+%46 Hırsızlık & +%21 Kritik & Zindan XP +%21 & Hareket hızı +%17', stealPct: 46, critPct: 21, dungeonXpPct: 21, speedPct: 17 },
+  },
+  nisanci_avci: {
+    name: 'Avcı Seti', emoji: '🐆', color: 0x1B4F72, tier: 'SSS', classKey: 'nisanci',
+    pieces: mkRelicPieces('nsavci', 'Avcı', '🐆', RELIC_TIER_PRICE.SSS),
+    bonus2: { desc: '+%16 Kritik şansı', critPct: 16 },
+    bonus4: { desc: '+%32 Kritik & +%14 Slot', critPct: 32, slotPct: 14 },
+    bonusFull: { desc: '+%56 Kritik & +%27 Slot & Zindan XP +%27 & Hareket hızı +%22', critPct: 56, slotPct: 27, dungeonXpPct: 27, speedPct: 22 },
   },
 };
 
@@ -7248,70 +7790,70 @@ const DUNGEONS = [
   {
     key: 'goblin',      name: 'Goblin Mağarası',    emoji: '👺',
     minLevel: 1,  xpReward: [30,60],   coinReward: [80,200],
-    color: 0x2ECC71, cd: 3600000, requiredPower: 10,
+    color: 0x2ECC71, cd: 120000, requiredPower: 10,
     desc: 'Goblinlerin ininden coin ve malzeme topla.',
     matPool: ['demir_cevheri','bakir_cevheri'],
   },
   {
     key: 'iskelet',     name: 'İskelet Mezarlığı',  emoji: '💀',
     minLevel: 3,  xpReward: [50,90],   coinReward: [150,350],
-    color: 0x95A5A6, cd: 3600000, requiredPower: 20,
+    color: 0x95A5A6, cd: 120000, requiredPower: 20,
     desc: 'Ölümsüzlerin arasında gizli hazineler var.',
     matPool: ['demir_cevheri','obsidyen'],
   },
   {
     key: 'orumcek',     name: 'Örümcek Yuvası',     emoji: '🕷️',
     minLevel: 5,  xpReward: [80,130],  coinReward: [250,500],
-    color: 0x8E44AD, cd: 3600000, requiredPower: 30,
+    color: 0x8E44AD, cd: 120000, requiredPower: 30,
     desc: 'Dev örümcekler değerli iplik ve malzeme bırakır.',
     matPool: ['demir_cevheri','altin_cevheri','ruh_tozu'],
   },
   {
     key: 'hayalet',     name: 'Hayalet Şatosu',     emoji: '👻',
     minLevel: 8,  xpReward: [110,180], coinReward: [400,750],
-    color: 0x6C3483, cd: 3600000, requiredPower: 45,
+    color: 0x6C3483, cd: 120000, requiredPower: 45,
     desc: 'Şatonun hayaletleri Ruh Tozu bırakır.',
     matPool: ['ruh_tozu','obsidyen','saf_kristal'],
   },
   {
     key: 'lav',         name: 'Lav Tapınağı',       emoji: '🌋',
     minLevel: 12, xpReward: [160,250], coinReward: [600,1100],
-    color: 0xFF4500, cd: 3600000, requiredPower: 65,
+    color: 0xFF4500, cd: 120000, requiredPower: 65,
     desc: 'Cehennem ateşi içinde Lav Taşları bulunur.',
     matPool: ['lav_tasi','obsidyen','ejder_pulu'],
   },
   {
     key: 'buz',         name: 'Buz Sarayı',         emoji: '❄️',
     minLevel: 16, xpReward: [210,320], coinReward: [850,1500],
-    color: 0x00BFFF, cd: 3600000, requiredPower: 85,
+    color: 0x00BFFF, cd: 120000, requiredPower: 85,
     desc: 'Sonsuz soğukta Buz Çekirdekleri gizlidir.',
     matPool: ['buz_cekirdegi','saf_kristal','yildirim_kristali'],
   },
   {
     key: 'orman',       name: 'Orman Mabedi',       emoji: '🌲',
     minLevel: 20, xpReward: [280,420], coinReward: [1200,2000],
-    color: 0x27AE60, cd: 3600000, requiredPower: 105,
+    color: 0x27AE60, cd: 120000, requiredPower: 105,
     desc: 'Antik ormanın ruhu değerli taşlar saklar.',
     matPool: ['ay_tasi','gunes_parcasi','saf_kristal'],
   },
   {
     key: 'karanlik',    name: 'Karanlık Orman',     emoji: '🌑',
     minLevel: 25, xpReward: [370,560], coinReward: [1700,2800],
-    color: 0x2C3E50, cd: 3600000, requiredPower: 130,
+    color: 0x2C3E50, cd: 120000, requiredPower: 130,
     desc: 'Karanlık öz bu ormanda kendiliğinden oluşur.',
     matPool: ['karanlik_oz','ruh_tozu','ejder_pulu'],
   },
   {
     key: 'ejder',       name: 'Ejder Zirvesi',      emoji: '🐉',
     minLevel: 35, xpReward: [550,800], coinReward: [2500,4000],
-    color: 0xFF6B00, cd: 3600000, requiredPower: 180,
+    color: 0xFF6B00, cd: 120000, requiredPower: 180,
     desc: 'Ejderin yatağında Ejder Pulu ve nadirlikler var.',
     matPool: ['ejder_pulu','elmas_cevheri','karanlik_oz','ay_tasi'],
   },
   {
     key: 'cehennem',    name: 'Cehennem Kapısı',    emoji: '🔥',
     minLevel: 45, xpReward: [750,1100],coinReward: [4000,7000],
-    color: 0xC0392B, cd: 3600000, requiredPower: 230,
+    color: 0xC0392B, cd: 120000, requiredPower: 230,
     desc: 'Cehennemin kapısında en değerli malzemeler bulunur.',
     matPool: ['ejder_pulu','karanlik_oz','ay_tasi','gunes_parcasi','yildirim_kristali','buz_cekirdegi'],
   },
@@ -7397,11 +7939,13 @@ const DUNGEON_FAIL_XP_PCT = 0.25;
 function getMmoPetBattlePower(gid, uid) {
   const active = getMmoActivePets(gid, uid);
   if (!active.length) return { power: 0, pets: [] };
+  const cls = getPlayerClass(gid, uid);
   let power = 0;
   const pets = [];
   for (const ap of active) {
     const def = MMORPG_PETS.find(p => p.key === ap.petKey);
     if (!def) continue;
+    if (cls && !classAllowsStat(cls, def.bonusType)) continue; // sınıfa uygun olmayan pet güce katılmaz
     const lv = db.prepare('SELECT level FROM mmo_pets WHERE guildId=? AND userId=? AND petKey=? AND hatchedAt=?')
       .get(gid, uid, ap.petKey, ap.petHatchedAt);
     const level = lv ? lv.level : 1;
@@ -7453,10 +7997,14 @@ function getRelicBattlePower(gid, uid) {
 }
 
 // Sahip olunan en iyi silah + her zırh slotundaki en iyi parça (otomatik seçilir)
+// Sınıf seçilmişse, sınıfa uygun olmayan silah/zırh dövüş gücüne hiç katılmaz.
 function getBestGearPower(gid, uid) {
+  const cls = getPlayerClass(gid, uid);
   const weapons = getWeapons(gid, uid);
   let bestWeapon = null;
   for (const w of weapons) {
+    const { type } = parseWeaponKey(w.weaponKey);
+    if (cls && type && !classAllowsStat(cls, type.stat)) continue;
     const p = getWeaponBattlePower(w.weaponKey, w.enhancement);
     if (!bestWeapon || p > bestWeapon.power) bestWeapon = { ...w, power: p };
   }
@@ -7465,13 +8013,42 @@ function getBestGearPower(gid, uid) {
   const armors = getArmors(gid, uid);
   const bestBySlot = {};
   for (const a of armors) {
+    const slotDef = ARMOR_SLOTS.find(s => s.key === a.slot);
+    if (cls && slotDef && !classAllowsStat(cls, slotDef.stat)) continue;
     const tierKey = a.armorKey.split('_')[1] || a.armorKey;
-    const p = getArmorBattlePower(tierKey, a.enhancement);
+    const p = getArmorBattlePower(tierKey, a.enhancement, a.slot);
     if (!bestBySlot[a.slot] || p > bestBySlot[a.slot].power) bestBySlot[a.slot] = { ...a, power: p };
   }
   const armorPower = Object.values(bestBySlot).reduce((sum, a) => sum + a.power, 0);
 
   return { weaponPower, armorPower, bestWeapon, bestArmors: Object.values(bestBySlot) };
+}
+
+// Zırhın kuşandığı slotun statüne göre savaşa küçük bir katkı sağlar:
+// hız statlı slotlar (Pantolon/Bot/Sadak/Nişan Gözlüğü) → hareket hızı
+// büyü/mana statlı slotlar (Kolye/Asa Kını/Büyücü Çubuğu/Muskalık/Büyü Kitabı) → büyü direnci
+// savunma/can statlı slotlar (Miğfer/Göğüslük/Pelerin/Kemer) → fiziksel direnç
+// Tier ve geliştirme seviyesi arttıkça katkı da büyür (üst sınır: %25).
+function getArmorCombatBonus(gid, uid) {
+  const { bestArmors } = getBestGearPower(gid, uid);
+  let speedBonus = 0, physResistBonus = 0, magicResistBonus = 0;
+  for (const a of bestArmors) {
+    const slotDef = ARMOR_SLOTS.find(s => s.key === a.slot);
+    const tierKey = a.armorKey.split('_')[1] || a.armorKey;
+    const tierDef = ARMOR_TIERS.find(t => t.key === tierKey);
+    if (!slotDef || !tierDef) continue;
+    const gradeMult = GEAR_GRADE_MULTIPLIER[tierDef.grade] || 1;
+    const enhMult   = 1 + (a.enhancement || 0) * GEAR_ENHANCEMENT_BONUS_PER_LV;
+    const base = 0.015 * gradeMult * enhMult;
+    if (slotDef.stat === 'speed')                                  speedBonus       += base;
+    else if (slotDef.stat === 'magic' || slotDef.stat === 'mana')  magicResistBonus += base;
+    else if (slotDef.stat === 'defense' || slotDef.stat === 'hp')  physResistBonus  += base;
+  }
+  return {
+    speedBonus:       Math.min(0.25, speedBonus),
+    physResistBonus:  Math.min(0.25, physResistBonus),
+    magicResistBonus: Math.min(0.25, magicResistBonus),
+  };
 }
 
 // Toplam dövüş gücü — /fight ve gösterim için kullanılır (petler dahil!)
@@ -7560,25 +8137,21 @@ function setFightCd(gid, uid) {
   `).run(gid, uid, Date.now());
 }
 
-// Düelloyu çözer: kim kazanır, kimden ne kadar coin/XP el değiştirir
+// Düelloyu çözer: kim kazanır, kimden ne kadar coin/XP el değiştirir.
+// Artık düz bir % zar atışı değil — hız/mesafe/direnç temelli 5 round'luk bir simülasyon (bkz. simulateCombat).
 function resolveFight(gid, challengerId, opponentId) {
   const challengerPower = getBattlePower(gid, challengerId);
   const opponentPower   = getBattlePower(gid, opponentId);
 
-  const totalPower = challengerPower.total + opponentPower.total || 1;
-  const share = challengerPower.total / totalPower; // 0..1
-  const challengerChance = Math.max(FIGHT_MIN_CHANCE, Math.min(FIGHT_MAX_CHANCE, Math.round(15 + share * 70)));
+  const A = buildCombatant(gid, challengerId);
+  const B = buildCombatant(gid, opponentId);
+  const sim = simulateCombat(A, B);
+  const challengerWins = sim.aWon;
 
-  // Şans %60'ın üzerindeyse artık zar atılmıyor, güçlü taraf otomatik kazanıyor.
-  // %40-%60 arası (aradaki güç farkı azken) hâlâ rastgele belirleniyor.
-  let challengerWins;
-  if (challengerChance > 60) {
-    challengerWins = true;
-  } else if (challengerChance < 40) {
-    challengerWins = false;
-  } else {
-    challengerWins = Math.random() * 100 < challengerChance;
-  }
+  // Gösterim amaçlı "kazanma şansı" — güç oranından türetilir, artık zar atmıyor ama panelde bilgi verir
+  const totalPower = challengerPower.total + opponentPower.total || 1;
+  const share = challengerPower.total / totalPower;
+  const challengerChance = Math.max(FIGHT_MIN_CHANCE, Math.min(FIGHT_MAX_CHANCE, Math.round(15 + share * 70)));
 
   const winnerId = challengerWins ? challengerId : opponentId;
   const loserId  = challengerWins ? opponentId   : challengerId;
@@ -7601,7 +8174,86 @@ function resolveFight(gid, challengerId, opponentId) {
   return {
     winnerId, loserId, stolen, winXp, loseXp,
     challengerId, opponentId, challengerPower, opponentPower, challengerChance, challengerWins,
+    combatLog: sim.log, hpA: sim.hpA, hpB: sim.hpB, maxHpA: A.maxHp, maxHpB: B.maxHp,
   };
+}
+function buildCombatant(gid, uid) {
+  const bp    = getBattlePower(gid, uid);
+  const cls   = getPlayerClass(gid, uid);
+  const stats = getRpgStats(gid, uid);
+  const rpg   = getRpgData(gid, uid);
+  const gear  = getBestGearPower(gid, uid);
+
+  let weaponSpeed = 1.0;
+  if (gear.bestWeapon) {
+    const { type, tier } = parseWeaponKey(gear.bestWeapon.weaponKey);
+    if (type && tier) weaponSpeed = (WEAPON_SPEED_BASE[type.key] || 1.0) * (TIER_SPEED_MULT[tier.key] || 1.0);
+  }
+
+  const profile = CLASS_COMBAT_PROFILE[cls] || { speedMult: 1, physResist: 0.1, magicResist: 0.1, closeGapPerRound: 0.15 };
+
+  // Aktif petlerin destek bonusu: hız/direnç türüne uygun petler ufak bir ek katkı sağlar
+  let speedSupport = 0, physSupport = 0, magicSupport = 0;
+  const { pets: activePets } = getMmoPetBattlePower(gid, uid);
+  for (const p of activePets) {
+    if (p.bonusType === 'speed')                       speedSupport += 0.1;
+    else if (p.bonusType === 'magic' || p.bonusType === 'mana') magicSupport += 0.03;
+    else if (p.bonusType === 'defense' || p.bonusType === 'hp') physSupport += 0.03;
+  }
+  speedSupport = Math.min(0.3, speedSupport);
+  magicSupport = Math.min(0.15, magicSupport);
+  physSupport  = Math.min(0.15, physSupport);
+
+  // Zırh (slot statüne göre) ve tam kuşanılmış class-locked relic setleri
+  // (Şövalye/Nişancı/Büyücü) hız/fiziksel direnç/büyü direnci katkısı sağlar.
+  const armorCombat = getArmorCombatBonus(gid, uid);
+  const relicCombat = getRelicSetCombatBonus(gid, uid);
+
+  return {
+    uid, cls,
+    battlePower: bp,
+    power: bp.total,
+    totalSpeed: (weaponSpeed * profile.speedMult + speedSupport + armorCombat.speedBonus) * (1 + relicCombat.speedPct / 100),
+    physResist: Math.min(0.75, profile.physResist + physSupport + armorCombat.physResistBonus + relicCombat.physResistPct / 100),
+    magicResist: Math.min(0.75, profile.magicResist + magicSupport + armorCombat.magicResistBonus + relicCombat.magicResistPct / 100),
+    closeGapPerRound: profile.closeGapPerRound,
+    dmgType: cls === 'buyucu' ? 'magic' : 'physical',
+    hp: 100 + rpg.rpgLevel * 4 + (stats.hp || 1) * 6,
+    maxHp: 100 + rpg.rpgLevel * 4 + (stats.hp || 1) * 6,
+  };
+}
+
+// Round bazlı, mantığa dayalı düello simülasyonu (5 round ≈ 10 saniyelik düello).
+// Kazananı şans zarı değil; hız/inisiyatif, mesafe kapatma ve direnç filtreli hasar belirler.
+// Ufak (±%10) rastgelelik sadece varyasyon için var, ana belirleyici değil.
+function simulateCombat(A, B) {
+  const ROUNDS = 5;
+  let hpA = A.hp, hpB = B.hp;
+  let gapA = 0, gapB = 0; // mesafeyi ne kadar kapattığı (0..1) — sadece yavaş taraf için işler
+  const log = [];
+
+  for (let r = 1; r <= ROUNDS; r++) {
+    if (hpA <= 0 || hpB <= 0) break;
+
+    if (A.totalSpeed < B.totalSpeed) gapA = Math.min(1, gapA + A.closeGapPerRound);
+    if (B.totalSpeed < A.totalSpeed) gapB = Math.min(1, gapB + B.closeGapPerRound);
+
+    const effSpeedA = A.totalSpeed + Math.max(0, B.totalSpeed - A.totalSpeed) * gapA;
+    const effSpeedB = B.totalSpeed + Math.max(0, A.totalSpeed - B.totalSpeed) * gapB;
+    const speedSum  = effSpeedA + effSpeedB || 1;
+    const shareA    = effSpeedA / speedSum; // bu round kim daha çok inisiyatif alıyor
+
+    const noise = () => 0.9 + Math.random() * 0.2; // ±%10 varyasyon
+    const dmgToB = Math.round((A.power * shareA       * (1 - (A.dmgType === 'magic' ? B.magicResist : B.physResist)) * noise()) / ROUNDS);
+    const dmgToA = Math.round((B.power * (1 - shareA) * (1 - (B.dmgType === 'magic' ? A.magicResist : A.physResist)) * noise()) / ROUNDS);
+
+    hpB -= dmgToB;
+    hpA -= dmgToA;
+    log.push(`**Tur ${r}:** ${Math.round(shareA*100)}% / ${Math.round((1-shareA)*100)}% inisiyatif → -${dmgToB} / -${dmgToA} can`);
+  }
+
+  const aWon = hpA === hpB ? (A.power >= B.power) : hpA > hpB;
+  return { aWon, hpA: Math.max(0, hpA), hpB: Math.max(0, hpB), log };
 }
 
 // ─────────────────────────────────────────────────────────────────────────
@@ -7715,6 +8367,19 @@ function upgradeRpgStat(gid, uid, stat) {
   addBalance(gid, uid, -cost);
   db.prepare(`UPDATE rpg_stats SET ${stat}=${stat}+1 WHERE guildId=? AND userId=?`).run(gid, uid);
   return { ok: true, newLevel: cur + 1, cost };
+}
+// Statlara harcanan toplam coini hesaplar (her stat için 2. seviyeden mevcut seviyeye kadar)
+function calcStatRefundTotal(gid, uid) {
+  const stats = getRpgStats(gid, uid);
+  let total = 0;
+  for (const key of Object.keys(RPG_STAT_NAMES)) {
+    const lvl = stats[key] || 1;
+    for (let l = 2; l <= lvl; l++) total += getStatCost(l);
+  }
+  return total;
+}
+function resetRpgStats(gid, uid) {
+  db.prepare('UPDATE rpg_stats SET hp=1,attack=1,defense=1,critical=1,speed=1,mana=1,magic=1 WHERE guildId=? AND userId=?').run(gid, uid);
 }
 
 // ─────────────────────────────────────────────────────────────────────────
@@ -7882,17 +8547,24 @@ function enhanceItem(gid, uid, table, id) {
     return { ok: false, reason: 'mats' };
   }
 
+  // +5'ten sonra ayrıca gelişmiş (yalnızca craftlanan) malzeme de gerekir
+  const advReq = getAdvancedEnhanceRequirement(enh);
+  if (advReq && !hasCraftMats(gid, uid, advReq)) {
+    return { ok: false, reason: 'advmats', advReq };
+  }
+
   addBalance(gid, uid, -coinCost);
   spendCraftMats(gid, uid, ENHANCEMENT_MAT_COST);
+  if (advReq) spendCraftMats(gid, uid, advReq);
 
   const successRate = ENHANCEMENT_SUCCESS_RATES[enh];
   const success = Math.random() * 100 < successRate;
   if (success) {
     db.prepare(`UPDATE ${table} SET enhancement=enhancement+1 WHERE id=?`).run(id);
-    return { ok: true, success: true, newEnh: enh + 1, cost: coinCost };
+    return { ok: true, success: true, newEnh: enh + 1, cost: coinCost, advReq };
   }
   // Başarısız — eşya kırılmaz, coin + mat gitti (zaten harcandı)
-  return { ok: true, success: false, enh, cost: coinCost };
+  return { ok: true, success: false, enh, cost: coinCost, advReq };
 }
 
 // ─────────────────────────────────────────────────────────────────────────
@@ -7927,7 +8599,14 @@ function getEquippedRelicSets(gid, uid) {
   return db.prepare('SELECT setKey FROM active_relic_sets WHERE guildId=? AND userId=?').all(gid, uid).map(r => r.setKey);
 }
 function equipRelicSet(gid, uid, setKey) {
-  if (!RELIC_SETS[setKey]) return { ok: false, reason: 'invalid' };
+  const def = RELIC_SETS[setKey];
+  if (!def) return { ok: false, reason: 'invalid' };
+  // Sınıfa özel setler (örn. Büyücü relic setleri) yalnızca o sınıfı seçmiş
+  // oyuncular tarafından kuşanılabilir. Parça sahipliği herkese açıktır,
+  // kısıtlama sadece bonusun aktifleşmesi (kuşanma) aşamasında uygulanır.
+  if (def.classKey && getPlayerClass(gid, uid) !== def.classKey) {
+    return { ok: false, reason: 'class', requiredClass: def.classKey };
+  }
   const equipped = getEquippedRelicSets(gid, uid);
   if (equipped.includes(setKey)) return { ok: false, reason: 'already' };
   if (equipped.length >= RELIC_SET_MAX_EQUIPPED) return { ok: false, reason: 'full', max: RELIC_SET_MAX_EQUIPPED };
@@ -8004,6 +8683,21 @@ function getRelicSetFishBonus(gid, uid) {
     else if (info.bonus === '2piece') total += def.bonus2.fishPct || 0;
   }
   return total;
+}
+// Şövalye/Nişancı/Büyücü'nün class-locked SSS/S/A/B setleri — tam set (6/6)
+// kuşanıldığında /fight simülasyonuna hareket hızı, fiziksel direnç veya
+// büyü direnci katkısı sağlar (bkz. buildCombatant()).
+function getRelicSetCombatBonus(gid, uid) {
+  const bonuses = getRelicSetBonuses(gid, uid);
+  let speedPct = 0, physResistPct = 0, magicResistPct = 0;
+  for (const [setKey, info] of Object.entries(bonuses)) {
+    if (info.bonus !== 'full') continue; // bu üç stat yalnızca TAM SET'te açılıyor
+    const def = RELIC_SETS[setKey];
+    speedPct       += def.bonusFull.speedPct || 0;
+    physResistPct  += def.bonusFull.physResistPct || 0;
+    magicResistPct += def.bonusFull.magicResistPct || 0;
+  }
+  return { speedPct, physResistPct, magicResistPct };
 }
 // Gölge Seti — Hırsızlık başarı bonusu (/çal ve /oyunlar cal içinde kullanılır)
 function getRelicSetStealBonus(gid, uid) {
@@ -8243,6 +8937,22 @@ const MMORPG_SLASH_COMMANDS = [
     .setName('stat')
     .setDescription('RPG statlarını coin ile yükselt'),
 
+  // /sinif — savaş yolu (sınıf) seç
+  new SlashCommandBuilder()
+    .setName('sinif')
+    .setDescription('Savaş yolunu (sınıfını) seç — Şövalye, Nişancı veya Büyücü')
+    .addStringOption(o => o.setName('sinif').setDescription('Seçmek istediğin sınıf').setRequired(true)
+      .addChoices(
+        { name: '⚔️ Şövalye (Kılıç/Tırpan • Güç-Savunma-Can)', value: 'sovalye' },
+        { name: '🏹 Nişancı (Yay/Hançer • Kritik-Hız)',        value: 'nisanci' },
+        { name: '🪄 Büyücü (Asa • Büyücülük-Mana)',            value: 'buyucu'  },
+      )),
+
+  // /statsifirla — statları sıfırla, coin iade et, sınıfı da temizle
+  new SlashCommandBuilder()
+    .setName('statsifirla')
+    .setDescription('Tüm statlarını sıfırlar, harcadığın coini iade eder ve yeniden sınıf seçmeni sağlar'),
+
   // /zindan — zindan gir
   new SlashCommandBuilder()
     .setName('zindan')
@@ -8305,6 +9015,8 @@ const MMORPG_SLASH_COMMANDS = [
         { name: '🛡️ Zırh',  value: 'zirh'  },
         { name: '🥚 Yumurta', value: 'yumurta' },
         { name: '📦 Sandık',  value: 'sandik'  },
+        { name: '🌀 Gelişmiş Malzeme', value: 'malzeme' },
+        { name: '💎 Relic Seti (Tam Set)', value: 'set' },
       ))
     .addStringOption(o => o.setName('item').setDescription('Üretilecek eşya').setRequired(true).setAutocomplete(true)),
 
@@ -8333,11 +9045,7 @@ const MMORPG_SLASH_COMMANDS = [
       .setName('set')
       .setDescription('Set (boş=hepsi)')
       .addChoices(
-        { name: '🌋 Lav Seti', value: 'lav' },
-        { name: '❄️ Buz Seti', value: 'buz' },
-        { name: '⚡ Fırtına Seti', value: 'firtina' },
-        { name: '🌑 Gölge Seti',  value: 'golge' },
-        { name: '☀️ Güneş Seti', value: 'gunes' },
+        ...Object.entries(RELIC_SETS).map(([key, def]) => ({ name: `${def.emoji} ${def.name}`, value: key }))
       )),
 
   // /rpg-pet — MMORPG pet yönetimi
@@ -8366,7 +9074,7 @@ const MMORPG_SLASH_COMMANDS = [
 SLASH_COMMANDS.push(...MMORPG_SLASH_COMMANDS);
 
 const MMO_CMDS = new Set([
-  'rpg', 'stat', 'zindan', 'envanter', 'sandik', 'yumurta',
+  'rpg', 'stat', 'sinif', 'statsifirla', 'zindan', 'envanter', 'sandik', 'yumurta',
   'craft', 'yukselt', 'slot', 'relic-set', 'rpg-pet', 'fight',
 ]);
 
@@ -8412,12 +9120,16 @@ async function handleMMOCommand(interaction, cmd, sub, gid, uid) {
 
     const bp = getBattlePower(tgid, tuid);
     const battlePowerLine = `**${bp.total}** ⚔️\nSeviye:${bp.levelPower} Stat:${bp.statPower} Relic:${bp.relicPower} Silah:${bp.weaponPower} Zırh:${bp.armorPower}`;
+    const tCls = getPlayerClass(tgid, tuid);
+    const classDef = tCls ? RPG_CLASSES.find(c => c.key === tCls) : null;
+    const classLine = classDef ? `${classDef.emoji} **${classDef.name}**` : '❌ Seçilmedi *(`/sinif` ile seç)*';
 
     const embed = new EmbedBuilder()
       .setTitle(`⚔️ ${target.username} — RPG Profili`)
       .setThumbnail(target.displayAvatarURL())
       .setColor(0x5865F2)
       .addFields(
+        { name: '🧭 Sınıf', value: classLine, inline: false },
         { name: '🏆 RPG Seviyesi', value: `**Lv.${rpg.rpgLevel}** / ${RPG_MAX_LEVEL}\n${xpBar}\n${rpg.rpgXp} / ${getRpgXpNeeded(rpg.rpgLevel)} XP`, inline: false },
         { name: '📊 Statlar', value: statLines, inline: true },
         { name: '💎 Relic Setleri', value: setLines || '—', inline: true },
@@ -8433,6 +9145,28 @@ async function handleMMOCommand(interaction, cmd, sub, gid, uid) {
   // ── /stat ─────────────────────────────────────────────────────────────
   if (cmd === 'stat') {
     return showStatPanel(interaction, gid, uid);
+  }
+
+  // ── /sinif ────────────────────────────────────────────────────────────
+  if (cmd === 'sinif') {
+    const secim = interaction.options.getString('sinif');
+    const cur   = getPlayerClass(gid, uid);
+    if (cur) {
+      const curDef = RPG_CLASSES.find(c => c.key === cur);
+      return interaction.reply({ ephemeral: true, content: `⛔ Zaten **${curDef.emoji} ${curDef.name}** yolunu seçtin! Değiştirmek için \`/statsifirla\` kullanmalısın (statların sıfırlanır, coin iade edilir, sınıf tekrar seçilebilir hale gelir).` });
+    }
+    setPlayerClass(gid, uid, secim);
+    const def = RPG_CLASSES.find(c => c.key === secim);
+    return interaction.reply({ content: `✅ **${def.emoji} ${def.name}** yolunu seçtin!\nArtık yalnızca bu sınıfa uygun silah/zırh craftlayabilir ve bu sınıfa uygun petler kuşanabilirsin.\n📊 Kilitli statlar: ${def.stats.map(s => `${RPG_STAT_NAMES[s].emoji} ${RPG_STAT_NAMES[s].name}`).join(', ')}` });
+  }
+
+  // ── /statsifirla ──────────────────────────────────────────────────────
+  if (cmd === 'statsifirla') {
+    const refund = calcStatRefundTotal(gid, uid);
+    resetRpgStats(gid, uid);
+    clearPlayerClass(gid, uid);
+    if (refund > 0) addBalance(gid, uid, refund);
+    return interaction.reply({ content: `♻️ **Statların sıfırlandı** ve sınıf seçimin kaldırıldı!\n💰 **+${refund} coin** iade edildi. Bakiye: **${getBalance(gid, uid).balance}**\n🧭 \`/sinif\` ile yeniden yol seç (Şövalye ⚔️ / Nişancı 🏹 / Büyücü 🪄).` });
   }
 
   // ── /zindan ───────────────────────────────────────────────────────────
@@ -8453,6 +9187,10 @@ async function handleMMOCommand(interaction, cmd, sub, gid, uid) {
 
     const { dungeon, xp, coin, leveled, newLevel, drops, isCrit, success, successChance, playerPower, requiredPower } = result;
     const powerLine = `⚔️ Gücün: **${playerPower}** / Önerilen: **${requiredPower}** • 🎲 Başarı şansı: **%${successChance}**`;
+
+    // Zindan hesaplanırken bot birkaç saniye "düşünsün"
+    await interaction.reply(`${dungeon.emoji} **${dungeon.name}**'a giriliyor... Hesaplanıyor...`);
+    await new Promise(res => setTimeout(res, 4000));
 
     // ── OwO tarzı görsel zindan savaş ekranı ───────────────────
     const { petLines, enemyLines } = buildDungeonResultVisual(gid, uid, dungeon, success);
@@ -8494,7 +9232,7 @@ async function handleMMOCommand(interaction, cmd, sub, gid, uid) {
         },
         { name: '💰 Coin',   value: success ? `+**${coin}** coin` : '~~+coin~~ (başarısız)', inline: true },
         { name: '✨ RPG XP', value: `+**${xp}** XP`, inline: true },
-        { name: '🕐 Tekrar', value: '1 saat sonra',   inline: true },
+        { name: '🕐 Tekrar', value: `${Math.round(dungeon.cd / 60000)} dakika sonra`, inline: true },
       );
 
     if (success && drops.length > 0) {
@@ -8505,7 +9243,7 @@ async function handleMMOCommand(interaction, cmd, sub, gid, uid) {
     }
     embed.setFooter({ text: powerLine });
 
-    return interaction.reply({ embeds: [embed] });
+    return interaction.editReply({ content: null, embeds: [embed] });
   }
 
   // ── /fight ────────────────────────────────────────────────────────────
@@ -8547,7 +9285,12 @@ async function handleMMOCommand(interaction, cmd, sub, gid, uid) {
       }
 
       setFightCd(gid, uid);
+
+      // Düello ~10 saniye sürsün — sonucu hemen değil, biraz "hesaplandıktan" sonra göster
+      await i.update({ content: `⚔️ **${interaction.user.username}** vs **${opponent.username}** — düello başladı! Hesaplanıyor...`, embeds: [], components: [] });
       const result = resolveFight(gid, uid, opponent.id);
+      await new Promise(res => setTimeout(res, 10000));
+
       const winnerUser  = result.winnerId === uid ? interaction.user : opponent;
       const cp = result.challengerPower;
       const op = result.opponentPower;
@@ -8609,10 +9352,16 @@ async function handleMMOCommand(interaction, cmd, sub, gid, uid) {
             value: `Kazanan +${result.winXp} XP • Kaybeden +${result.loseXp} XP`,
             inline: true,
           },
+          {
+            name: '📜 Düello Akışı (round bazlı)',
+            value: (result.combatLog && result.combatLog.length ? result.combatLog.join('\n') : '—') +
+              `\n❤️ Kalan can: **${interaction.user.username}** ${result.hpA}/${result.maxHpA} — **${opponent.username}** ${result.hpB}/${result.maxHpB}`,
+            inline: false,
+          },
         )
         .setFooter({ text: 'Petlerini /rpg-pet ile kuşan → Dövüş gücünü artır! 🐾' });
 
-      return i.update({ content: null, embeds: [embed], components: [] });
+      return i.editReply({ content: null, embeds: [embed], components: [] });
     });
 
     coll.on('end', (collected, reason) => {
@@ -8704,15 +9453,20 @@ async function handleMMOCommand(interaction, cmd, sub, gid, uid) {
       if (result.reason === 'max')      return interaction.reply({ ephemeral: true, content: '⛔ Bu eşya zaten +10 (maksimum)!' });
       if (result.reason === 'coin')     return interaction.reply({ ephemeral: true, content: `⛔ Yetersiz coin! Gerekli: **${result.cost}** coin.` });
       if (result.reason === 'mats')     return interaction.reply({ ephemeral: true, content: `⛔ Yetersiz craft malzemesi!\nGerekli: ${Object.entries(ENHANCEMENT_MAT_COST).map(([k,v]) => `${CRAFT_MATERIALS.find(m=>m.key===k)?.emoji||''} ${CRAFT_MATERIALS.find(m=>m.key===k)?.name||k} x${v}`).join(', ')}` });
+      if (result.reason === 'advmats')  return interaction.reply({ ephemeral: true, content: `⛔ Yetersiz gelişmiş malzeme! **+5 sonrası** geliştirmeler için ayrıca gerekli:\n${Object.entries(result.advReq).map(([k,v]) => { const d = ADVANCED_CRAFT_MATERIALS.find(m=>m.key===k); return `${d?.emoji||''} ${d?.name||k} x${v}`; }).join(', ')}\n💡 \`/craft kategori:malzeme\` ile üretebilirsin.` });
     }
 
+    const advStr = result.advReq
+      ? ` + ${Object.entries(result.advReq).map(([k,v]) => { const d = ADVANCED_CRAFT_MATERIALS.find(m=>m.key===k); return `${d?.emoji||''} ${d?.name||k} x${v}`; }).join(', ')}`
+      : '';
+
     if (result.success) {
-      return interaction.reply({ content: `✨ **Başarılı!** Eşyan **+${result.newEnh}** oldu! (-${result.cost} coin)` });
+      return interaction.reply({ content: `✨ **Başarılı!** Eşyan **+${result.newEnh}** oldu! (-${result.cost} coin${advStr})` });
     } else {
       const mats = Object.entries(ENHANCEMENT_MAT_COST)
         .map(([k,v]) => { const d = CRAFT_MATERIALS.find(m=>m.key===k); return `${d?.emoji||''} ${d?.name||k} x${v}`; })
         .join(', ');
-      return interaction.reply({ content: `💥 **Başarısız!** Eşya **+${result.enh}** kalmaya devam ediyor. (-${result.cost} coin, ${mats} malzeme harcandı.)` });
+      return interaction.reply({ content: `💥 **Başarısız!** Eşya **+${result.enh}** kalmaya devam ediyor. (-${result.cost} coin, ${mats}${advStr} malzeme harcandı.)` });
     }
   }
 
@@ -8747,10 +9501,49 @@ async function handleMMOCommand(interaction, cmd, sub, gid, uid) {
 
     const net = payout - bet;
     const newBal = getBalance(gid, uid).balance;
-    const reelStr = spin.reels.join(' ║ ');
-
     const color = spin.multiplier >= 5 ? 0xF1C40F : spin.multiplier >= 3 ? 0x9B59B6 : spin.multiplier > 0 ? 0x2ECC71 : 0xE74C3C;
 
+    const randSymbol = () => SLOT_SYMBOLS_DEF[Math.floor(Math.random() * SLOT_SYMBOLS_DEF.length)].emoji;
+    const spinningReel = (locked, count) => Array.from({ length: 3 }, (_, i) => (i < locked ? spin.reels[i] : randSymbol())).join(' ║ ');
+
+    // ── Gerilim veren dönme animasyonu ────────────────────────
+    // İlk mesajı gönder, sonra bobinleri soldan sağa tek tek "kilitleyerek"
+    // birkaç kez düzenle — gerçek bir slot makinesi gibi gerilim yaratır.
+    await interaction.reply({
+      embeds: [new EmbedBuilder()
+        .setTitle('🎰 Slot Makinesi')
+        .setColor(0x95A5A6)
+        .setDescription(`**╔══ ${spinningReel(0)} ══╗**\n\n🎲 Çekiliyor...`)],
+    });
+
+    for (let i = 0; i < 3; i++) {
+      await sleep(500);
+      await interaction.editReply({
+        embeds: [new EmbedBuilder()
+          .setTitle('🎰 Slot Makinesi')
+          .setColor(0x95A5A6)
+          .setDescription(`**╔══ ${spinningReel(0)} ══╗**\n\n🎲 Çekiliyor...`)],
+      });
+    }
+
+    await sleep(600);
+    await interaction.editReply({
+      embeds: [new EmbedBuilder()
+        .setTitle('🎰 Slot Makinesi')
+        .setColor(0x95A5A6)
+        .setDescription(`**╔══ ${spinningReel(1)} ══╗**\n\n🔒 1. bobin kilitlendi...`)],
+    });
+
+    await sleep(700);
+    await interaction.editReply({
+      embeds: [new EmbedBuilder()
+        .setTitle('🎰 Slot Makinesi')
+        .setColor(0x95A5A6)
+        .setDescription(`**╔══ ${spinningReel(2)} ══╗**\n\n🔒🔒 2. bobin kilitlendi...`)],
+    });
+
+    await sleep(800);
+    const reelStr = spin.reels.join(' ║ ');
     const embed = new EmbedBuilder()
       .setTitle('🎰 Slot Makinesi')
       .setColor(color)
@@ -8764,7 +9557,7 @@ async function handleMMOCommand(interaction, cmd, sub, gid, uid) {
       )
       .setFooter({ text: 'Slot: Günlük 10 hak • Max ödül 5x • Uzun vadede -%50' });
 
-    return interaction.reply({ embeds: [embed] });
+    return interaction.editReply({ embeds: [embed] });
   }
 
   // ── /relic-set ────────────────────────────────────────────────────────
@@ -8777,24 +9570,38 @@ async function handleMMOCommand(interaction, cmd, sub, gid, uid) {
     const embed = new EmbedBuilder()
       .setTitle('💎 Relic Setleri')
       .setColor(0x9B59B6)
-      .setFooter({ text: `Her parça 8.000 coin • Aynı anda en fazla ${RELIC_SET_MAX_EQUIPPED} set kuşanılabilir (${equippedSets.length}/${RELIC_SET_MAX_EQUIPPED}) • Sandıktan / Zindandan da düşer` });
+      .setFooter({ text: `Parça fiyatı tier'e göre değişir: B 6.000 • A 8.000 • S 11.000 • SSS 15.000 coin • Aynı anda en fazla ${RELIC_SET_MAX_EQUIPPED} set kuşanılabilir (${equippedSets.length}/${RELIC_SET_MAX_EQUIPPED}) • Sandıktan / Madenden / Zindandan da düşer` });
 
     for (const [key, def] of Object.entries(sets)) {
       const count = def.pieces.filter(p => ownedKeys.includes(p.key)).length;
       const progress = '🟩'.repeat(count) + '⬜'.repeat(def.pieces.length - count);
-      const pieces = def.pieces.map(p => `${ownedKeys.includes(p.key) ? '✅' : '❌'} ${p.name}`).join('\n');
       const isEquipped = equippedSets.includes(key);
+      const classTag = def.classKey ? ` ${RPG_CLASSES.find(c => c.key === def.classKey)?.emoji || '🔒'}` : '';
 
-      let bonusText = '';
-      if (def.bonus2)    bonusText += `**2 Parça:** ${def.bonus2.desc}\n`;
-      if (def.bonus4)    bonusText += `**4 Parça:** ${def.bonus4.desc}\n`;
-      if (def.bonusFull) bonusText += `**Tam Set:** ${def.bonusFull.desc}`;
-
-      embed.addFields({
-        name: `${def.emoji} ${def.name} — ${count}/${def.pieces.length} ${progress}${isEquipped ? ' 🟢 KUŞANILI' : ''}`,
-        value: `${pieces}\n\n${bonusText}`,
-        inline: false,
-      });
+      if (setChoice) {
+        // Tek set seçildiyse tam detay göster (parça listesi + tüm bonus kademeleri)
+        const pieces = def.pieces.map(p => `${ownedKeys.includes(p.key) ? '✅' : '❌'} ${p.name} (${p.price}c)`).join('\n');
+        let bonusText = '';
+        if (def.bonus2)    bonusText += `**2 Parça:** ${def.bonus2.desc}\n`;
+        if (def.bonus4)    bonusText += `**4 Parça:** ${def.bonus4.desc}\n`;
+        if (def.bonusFull) bonusText += `**Tam Set:** ${def.bonusFull.desc}`;
+        if (def.classKey) {
+          const clsDef = RPG_CLASSES.find(c => c.key === def.classKey);
+          bonusText += `\n\n🔒 Yalnızca **${clsDef?.emoji || ''} ${clsDef?.name || def.classKey}** sınıfı kuşanabilir.`;
+        }
+        embed.addFields({
+          name: `${def.emoji} ${def.name} [${def.tier}]${classTag} — ${count}/${def.pieces.length} ${progress}${isEquipped ? ' 🟢 KUŞANILI' : ''}`,
+          value: `${pieces}\n\n${bonusText}`,
+          inline: false,
+        });
+      } else {
+        // Hepsi listelendiğinde (19 set) embed limitlerini aşmamak için tek satır özet
+        embed.addFields({
+          name: `${def.emoji} ${def.name} [${def.tier}]${classTag} ${count}/${def.pieces.length} ${isEquipped ? '🟢' : ''}`,
+          value: def.bonusFull?.desc || '—',
+          inline: false,
+        });
+      }
     }
 
     // Yalnızca tek bir set seçildiyse eksik parçalar için satın alma butonu +
@@ -8874,6 +9681,13 @@ async function handleMMOCommand(interaction, cmd, sub, gid, uid) {
 
       const owns = db.prepare('SELECT * FROM mmo_pets WHERE guildId=? AND userId=? AND petKey=? AND hatchedAt=?').get(gid, uid, petKey, hatchedAt);
       if (!owns) return interaction.reply({ ephemeral: true, content: '⛔ Bu pet sende yok veya ID hatalı.' });
+
+      const petDef = MMORPG_PETS.find(p => p.key === petKey);
+      const pCls = getPlayerClass(gid, uid);
+      if (pCls && petDef && !classAllowsStat(pCls, petDef.bonusType)) {
+        const clsDef = RPG_CLASSES.find(c => c.key === pCls);
+        return interaction.reply({ ephemeral: true, content: `⛔ **${clsDef.emoji} ${clsDef.name}** sınıfın **${petDef.emoji} ${petDef.name}** petini kuşanmana izin vermiyor!` });
+      }
 
       equipMmoPet(gid, uid, petKey, hatchedAt, slot);
       const def = MMORPG_PETS.find(p => p.key === petKey);
@@ -9031,7 +9845,7 @@ function buildInventoryEmbed(gid, uid, tab, tabs) {
       ? weapons.map(w => `[ID:${w.id}] ${getWeaponName(w.weaponKey)} **+${w.enhancement}** — ⚔️${getWeaponBattlePower(w.weaponKey, w.enhancement)} güç`).join('\n')
       : '*Silah yok*';
     const aLines  = armors.length
-      ? armors.map(a => `[ID:${a.id}] ${getArmorName(a.slot, a.armorKey.split('_')[1] || '')} **+${a.enhancement}** — 🛡️${getArmorBattlePower(a.armorKey.split('_')[1] || '', a.enhancement)} güç`).join('\n')
+      ? armors.map(a => `[ID:${a.id}] ${getArmorName(a.slot, a.armorKey.split('_')[1] || '')} **+${a.enhancement}** — 🛡️${getArmorBattlePower(a.armorKey.split('_')[1] || '', a.enhancement, a.slot)} güç`).join('\n')
       : '*Zırh yok*';
     embed.addFields(
       { name: '⚔️ Silahlar', value: wLines, inline: false },
@@ -9086,35 +9900,48 @@ function buildInventoryEmbed(gid, uid, tab, tabs) {
   }
 
   else if (tab === 'relic') {
-    const ownedKeys = getRelics(gid, uid);
+    const ownedKeys   = getRelics(gid, uid);
+    const equippedSets = getEquippedRelicSets(gid, uid);
     // Eski relicler
     const oldLines  = RELICS
       .filter(r => ownedKeys.includes(r.key))
       .map(r => `${r.emoji} **${r.name}**`)
       .join('\n') || '*Yok*';
 
-    // Yeni set parçaları
+    // Yeni set parçaları — kuşanılı setler 🟢 ile işaretlenir
     const setLines  = Object.entries(RELIC_SETS).map(([key, def]) => {
       const cnt  = def.pieces.filter(p => ownedKeys.includes(p.key)).length;
-      return `${def.emoji} **${def.name}** ${cnt}/${def.pieces.length}`;
+      const isEquipped = equippedSets.includes(key);
+      return `${def.emoji} **${def.name}** ${cnt}/${def.pieces.length}${isEquipped ? ' 🟢 KUŞANILI' : ''}`;
     }).join('\n');
 
     embed.addFields(
       { name: '📿 Tek Relikler',  value: oldLines,  inline: false },
-      { name: '💎 Set Parçaları', value: setLines,  inline: false },
+      { name: `💎 Set Parçaları (Kuşanılı: ${equippedSets.length}/${RELIC_SET_MAX_EQUIPPED})`, value: setLines,  inline: false },
     );
-    embed.setFooter({ text: '/relic-set ile detay • /market ile satın al' });
+    embed.setFooter({ text: '/relic-set ile kuşan/detay • /market veya /craft kategori:set ile edin' });
   }
 
   else if (tab === 'craft') {
     const mats  = getCraftMats(gid, uid);
-    const lines = mats.length
-      ? mats.map(m => {
+    const basic = mats.filter(m => !ADVANCED_MAT_KEYS.includes(m.matKey));
+    const adv   = mats.filter(m => ADVANCED_MAT_KEYS.includes(m.matKey));
+    const basicLines = basic.length
+      ? basic.map(m => {
           const def = CRAFT_MATERIALS.find(x => x.key === m.matKey);
           return `${def?.emoji || '🔩'} **${def?.name || m.matKey}** × ${m.quantity}`;
         }).join('\n')
-      : '*Craft malzemesi yok — Zindan ve Sandıklardan toplanır*';
-    embed.setDescription(lines);
+      : '*Yok — Zindan ve Sandıklardan toplanır*';
+    const advLines = adv.length
+      ? adv.map(m => {
+          const def = ADVANCED_CRAFT_MATERIALS.find(x => x.key === m.matKey);
+          return `${def?.emoji || '🌀'} **${def?.name || m.matKey}** × ${m.quantity}`;
+        }).join('\n')
+      : '*Yok — /craft kategori:malzeme ile üret*';
+    embed.addFields(
+      { name: '🔩 Ham Malzemeler',      value: basicLines, inline: false },
+      { name: '🌀 Gelişmiş Malzemeler', value: advLines,   inline: false },
+    );
     embed.setFooter({ text: '/craft ile eşya üret' });
   }
 
@@ -9176,6 +10003,12 @@ async function handleCraftCommand(interaction, gid, uid) {
       return interaction.reply({ ephemeral: true, content: `⛔ Geçersiz silah! Seçenekler:\n${options}` });
     }
 
+    const wCls = getPlayerClass(gid, uid);
+    if (wCls && !classAllowsStat(wCls, wType.stat)) {
+      const clsDef = RPG_CLASSES.find(c => c.key === wCls);
+      return interaction.reply({ ephemeral: true, content: `⛔ **${clsDef.emoji} ${clsDef.name}** sınıfın **${wType.emoji} ${wType.name}** craftlamana izin vermiyor!` });
+    }
+
     if (!hasCraftMats(gid, uid, wTier.craft)) {
       const needed = Object.entries(wTier.craft).map(([k,v]) => {
         const d = CRAFT_MATERIALS.find(m => m.key === k);
@@ -9188,7 +10021,7 @@ async function handleCraftCommand(interaction, gid, uid) {
     spendCraftMats(gid, uid, wTier.craft);
     const id = addWeapon(gid, uid, `${typeKey}_${tierKey}`);
     // Craft XP
-    const craftXp = wTier.key === 'ejder' ? 80 : wTier.key === 'kristal' ? 50 : wTier.key === 'altin' ? 30 : 15;
+    const craftXp = wTier.key === 'godslayer' ? 150 : wTier.key === 'ejder' ? 80 : wTier.key === 'kristal' ? 50 : wTier.key === 'altin' ? 30 : 15;
     addRpgXp(gid, uid, craftXp);
 
     return interaction.reply({
@@ -9209,6 +10042,12 @@ async function handleCraftCommand(interaction, gid, uid) {
       return interaction.reply({ ephemeral: true, content: `⛔ Geçersiz zırh! Seçenekler (örn):\n${ARMOR_SLOTS.slice(0,2).flatMap(s => ARMOR_TIERS.slice(0,3).map(t => `\`${s.key}_${t.key}\``)).join(', ')} ...` });
     }
 
+    const aCls = getPlayerClass(gid, uid);
+    if (aCls && !classAllowsStat(aCls, aSlot.stat)) {
+      const clsDef = RPG_CLASSES.find(c => c.key === aCls);
+      return interaction.reply({ ephemeral: true, content: `⛔ **${clsDef.emoji} ${clsDef.name}** sınıfın **${aSlot.emoji} ${aSlot.name}** craftlamana izin vermiyor!` });
+    }
+
     if (!hasCraftMats(gid, uid, aTier.craft)) {
       const needed = Object.entries(aTier.craft).map(([k,v]) => {
         const d = CRAFT_MATERIALS.find(m => m.key === k);
@@ -9220,7 +10059,7 @@ async function handleCraftCommand(interaction, gid, uid) {
 
     spendCraftMats(gid, uid, aTier.craft);
     const id = addArmor(gid, uid, `${slotKey}_${tierKey}`, slotKey);
-    const craftXp = aTier.key === 'ejder' ? 70 : aTier.key === 'kristal' ? 45 : aTier.key === 'altin' ? 25 : 12;
+    const craftXp = aTier.key === 'godslayer' ? 130 : aTier.key === 'ejder' ? 70 : aTier.key === 'kristal' ? 45 : aTier.key === 'altin' ? 25 : 12;
     addRpgXp(gid, uid, craftXp);
 
     return interaction.reply({
@@ -9262,6 +10101,63 @@ async function handleCraftCommand(interaction, gid, uid) {
     const chestDef = MMORPG_CHESTS.find(c => c.key === itemStr);
     addRpgXp(gid, uid, 15);
     return interaction.reply({ content: `✅ **${chestDef?.name}** crafted! (+15 RPG XP)` });
+  }
+
+  else if (kategori === 'malzeme') {
+    // Gelişmiş malzeme craftlama — madenden düşmez, tek yol burası.
+    const def = ADVANCED_CRAFT_MATERIALS.find(m => m.key === itemStr);
+    if (!def) return interaction.reply({ ephemeral: true, content: `⛔ Geçerli gelişmiş malzemeler: ${ADVANCED_CRAFT_MATERIALS.map(m => `\`${m.key}\``).join(', ')}` });
+
+    if (!hasCraftMats(gid, uid, def.craft)) {
+      const needed = Object.entries(def.craft).map(([k, v]) => {
+        const d = CRAFT_MATERIALS.find(m => m.key === k);
+        const have = getCraftMats(gid, uid).find(m => m.matKey === k)?.quantity || 0;
+        return `${d?.emoji || ''} ${d?.name || k}: ${have}/${v}`;
+      }).join('\n');
+      return interaction.reply({ ephemeral: true, content: `⛔ Yetersiz malzeme!\n${needed}` });
+    }
+
+    spendCraftMats(gid, uid, def.craft);
+    addCraftMat(gid, uid, def.key, 1);
+    addRpgXp(gid, uid, 60);
+
+    return interaction.reply({
+      content: `✅ ${def.emoji} **${def.name}** × 1 crafted! (+60 RPG XP)\n🌀 SSS tier ekipman/relic set üretiminde ve +5 sonrası geliştirmelerde kullanılır.`,
+    });
+  }
+
+  else if (kategori === 'set') {
+    // Tam Relic Seti craftlama — kılıç craft sisteminden örnek alınmış, %60 daha zor.
+    const def = RELIC_SETS[itemStr];
+    if (!def) return interaction.reply({ ephemeral: true, content: `⛔ Geçersiz set! Seçenekler: ${Object.keys(RELIC_SETS).join(', ')}` });
+
+    if (def.classKey && getPlayerClass(gid, uid) !== def.classKey) {
+      const clsDef = RPG_CLASSES.find(c => c.key === def.classKey);
+      return interaction.reply({ ephemeral: true, content: `⛔ **${def.emoji} ${def.name}** yalnızca **${clsDef?.emoji || ''} ${clsDef?.name || def.classKey}** sınıfı tarafından craftlanabilir!` });
+    }
+
+    const ownedKeys = getRelics(gid, uid);
+    const missing   = def.pieces.filter(p => !ownedKeys.includes(p.key));
+    if (!missing.length) return interaction.reply({ ephemeral: true, content: `${def.emoji} **${def.name}** zaten tam (6/6) sende var.` });
+
+    const recipe = getRelicSetCraftRecipe(def.tier);
+    if (!hasCraftMats(gid, uid, recipe)) {
+      const needed = Object.entries(recipe).map(([k, v]) => {
+        const d = CRAFT_MATERIALS.find(m => m.key === k) || ADVANCED_CRAFT_MATERIALS.find(m => m.key === k);
+        const have = getCraftMats(gid, uid).find(m => m.matKey === k)?.quantity || 0;
+        return `${d?.emoji || ''} ${d?.name || k}: ${have}/${v}`;
+      }).join('\n');
+      return interaction.reply({ ephemeral: true, content: `⛔ Yetersiz malzeme! **${def.emoji} ${def.name}** [${def.tier}] tam seti için gerekli:\n${needed}` });
+    }
+
+    spendCraftMats(gid, uid, recipe);
+    for (const p of missing) buyRelic(gid, uid, p.key);
+    const craftXp = { B: 60, A: 90, S: 130, SSS: 200 }[def.tier] || 60;
+    addRpgXp(gid, uid, craftXp);
+
+    return interaction.reply({
+      content: `✅ **${def.emoji} ${def.name}** tam set (6/6) crafted! (+${craftXp} RPG XP)\n💎 \`/relic-set\` ekranından kuşanabilirsin (aynı anda max ${RELIC_SET_MAX_EQUIPPED} set).`,
+    });
   }
 
   return interaction.reply({ ephemeral: true, content: '⛔ Geçersiz kategori.' });
@@ -9313,6 +10209,10 @@ async function handleMMOButton(interaction) {
       if (result.reason === 'full') {
         const equipped = getEquippedRelicSets(gid, uid).map(k => RELIC_SETS[k]?.name).filter(Boolean).join(', ');
         return interaction.reply({ ephemeral: true, content: `⛔ Aynı anda en fazla **${RELIC_SET_MAX_EQUIPPED} set** kuşanabilirsin! (Şu an: ${equipped})\nÖnce \`/relic-set\` üzerinden birini **Çıkar**.` });
+      }
+      if (result.reason === 'class') {
+        const clsDef = RPG_CLASSES.find(c => c.key === result.requiredClass);
+        return interaction.reply({ ephemeral: true, content: `⛔ ${def.emoji} **${def.name}** yalnızca **${clsDef?.emoji || ''} ${clsDef?.name || result.requiredClass}** sınıfı tarafından kuşanılabilir!\n\`/sinif\` komutuyla bu yolu seçmen gerekiyor.` });
       }
       return interaction.reply({ ephemeral: true, content: '⛔ Geçersiz set.' });
     }
