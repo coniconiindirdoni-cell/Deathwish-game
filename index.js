@@ -3829,6 +3829,14 @@ client.on('interactionCreate', async interaction => {
           .map(c => ({ name: c.label.slice(0, 100), value: c.key }));
       }
 
+      else if (commandName === 'relic-set' && focused.name === 'set') {
+        choices = Object.entries(RELIC_SETS)
+          .map(([key, def]) => ({ key, label: `${def.emoji} ${def.name} [${def.tier}]` }))
+          .filter(c => !typed || c.key.toLowerCase().includes(typed) || c.label.toLowerCase().includes(typed))
+          .slice(0, 25)
+          .map(c => ({ name: c.label.slice(0, 100), value: c.key }));
+      }
+
       else if (commandName === 'antika' && focused.name === 'anahtar') {
         const inv = getAntiqueInventory(gid2, uid2);
         choices = inv
@@ -9044,9 +9052,7 @@ const MMORPG_SLASH_COMMANDS = [
     .addStringOption(o => o
       .setName('set')
       .setDescription('Set (boş=hepsi)')
-      .addChoices(
-        ...Object.entries(RELIC_SETS).map(([key, def]) => ({ name: `${def.emoji} ${def.name}`, value: key }))
-      )),
+      .setAutocomplete(true)),
 
   // /rpg-pet — MMORPG pet yönetimi
   new SlashCommandBuilder()
@@ -9570,7 +9576,7 @@ async function handleMMOCommand(interaction, cmd, sub, gid, uid) {
     const embed = new EmbedBuilder()
       .setTitle('💎 Relic Setleri')
       .setColor(0x9B59B6)
-      .setFooter({ text: `Parça fiyatı tier'e göre değişir: B 6.000 • A 8.000 • S 11.000 • SSS 15.000 coin • Aynı anda en fazla ${RELIC_SET_MAX_EQUIPPED} set kuşanılabilir (${equippedSets.length}/${RELIC_SET_MAX_EQUIPPED}) • Sandıktan / Madenden / Zindandan da düşer` });
+      .setFooter({ text: `Parça fiyatı: 20.000 coin (set başı 120.000) • Aynı anda en fazla ${RELIC_SET_MAX_EQUIPPED} set kuşanılabilir (${equippedSets.length}/${RELIC_SET_MAX_EQUIPPED}) • Sandıktan / Madenden / Zindandan da düşer` });
 
     for (const [key, def] of Object.entries(sets)) {
       const count = def.pieces.filter(p => ownedKeys.includes(p.key)).length;
@@ -10335,7 +10341,8 @@ function buildChestResultDesc(result) {
 //  Parça sahipliği (relics tablosu) ile kuşanma (active_relic_sets tablosu) AYRI
 //  şeylerdir — bir set 6/6 parça olsa bile kuşanılmadıysa bonusu SIFIRDIR.
 //  Kuşan/Çıkar: /relic-set ekranındaki butonlar → equipRelicSet()/unequipRelicSet().
-//  Fiyat: her parça 10.000 → 8.000 coin (%20 indirim), tam set artık 48.000 coin.
+//  Fiyat: her parça 20.000 coin (tüm tier'lerde eşit), tam set 120.000 coin —
+//  satın almayı caydırıp craftlamayı özendirmek için kasıtlı yüksek tutuldu.
 // ─────────────────────────────────────────────────────────────────────────
 //  DURUM NOTU — Zindan Zorluğu / RPG Stat Gücü (TAMAMLANDI)
 //  /stat artık gerçekten işlevsel: 7 statın toplamı (getRpgPowerScore) bir
