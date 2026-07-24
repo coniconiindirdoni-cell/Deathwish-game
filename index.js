@@ -6048,6 +6048,13 @@ client.on('interactionCreate', async interaction => {
           }).join('\n')
         : `❌ Kuşanılmış MMORPG pet yok *(/rpg-pet kuşan)*`;
 
+      // Hırsızlık seviyesi
+      const theftLvl = getTheftLevel(gid, tid);
+      const theftXpNeeded = theftLvl.level >= THEFT_MAX_LEVEL ? 0 : getTheftXpNeeded(theftLvl.level);
+      const theftStr = theftLvl.level >= THEFT_MAX_LEVEL
+        ? `**${theftLvl.level}** / ${THEFT_MAX_LEVEL} MAX 🔥 (Çalma: ${getTheftStealAmount(gid, tid)} coin)`
+        : `**${theftLvl.level}** / ${THEFT_MAX_LEVEL} — ${theftLvl.xp} / ${theftXpNeeded} XP (Çalma: ${getTheftStealAmount(gid, tid)} coin)`;
+
       // Mülkler
       const props = getProperties(gid, tid);
       const houseStr = props.houseLevel > 0 ? `Lv.${props.houseLevel} (+%${props.houseLevel * 2} Coin Boost)` : '❌ Yok';
@@ -6071,6 +6078,7 @@ client.on('interactionCreate', async interaction => {
           { name: '🐾 Petler (Hepsi Aktif)', value: petStr,                                  inline: false },
           { name: `💎 Kuşanılmış Relic Setleri (${Object.values(relicSetInfo).filter(i => i.equipped).length}/${RELIC_SET_MAX_EQUIPPED})`, value: equippedSetStr, inline: false },
           { name: `🐉 MMORPG Petleri (${mmoActivePets.length}/${MMO_PET_MAX_ACTIVE})`, value: mmoPetStr, inline: false },
+          { name: '🕵️ Hırsızlık Seviyesi', value: theftStr,                                inline: false },
           { name: '🏠 Ev',                value: houseStr,                                 inline: true },
           { name: '🚗 Araba',             value: carStr,                                   inline: true },
           { name: '👑 Kraliyet Unvanları', value: royalStr,                                inline: false },
@@ -7569,24 +7577,36 @@ function getAdvancedEnhanceRequirement(enh) {
 // hesaba katılacağını sınırlar. Kuşanma: /relic-set ekranındaki
 // "Kuşan"/"Çıkar" butonları (mmo_equipset_ / mmo_unequipset_).
 const RELIC_SET_MAX_EQUIPPED = 2;
-// Parça fiyatı — artık tüm tier'lerde eşit (satın alma yerine craftlamayı özendirmek için).
-// Tüm tier'ler artık aynı fiyatta: 6 parça × 20.000 = set başına 120.000 coin.
+// Parça fiyatı — B/A/S tier'lerde eşit, SSS tier'de daha yüksek.
+// B/A/S: 6 parça × 20.000 = set başına 120.000 coin.
+// SSS: 6 parça × 25.000 = set başına 150.000 coin.
 // Amaç: satın almayı caydırıp herkesi craftlamaya (bkz. getRelicSetCraftRecipe) yönlendirmek.
-const RELIC_TIER_PRICE = { B: 20000, A: 20000, S: 20000, SSS: 20000 };
+const RELIC_TIER_PRICE = { B: 20000, A: 20000, S: 20000, SSS: 25000 };
 // Tam set craft reçetesi — kılıç (WEAPON_TIERS) craft reçetesinden örnek alınır,
-// aynı tier'in kılıcına göre %60 DAHA ZOR (×1.6) olacak şekilde ölçeklenir.
+// tier'e göre ölçeklenen bir zorluk çarpanıyla büyütülür. B/A tier'ler kılıç
+// reçetesine göre %60 DAHA ZOR (×1.6) kalır; S tier bu çarpana göre %40 daha
+// kolay (×0.96), SSS tier ise %50 daha kolay (×0.8) craftlanır.
 // SSS tier setler ayrıca 2-3 adet gelişmiş (yalnızca craftlanan) malzeme ister.
 const RELIC_SET_TIER_TO_WEAPON_TIER = { B: 'altin', A: 'kristal', S: 'ejder', SSS: 'godslayer' };
 const RELIC_SET_CRAFT_HARDER_MULT = 1.6;
+// S tier: baz çarpanın %40 kolaylaştırılmışı (×0.6). SSS tier: baz çarpanın
+// %50 kolaylaştırılmışı (×0.5). B/A tier'ler orijinal zorlukta kalır.
+const RELIC_SET_CRAFT_TIER_MULT = {
+  B:   RELIC_SET_CRAFT_HARDER_MULT,
+  A:   RELIC_SET_CRAFT_HARDER_MULT,
+  S:   RELIC_SET_CRAFT_HARDER_MULT * 0.6,
+  SSS: RELIC_SET_CRAFT_HARDER_MULT * 0.5,
+};
 function getRelicSetCraftRecipe(tierGrade) {
   const wKey  = RELIC_SET_TIER_TO_WEAPON_TIER[tierGrade];
   const wTier = WEAPON_TIERS.find(t => t.key === wKey);
   if (!wTier) return {};
+  const mult  = RELIC_SET_CRAFT_TIER_MULT[tierGrade] ?? RELIC_SET_CRAFT_HARDER_MULT;
   const recipe = {};
   for (const [mat, qty] of Object.entries(wTier.craft)) {
     // Kılıcın kendi gelişmiş malzeme gereksinimi varsa (godslayer) onu da
-    // aynı ×1.6 oranıyla ölçekle; yoksa aşağıda ayrıca ekleniyor.
-    recipe[mat] = Math.ceil(qty * RELIC_SET_CRAFT_HARDER_MULT);
+    // aynı tier çarpanıyla ölçekle; yoksa aşağıda ayrıca ekleniyor.
+    recipe[mat] = Math.max(1, Math.ceil(qty * mult));
   }
   if (tierGrade === 'SSS') {
     // 2-3 adet gelişmiş malzeme şartı (godslayer kılıcınkinden bağımsız, sete özel)
@@ -7654,12 +7674,12 @@ const RELIC_SETS = {
   golge: {
     name: 'Gölge Seti', emoji: '🌑', color: 0x2C3E50, tier: 'SSS',
     pieces: [
-      { key: 'golge_tac',      name: 'Gölge Tacı',      price: 20000, emoji: '🌑' },
-      { key: 'golge_kolye',    name: 'Gölge Kolyesi',   price: 20000, emoji: '🌑' },
-      { key: 'golge_yuzuk',    name: 'Gölge Yüzüğü',   price: 20000, emoji: '🌑' },
-      { key: 'golge_kristal',  name: 'Gölge Kristali',  price: 20000, emoji: '🌑' },
-      { key: 'golge_muhur',    name: 'Gölge Mührü',     price: 20000, emoji: '🌑' },
-      { key: 'golge_cekirdek', name: 'Gölge Çekirdeği', price: 20000, emoji: '🌑' },
+      { key: 'golge_tac',      name: 'Gölge Tacı',      price: 25000, emoji: '🌑' },
+      { key: 'golge_kolye',    name: 'Gölge Kolyesi',   price: 25000, emoji: '🌑' },
+      { key: 'golge_yuzuk',    name: 'Gölge Yüzüğü',   price: 25000, emoji: '🌑' },
+      { key: 'golge_kristal',  name: 'Gölge Kristali',  price: 25000, emoji: '🌑' },
+      { key: 'golge_muhur',    name: 'Gölge Mührü',     price: 25000, emoji: '🌑' },
+      { key: 'golge_cekirdek', name: 'Gölge Çekirdeği', price: 25000, emoji: '🌑' },
     ],
     bonus2: { desc: '+%16 Hırsızlık başarı şansı',               stealPct: 16 },
     bonus4: { desc: '+%32 Hırsızlık & +%16 Madencilik satışı',   stealPct: 32, minePct: 16 },
@@ -7668,12 +7688,12 @@ const RELIC_SETS = {
   gunes: {
     name: 'Güneş Seti', emoji: '☀️', color: 0xFFD700, tier: 'SSS',
     pieces: [
-      { key: 'gunes_tac',      name: 'Güneş Tacı',      price: 20000, emoji: '☀️' },
-      { key: 'gunes_kolye',    name: 'Güneş Kolyesi',   price: 20000, emoji: '☀️' },
-      { key: 'gunes_yuzuk',    name: 'Güneş Yüzüğü',   price: 20000, emoji: '☀️' },
-      { key: 'gunes_kristal',  name: 'Güneş Kristali',  price: 20000, emoji: '☀️' },
-      { key: 'gunes_muhur',    name: 'Güneş Mührü',     price: 20000, emoji: '☀️' },
-      { key: 'gunes_cekirdek', name: 'Güneş Çekirdeği', price: 20000, emoji: '☀️' },
+      { key: 'gunes_tac',      name: 'Güneş Tacı',      price: 25000, emoji: '☀️' },
+      { key: 'gunes_kolye',    name: 'Güneş Kolyesi',   price: 25000, emoji: '☀️' },
+      { key: 'gunes_yuzuk',    name: 'Güneş Yüzüğü',   price: 25000, emoji: '☀️' },
+      { key: 'gunes_kristal',  name: 'Güneş Kristali',  price: 25000, emoji: '☀️' },
+      { key: 'gunes_muhur',    name: 'Güneş Mührü',     price: 25000, emoji: '☀️' },
+      { key: 'gunes_cekirdek', name: 'Güneş Çekirdeği', price: 25000, emoji: '☀️' },
     ],
     bonus2: { desc: '+%16 Balıkçılık değeri',                     fishPct: 16 },
     bonus4: { desc: '+%32 Balıkçılık & +%16 Odunculuk satışı',    fishPct: 32, woodPct: 16 },
@@ -7686,7 +7706,7 @@ const RELIC_SETS = {
   //   B  → bonus2:%7  | bonus4:%14 (+%6)  | bonusFull:%25 (+%10 +%10) | fiyat 120.000 (set)
   //   A  → bonus2:%10 | bonus4:%20 (+%8)  | bonusFull:%35 (+%15 +%15) | fiyat 120.000 (set)
   //   S  → bonus2:%13 | bonus4:%26 (+%11) | bonusFull:%46 (+%21 +%21) | fiyat 120.000 (set)
-  //   SSS→ bonus2:%16 | bonus4:%32 (+%14) | bonusFull:%56 (+%27 +%27) | fiyat 120.000 (set)
+  //   SSS→ bonus2:%16 | bonus4:%32 (+%14) | bonusFull:%56 (+%27 +%27) | fiyat 150.000 (set)
   // Dağılım: B=Toprak,Ay,Demir(3) • A=Rüzgar,Su,Yıldız(3) • S=Zehir,Kan(2) • SSS=Elmas,Altın(2)
   toprak: {
     name: 'Toprak Seti', emoji: '🪨', color: 0x8B5A2B, tier: 'B',
