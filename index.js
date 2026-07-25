@@ -766,6 +766,37 @@ const BANK_EXEMPT_COMMANDS = new Set(['setup', 'yardim', 'banka', 'verikaydet', 
 
 // İsim Rengi Rolleri (admin /setup üzerinden ekler, kullanıcı /renk al ile satın alır)
 function getColorRoles(gid)              { return db.prepare('SELECT * FROM color_roles WHERE guildId=?').all(gid); }
+
+// Satırları, Discord embed field limitini (1024 karakter) aşmayacak
+// şekilde birden fazla field'a böler. Örn: "Renk Rolleri" -> "Renk Rolleri (1. kısım)", "(2. kısım)"...
+// baseName: field adının kökü, lines: string dizisi.
+// Dönen değer: [{ name, value }, ...] — embed.addFields(...chunks) ile kullan.
+function chunkLinesIntoFields(baseName, lines, limit = 1024) {
+  if (!lines.length) return [{ name: baseName, value: '_(henüz eklenmedi)_' }];
+
+  const chunks = [];
+  let current = [];
+  let used = 0;
+  for (const line of lines) {
+    const add = (current.length ? 1 : 0) + line.length; // +1 satır arası \n için
+    if (used + add > limit) {
+      chunks.push(current);
+      current = [line];
+      used = line.length;
+    } else {
+      current.push(line);
+      used += add;
+    }
+  }
+  if (current.length) chunks.push(current);
+
+  if (chunks.length === 1) return [{ name: baseName, value: chunks[0].join('\n') }];
+
+  return chunks.map((c, i) => ({
+    name: `${baseName} (${i + 1}. kısım)`,
+    value: c.join('\n'),
+  }));
+}
 function addColorRole(gid, rid, price = 4000) { db.prepare('INSERT OR REPLACE INTO color_roles(guildId,roleId,price)VALUES(?,?,?)').run(gid, rid, price); }
 function removeColorRole(gid, rid)       { db.prepare('DELETE FROM color_roles WHERE guildId=? AND roleId=?').run(gid, rid); }
 
@@ -5366,10 +5397,16 @@ client.on('interactionCreate', async interaction => {
           .setTitle('🛒 Market Rolleri')
           .setColor(0xE67E22);
         if (roles.length) {
-          embed.addFields({ name: '🛒 Market (Eşyalar)', value: roles.map((r, i) => `**${i + 1}.** <@&${r.roleId}> \`(${r.roleId})\` — **${r.price} coin**${r.isPremium ? ' 👑' : ''}`).join('\n'), inline: false });
+          embed.addFields(...chunkLinesIntoFields(
+            '🛒 Market (Eşyalar)',
+            roles.map((r, i) => `**${i + 1}.** <@&${r.roleId}> \`(${r.roleId})\` — **${r.price} coin**${r.isPremium ? ' 👑' : ''}`)
+          ));
         }
         if (colorRoles.length) {
-          embed.addFields({ name: '🎨 Renk Al', value: colorRoles.map((r, i) => `**${i + 1}.** <@&${r.roleId}> \`(${r.roleId})\` — **${r.price} coin**`).join('\n'), inline: false });
+          embed.addFields(...chunkLinesIntoFields(
+            '🎨 Renk Al',
+            colorRoles.map((r, i) => `**${i + 1}.** <@&${r.roleId}> \`(${r.roleId})\` — **${r.price} coin**`)
+          ));
         }
         return interaction.reply({ embeds: [embed] });
       }
@@ -6841,6 +6878,13 @@ async function sendSetupPanel(interaction) {
   const fmt  = key => s[key] ? `<#${s[key]}>` : '_(ayarlanmamış)_';
   const colorRoles = getColorRoles(gid);
 
+  // Discord embed field değeri 1024 karakteri geçemez; liste uzunsa
+  // "(1. kısım)", "(2. kısım)" şeklinde birden fazla field'a bölünür.
+  const colorRoleFields = chunkLinesIntoFields(
+    '🎨 Renk Rolleri',
+    colorRoles.map(r => `<@&${r.roleId}> — ${r.price} coin`)
+  );
+
   const embed = new EmbedBuilder()
     .setTitle('⚙️ DeathWish Game — Ayar Paneli')
     .setColor(0x5865F2)
@@ -6850,7 +6894,7 @@ async function sendSetupPanel(interaction) {
       { name: '💬 Sohbet',        value: `Kanal: ${fmt('sohbet_channel')}` },
       { name: '⌨️ Yazı Oyunu',   value: `Kanal: ${fmt('yazi_oyunu_channel')}` },
       { name: '💰 Çal Kanalı',   value: `Kanal: ${fmt('cal_channel')}` },
-      { name: '🎨 Renk Rolleri', value: colorRoles.length ? colorRoles.map(r => `<@&${r.roleId}> — ${r.price} coin`).join('\n') : '_(henüz eklenmedi)_' },
+      ...colorRoleFields,
       { name: '📋 Log Kanalları', value: [
         `⚡ XP: ${fmt('log_xp_channel')}`,
         `🏆 Level: ${fmt('log_level_channel')}`,
