@@ -4381,43 +4381,55 @@ client.on('interactionCreate', async interaction => {
         (setsByTier[def.tier] = setsByTier[def.tier] || []).push({ setKey, def });
       }
 
+      // Discord embed field value limiti 1024 karakter — bu yüzden tier başına
+      // tek bir büyük field yerine SET BAŞINA bir field kullanılıyor (her biri kısa).
       const fields = [];
       for (const tier of tierOrder) {
         const list = setsByTier[tier];
         if (!list || !list.length) continue;
-        const pieceCount  = list[0].def.pieces.length;
-        const piecePrice  = list[0].def.pieces[0].price;
-        const lines = list.map(({ setKey, def }) => {
+        for (const { setKey, def } of list) {
           const owned      = def.pieces.filter(p => ownedKeys.includes(p.key)).length;
           const isEquipped = equippedSets.includes(setKey);
           const status     = isEquipped ? '✅ Kuşanılı' : owned > 0 ? `📦 ${owned}/${def.pieces.length} parça (kuşanılı değil)` : '⬜ Sahip değilsin';
-          return (
-            `${def.emoji} **${def.name}**  —  ${status}\n` +
-            `　2 parça: ${def.bonus2.desc}\n` +
-            `　4 parça: ${def.bonus4.desc}\n` +
-            `　Tam set (${def.pieces.length}/${def.pieces.length}): ${def.bonusFull.desc}`
-          );
-        });
-        fields.push({
-          name: `${tierEmoji[tier]} Tier ${tier} — parça fiyatı ${piecePrice.toLocaleString('tr-TR')} coin (${pieceCount} parça = ${(piecePrice * pieceCount).toLocaleString('tr-TR')} coin tam set)`,
-          value: lines.join('\n\n'),
-          inline: false,
-        });
+          const piecePrice = def.pieces[0].price;
+
+          fields.push({
+            name: `${tierEmoji[tier]} Tier ${tier} — ${def.emoji} ${def.name} (${piecePrice.toLocaleString('tr-TR')} coin/parça)`,
+            value:
+              `${status}\n` +
+              `2 parça: ${def.bonus2.desc}\n` +
+              `4 parça: ${def.bonus4.desc}\n` +
+              `Tam set (${def.pieces.length}/${def.pieces.length}): ${def.bonusFull.desc}`,
+            inline: false,
+          });
+        }
       }
 
-      const embed = new EmbedBuilder()
-        .setTitle('📿 Relic Bonusu — Tüm Setler')
-        .setColor(0x9B59B6)
-        .setDescription(
-          `<@${uid}> için relic set bilgisi.\n` +
-          `Bonus, yalnızca **kuşanılmış** setlerde aktif olur (aynı anda en fazla **${RELIC_SET_MAX_EQUIPPED}** set). ` +
-          `Parça satın almak için \`/relic-set\`, kuşanmak için de aynı komutu kullan.`
-        )
-        .addFields(fields)
-        .setTimestamp();
+      // Discord tek embed'de max 25 field kabul eder — 27 relic seti olduğu için
+      // field'ları birden fazla embed'e (max 10 embed/mesaj) bölüyoruz.
+      const CHUNK_SIZE = 12;
+      const chunks = [];
+      for (let i = 0; i < fields.length; i += CHUNK_SIZE) chunks.push(fields.slice(i, i + CHUNK_SIZE));
 
-      return interaction.reply({ ephemeral: true, embeds: [embed] });
+      const embeds = chunks.map((chunkFields, idx) => {
+        const embed = new EmbedBuilder()
+          .setColor(0x9B59B6)
+          .addFields(chunkFields)
+          .setTimestamp();
+        if (idx === 0) {
+          embed.setTitle('📿 Relic Bonusu — Tüm Setler');
+          embed.setDescription(
+            `<@${uid}> için relic set bilgisi.\n` +
+            `Bonus, yalnızca **kuşanılmış** setlerde aktif olur (aynı anda en fazla **${RELIC_SET_MAX_EQUIPPED}** set). ` +
+            `Parça satın almak için \`/relic-set\`, kuşanmak için de aynı komutu kullan.`
+          );
+        }
+        return embed;
+      });
+
+      return interaction.reply({ ephemeral: true, embeds });
     }
+
 
 
     // ─────────────────────────────────────────────────────────
