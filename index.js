@@ -1793,6 +1793,7 @@ let stealUseCounter     = 0;
 // Yeni özellikler için in-memory durumlar
 const fishCooldown   = new Map(); // `${gid}:${uid}` -> son tutma zamanı (ms)
 const activeBlackjack = new Map(); // `${gid}:${uid}` -> oyun durumu
+const activeBombaGames = new Map(); // `${gid}:${uid}` -> bomba oyun durumu
 const activeRaces    = new Map(); // channelId -> yarış durumu
 
 function normalizeTR(s) {
@@ -3520,14 +3521,20 @@ const SLASH_COMMANDS = [
   new SlashCommandBuilder()
     .setName('blackjack')
     .setDescription('Blackjack (21) oyna — botla (günlük max 8 kez)')
-    .addIntegerOption(o => o.setName('bahis').setDescription('Bahis miktarı').setRequired(true).setMinValue(1)),
+    .addIntegerOption(o => o.setName('bahis').setDescription('Bahis miktarı (max 100.000)').setRequired(true).setMinValue(1).setMaxValue(100000)),
+
+  // /bomba — 20 sayıdan 2 bombayı bulmadan ilerle, en az 5 doğrudan sonra çekebilirsin
+  new SlashCommandBuilder()
+    .setName('bomba')
+    .setDescription(`Bomba oyunu: ${BOMBA_TOTAL_SLOTS} sayı, ${BOMBA_BOMB_COUNT} bomba! En az ${BOMBA_MIN_CASHOUT_PICKS} doğru bulunca çekebilirsin. (günlük max ${BOMBA_MAX_DAILY} kez)`)
+    .addIntegerOption(o => o.setName('bahis').setDescription('Bahis miktarı (min 50, max 100.000)').setRequired(true).setMinValue(50).setMaxValue(100000)),
 
   // /atyarisi — at yarışı (çok oyunculu bahis)
   new SlashCommandBuilder()
     .setName('atyarisi')
     .setDescription('At yarışına bahis koy (20 saniyelik paylaşımlı yarış penceresi)')
     .addIntegerOption(o => o.setName('at').setDescription('At numarası (1-6)').setRequired(true).setMinValue(1).setMaxValue(6))
-    .addIntegerOption(o => o.setName('bahis').setDescription('Bahis miktarı').setRequired(true).setMinValue(1)),
+    .addIntegerOption(o => o.setName('bahis').setDescription('Bahis miktarı (max 100.000)').setRequired(true).setMinValue(1).setMaxValue(100000)),
 
   // /sifirla (owner)
   new SlashCommandBuilder()
@@ -4218,6 +4225,7 @@ client.on('interactionCreate', async interaction => {
               '`/oyunlar sanskutusu` — Şans kutusu (80 coin)',
               '`/çal @hedef` — Coinini çal',
               '`/blackjack bahis:` — Blackjack (botla, 2x / ~%0.1 ihtimalle 4x)',
+              '`/bomba bahis:` — Bomba oyunu (20 sayı, 2 bomba, en az 5 doğru bulunca çekebilirsin)',
               '`/atyarisi at: bahis:` — At yarışı (paylaşımlı, 2x / ~%0.1 ihtimalle 5x)',
             ].join('\n'),
           },
@@ -5913,20 +5921,28 @@ client.on('interactionCreate', async interaction => {
           return e;
         };
 
-        if (handValue(player) === 21) {
+        if (handValue(player) === 21 || handValue(dealer) === 21) {
           activeBlackjack.delete(bkey);
-          const win = resolveWinAmount(bet, gid, uid);
-          addBalance(gid, uid, win);
-          return await interaction.reply({ embeds: [buildEmbed(true, `🎉 **BLACKJACK!** Kazandın: **+${win} coin**`)] });
+          const playerBJ = handValue(player) === 21;
+          const dealerBJ = handValue(dealer) === 21;
+          if (playerBJ && dealerBJ) {
+            addBalance(gid, uid, bet);
+            return await interaction.reply({ embeds: [buildEmbed(true, `🤝 **Berabere!** Bot da Blackjack yaptı. Bahsin iade edildi.`)] });
+          }
+          if (playerBJ) {
+            const win = resolveWinAmount(bet, gid, uid);
+            addBalance(gid, uid, win);
+            return await interaction.reply({ embeds: [buildEmbed(true, `🎉 **BLACKJACK!** Kazandın: **+${win} coin**`)] });
+          }
+          // Sadece dealer Blackjack yaptı — oyuncu kaybeder
+          return await interaction.reply({ embeds: [buildEmbed(true, `😿 **Kaybettin!** Bot Blackjack yaptı (21). **-${bet} coin**`)] });
         }
 
         const hitId = `bj_hit_${uid}_${Date.now()}`;
         const standId = `bj_stand_${uid}_${Date.now()}`;
-        const cancelId = `bj_cancel_${uid}_${Date.now()}`;
         const row = new ActionRowBuilder().addComponents(
           new ButtonBuilder().setCustomId(hitId).setLabel('Çek (Hit)').setStyle(ButtonStyle.Primary).setEmoji('🃏'),
           new ButtonBuilder().setCustomId(standId).setLabel('Dur (Stand)').setStyle(ButtonStyle.Secondary).setEmoji('✋'),
-          new ButtonBuilder().setCustomId(cancelId).setLabel('Vazgeç (İptal)').setStyle(ButtonStyle.Danger).setEmoji('🚫'),
         );
         await interaction.reply({ embeds: [buildEmbed(false)], components: [row] });
         const m2 = await interaction.fetchReply();
@@ -5936,7 +5952,7 @@ client.on('interactionCreate', async interaction => {
           await i.update({ embeds: [buildEmbed(true, resultText).setColor(won ? 0x2ECC71 : 0xED4245)], components: [] });
         };
 
-        const coll = m2.createMessageComponentCollector({ componentType: ComponentType.Button, time: 60000, filter: i => i.user.id === uid && (i.customId === hitId || i.customId === standId || i.customId === cancelId) });
+        const coll = m2.createMessageComponentCollector({ componentType: ComponentType.Button, time: 60000, filter: i => i.user.id === uid && (i.customId === hitId || i.customId === standId) });
         coll.on('collect', async i => {
           try {
             if (i.customId === hitId) {
@@ -5962,11 +5978,6 @@ client.on('interactionCreate', async interaction => {
                 return await finish(i, `😿 **Kaybettin.** ${pv} vs ${dv}. **-${bet} coin**`, false);
               }
             }
-            if (i.customId === cancelId) {
-              coll.stop();
-              addBalance(gid, uid, bet);
-              return await finish(i, `🚫 **Vazgeçtin.** El iptal edildi, **${bet} coin** bahsin iade edildi.`, true);
-            }
           } catch (err) {
             activeBlackjack.delete(bkey);
             addBalance(gid, uid, bet);
@@ -5986,6 +5997,224 @@ client.on('interactionCreate', async interaction => {
         activeBlackjack.delete(bkey);
         if (betCharged) addBalance(gid, uid, bet);
         sendErrorLog(gid, '/blackjack', err);
+        try {
+          if (!interaction.replied && !interaction.deferred) {
+            await interaction.reply({ ephemeral: true, content: '⛔ Bir hata oluştu, bahsin iade edildi.' });
+          } else {
+            await interaction.followUp({ ephemeral: true, content: '⛔ Bir hata oluştu, bahsin iade edildi.' });
+          }
+        } catch {}
+        return;
+      }
+    }
+
+    // ─────────────────────────────────────────────────────────
+    //  /bomba — 20 sayı, 2 bomba, en az 5 doğrudan sonra çekebilirsin
+    // ─────────────────────────────────────────────────────────
+    if (cmd === 'bomba') {
+      const bet  = interaction.options.getInteger('bahis');
+      const bkey = `${gid}:${uid}`;
+
+      if (activeBombaGames.has(bkey)) {
+        return interaction.reply({ ephemeral: true, content: '⛔ Zaten aktif bir bomba oyunun var.' });
+      }
+
+      const bombaDay   = todayTR();
+      const bombaPlays = getDailyCount(gid, uid, bombaDay, 'bomba');
+      if (bombaPlays >= BOMBA_MAX_DAILY) {
+        return interaction.reply({ ephemeral: true, content: `💣 Günlük ${BOMBA_MAX_DAILY} bomba hakkın doldu! Yarın tekrar gel.` });
+      }
+
+      const bal = getBalance(gid, uid);
+      if (bal.balance < bet) return interaction.reply({ ephemeral: true, content: `⛔ Yetersiz coin! Bakiye: **${bal.balance}**` });
+
+      let betCharged = false;
+      try {
+        incDailyCount(gid, uid, bombaDay, 'bomba');
+        addBalance(gid, uid, -bet);
+        betCharged = true;
+
+        // Bomba konumlarını rastgele seç
+        const bombs = new Set();
+        while (bombs.size < BOMBA_BOMB_COUNT) {
+          bombs.add(randBetween(1, BOMBA_TOTAL_SLOTS));
+        }
+        const totalSafe = BOMBA_TOTAL_SLOTS - BOMBA_BOMB_COUNT;
+
+        const state = { bet, bombs, revealedSafe: new Set(), correctCount: 0, multiplier: 1, finished: false };
+        activeBombaGames.set(bkey, state);
+
+        const currentPayout = () => Math.round(bet * state.multiplier * BOMBA_HOUSE_EDGE);
+
+        const buildButtons = () => {
+          const rows = [];
+          for (let r = 0; r < 4; r++) {
+            const row = new ActionRowBuilder();
+            for (let c = 1; c <= 5; c++) {
+              const num = r * 5 + c;
+              const isSafe = state.revealedSafe.has(num);
+              row.addComponents(
+                new ButtonBuilder()
+                  .setCustomId(`bomba_num_${bkey}_${num}`)
+                  .setLabel(isSafe ? `✅ ${num}` : `${num}`)
+                  .setStyle(isSafe ? ButtonStyle.Success : ButtonStyle.Secondary)
+                  .setDisabled(isSafe)
+              );
+            }
+            rows.push(row);
+          }
+          const canCash = state.correctCount >= BOMBA_MIN_CASHOUT_PICKS;
+          rows.push(new ActionRowBuilder().addComponents(
+            new ButtonBuilder()
+              .setCustomId(`bomba_cashout_${bkey}`)
+              .setLabel(canCash ? `💰 Çek (x${state.multiplier.toFixed(2)} • ${currentPayout()} coin)` : `🔒 Çekmek için en az ${BOMBA_MIN_CASHOUT_PICKS} doğru gerekli`)
+              .setStyle(ButtonStyle.Success)
+              .setDisabled(!canCash)
+          ));
+          return rows;
+        };
+
+        const buildFinalButtons = () => {
+          const rows = [];
+          for (let r = 0; r < 4; r++) {
+            const row = new ActionRowBuilder();
+            for (let c = 1; c <= 5; c++) {
+              const num = r * 5 + c;
+              const isBomb = state.bombs.has(num);
+              const isSafe = state.revealedSafe.has(num);
+              let label = `${num}`, style = ButtonStyle.Secondary;
+              if (isBomb) { label = `💣 ${num}`; style = ButtonStyle.Danger; }
+              else if (isSafe) { label = `✅ ${num}`; style = ButtonStyle.Success; }
+              row.addComponents(new ButtonBuilder().setCustomId(`bomba_done_${bkey}_${num}`).setLabel(label).setStyle(style).setDisabled(true));
+            }
+            rows.push(row);
+          }
+          return rows;
+        };
+
+        const buildEmbed = (desc) => {
+          const e = new EmbedBuilder()
+            .setTitle(`💣 Bomba Oyunu (${BOMBA_TOTAL_SLOTS} Sayı, ${BOMBA_BOMB_COUNT} Bomba)`)
+            .setColor(0x2ECC71)
+            .setDescription(
+              desc ||
+              `Bir sayı seç! Bomba olmayan sayıları bulmaya devam et.\n` +
+              `En az **${BOMBA_MIN_CASHOUT_PICKS}** doğru bulunca çekebilirsin.\n\n` +
+              `💰 Bahis: **${bet} coin** • Doğru: **${state.correctCount}** • Çarpan: **x${state.multiplier.toFixed(2)}**`
+            )
+            .setFooter({ text: `Hak: ${bombaPlays + 1}/${BOMBA_MAX_DAILY}` });
+          return e;
+        };
+
+        await interaction.reply({ embeds: [buildEmbed()], components: buildButtons() });
+        const msg = await interaction.fetchReply();
+
+        const coll = msg.createMessageComponentCollector({
+          componentType: ComponentType.Button,
+          time: 120000,
+          filter: i => i.user.id === uid && i.customId.startsWith('bomba_') && i.customId.includes(bkey),
+        });
+
+        coll.on('collect', async i => {
+          try {
+            if (state.finished) return i.deferUpdate().catch(() => {});
+
+            if (i.customId.startsWith(`bomba_num_${bkey}_`)) {
+              const num = parseInt(i.customId.slice(`bomba_num_${bkey}_`.length), 10);
+              if (state.revealedSafe.has(num)) return i.deferUpdate();
+
+              if (state.bombs.has(num)) {
+                coll.stop();
+                state.finished = true;
+                activeBombaGames.delete(bkey);
+                const refund = Math.round(bet * BOMBA_LOSE_REFUND);
+                addBalance(gid, uid, refund);
+                return await i.update({
+                  embeds: [buildEmbed(
+                    `💥 **BOMBAYI BULDUN!** (${num} numarada bomba vardı)\n` +
+                    `📊 ${state.correctCount} doğru bulmuştun, çarpan: x${state.multiplier.toFixed(2)}\n` +
+                    `😿 **-${bet - refund} coin** kaybettin. (**${refund} coin** iade edildi)`
+                  ).setColor(0xED4245)],
+                  components: buildFinalButtons(),
+                });
+              }
+
+              // güvenli sayı
+              state.revealedSafe.add(num);
+              state.correctCount++;
+              const remainingTotalBefore = BOMBA_TOTAL_SLOTS - (state.correctCount - 1);
+              const remainingSafeBefore  = totalSafe - (state.correctCount - 1);
+              state.multiplier *= remainingTotalBefore / remainingSafeBefore;
+
+              if (state.correctCount >= totalSafe) {
+                // tüm güvenli sayılar bulundu — otomatik çekim
+                coll.stop();
+                state.finished = true;
+                activeBombaGames.delete(bkey);
+                const win = currentPayout();
+                addBalance(gid, uid, win);
+                return await i.update({
+                  embeds: [buildEmbed(
+                    `🏆 **TÜM GÜVENLİ SAYILARI BULDUN!** Otomatik çekim yapıldı.\n` +
+                    `🎉 **+${win - bet} coin** kazandın! (Toplam: **${win} coin**)`
+                  ).setColor(0x2ECC71)],
+                  components: buildFinalButtons(),
+                });
+              }
+
+              return await i.update({ embeds: [buildEmbed()], components: buildButtons() });
+            }
+
+            if (i.customId === `bomba_cashout_${bkey}`) {
+              if (state.correctCount < BOMBA_MIN_CASHOUT_PICKS) return i.deferUpdate();
+              coll.stop();
+              state.finished = true;
+              activeBombaGames.delete(bkey);
+              const win = currentPayout();
+              addBalance(gid, uid, win);
+              return await i.update({
+                embeds: [buildEmbed(
+                  `💰 **Çektin!** ${state.correctCount} doğru ile x${state.multiplier.toFixed(2)} çarpan.\n` +
+                  `🎉 **+${win - bet} coin** kazandın! (Toplam: **${win} coin**)`
+                ).setColor(0x2ECC71)],
+                components: buildFinalButtons(),
+              });
+            }
+          } catch (err) {
+            state.finished = true;
+            activeBombaGames.delete(bkey);
+            addBalance(gid, uid, bet);
+            sendErrorLog(gid, '/bomba (collect)', err);
+            msg.edit({ content: '⛔ Bir hata oluştu, bahsin tamamı iade edildi.', embeds: [], components: [] }).catch(() => {});
+          }
+        });
+
+        coll.on('end', (_, reason) => {
+          if (reason === 'time' && activeBombaGames.has(bkey) && !state.finished) {
+            state.finished = true;
+            activeBombaGames.delete(bkey);
+            if (state.correctCount >= BOMBA_MIN_CASHOUT_PICKS) {
+              const win = currentPayout();
+              addBalance(gid, uid, win);
+              msg.edit({
+                embeds: [buildEmbed(`⏰ Süre doldu, otomatik çekim yapıldı.\n🎉 **+${win - bet} coin** kazandın! (Toplam: **${win} coin**)`).setColor(0x2ECC71)],
+                components: buildFinalButtons(),
+              }).catch(() => {});
+            } else {
+              addBalance(gid, uid, bet);
+              msg.edit({
+                embeds: [buildEmbed(`⏰ Süre doldu, yeterli doğru bulamadığın için bahsin tamamı iade edildi.`).setColor(0x95A5A6)],
+                components: buildFinalButtons(),
+              }).catch(() => {});
+            }
+          }
+        });
+
+        return;
+      } catch (err) {
+        activeBombaGames.delete(bkey);
+        if (betCharged) addBalance(gid, uid, bet);
+        sendErrorLog(gid, '/bomba', err);
         try {
           if (!interaction.replied && !interaction.deferred) {
             await interaction.reply({ ephemeral: true, content: '⛔ Bir hata oluştu, bahsin iade edildi.' });
@@ -8594,6 +8823,12 @@ const SLOT_SYMBOLS_DEF = [
 ];
 const SLOT_MAX_DAILY = 10;
 const BLACKJACK_MAX_DAILY = 8;
+const BOMBA_MAX_DAILY = 15;
+const BOMBA_TOTAL_SLOTS = 20;      // toplam sayı adedi (1-20)
+const BOMBA_BOMB_COUNT = 2;        // bomba adedi
+const BOMBA_MIN_CASHOUT_PICKS = 5; // çekebilmek için gereken minimum doğru sayısı
+const BOMBA_HOUSE_EDGE = 0.95;     // ödeme anında uygulanan house edge (%5)
+const BOMBA_LOSE_REFUND = 0.30;    // bombaya basınca bahsin %30'u iade (yani %70 kayıp)
 
 // ~50% RTP slot sonucu üret
 // Returns: { reels, multiplier, label }
@@ -9362,7 +9597,7 @@ const MMORPG_SLASH_COMMANDS = [
   new SlashCommandBuilder()
     .setName('slot')
     .setDescription(`Slot makinesi oyna (günlük max ${SLOT_MAX_DAILY} kez)`)
-    .addIntegerOption(o => o.setName('bahis').setDescription('Bahis miktarı (min 50, max 5000)').setRequired(true).setMinValue(50).setMaxValue(5000)),
+    .addIntegerOption(o => o.setName('bahis').setDescription('Bahis miktarı (min 50, max 100.000)').setRequired(true).setMinValue(50).setMaxValue(100000)),
 
   // /relic-set — yeni relic set görüntüle
   new SlashCommandBuilder()
