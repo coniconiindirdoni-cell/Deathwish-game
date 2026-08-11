@@ -37,6 +37,17 @@ const PORT   = process.env.PORT || 3000;
 const GITHUB_OWNER   = process.env.GITHUB_OWNER || '';
 const GITHUB_REPO    = process.env.GITHUB_REPO  || '';
 const GITHUB_TOKEN   = process.env.GITHUB_TOKEN  || '';
+
+// /bomba oyunu sabitleri — SLASH_COMMANDS dizisi bu dosyanın ilerisinde
+// tanımlandığı için (ve modül yüklenirken hemen çalıştığı için) bu sabitler
+// dosyanın en başında olmak zorunda, aksi halde "before initialization" hatası alınır.
+const BOMBA_MAX_DAILY = 15;
+const BOMBA_TOTAL_SLOTS = 20;      // toplam sayı adedi (1-20)
+const BOMBA_BOMB_COUNT = 2;        // bomba adedi
+const BOMBA_MIN_CASHOUT_PICKS = 5; // çekebilmek için gereken minimum doğru sayısı
+const BOMBA_HOUSE_EDGE = 0.95;     // ödeme anında uygulanan house edge (%5)
+const BOMBA_LOSE_REFUND = 0.30;    // bombaya basınca bahsin %30'u iade (yani %70 kayıp)
+
 // ⚠️ KRİTİK: Bu branch'e atılan HER commit, Render/Railway gibi platformlarda
 // "Auto-Deploy" kuruluysa YENİ BİR DEPLOY tetikler. Eğer GITHUB_OWNER/GITHUB_REPO
 // botun kaynak kodunun bulunduğu repo ise ve BACKUP_BRANCH o deploy'un izlediği
@@ -3769,6 +3780,33 @@ client.on('messageCreate', async message => {
   const uid = message.author.id;
   const cid = message.channel.id;
 
+  // ── 🤫 İTİRAF KANALI ────────────────────────────────────────
+  // Bu kanala yazılan HER mesaj silinir ve içeriği kimliği belirtilmeden
+  // anonim bir embed olarak aynı kanala "İtiraf!" başlığıyla tekrar gönderilir.
+  const itirafCh = getSetting(gid, 'itiraf_channel');
+  if (itirafCh && cid === itirafCh) {
+    const content = message.content?.trim();
+    const attachmentUrls = message.attachments?.size ? [...message.attachments.values()].map(a => a.url) : [];
+    try { await message.delete(); } catch {}
+
+    if (content || attachmentUrls.length) {
+      try {
+        const embed = new EmbedBuilder()
+          .setTitle('🤫 İtiraf!')
+          .setColor(0x2C2F33)
+          .setDescription(content || '_(medya)_')
+          .setThumbnail(message.guild.iconURL({ size: 256 }) || null)
+          .setFooter({ text: 'Anonim İtiraf • Kimlik gizli tutulur' })
+          .setTimestamp();
+        if (attachmentUrls[0] && /\.(png|jpe?g|gif|webp)$/i.test(attachmentUrls[0])) {
+          embed.setImage(attachmentUrls[0]);
+        }
+        await message.channel.send({ embeds: [embed] });
+      } catch (e) { sendErrorLog(gid, 'itiraf_channel', e); }
+    }
+    return; // İtiraf kanalında başka hiçbir işlem (XP, sohbet sayacı vb.) yürütülmez
+  }
+
   // ── XP KAZANMA (pasif, otomatik) ────────────────────────────
   // Not: XP kazanma ve seviye atlayınca verilen rol, banka hesabı olmasa
   // da çalışır — sadece coin ile ilgili sistemler banka hesabı istiyor.
@@ -7284,6 +7322,7 @@ async function sendSetupPanel(interaction) {
       { name: '💬 Sohbet',        value: `Kanal: ${fmt('sohbet_channel')}` },
       { name: '⌨️ Yazı Oyunu',   value: `Kanal: ${fmt('yazi_oyunu_channel')}` },
       { name: '💰 Çal Kanalı',   value: `Kanal: ${fmt('cal_channel')}` },
+      { name: '🤫 İtiraf Kanalı', value: `Kanal: ${fmt('itiraf_channel')}` },
       ...colorRoleFields,
       { name: '📋 Log Kanalları', value: [
         `⚡ XP: ${fmt('log_xp_channel')}`,
@@ -7311,6 +7350,7 @@ async function sendSetupPanel(interaction) {
       { label: '💬 Sohbet Kanalı',        value: 'sohbet_channel',       description: 'Mesaj sayacı ve pasif coin kanalı' },
       { label: '⌨️ Yazı Oyunu Kanalı',   value: 'yazi_oyunu_channel',   description: '/yazioyunu baslat için özel kanal' },
       { label: '💰 Çal Komutu Kanalı',   value: 'cal_channel',           description: '/oyunlar cal komutunun kanalı' },
+      { label: '🤫 İtiraf Kanalı',       value: 'itiraf_channel',        description: 'Anonim itiraf mesajlarının gönderileceği kanal' },
       { label: '🎨 Renk Rolü Çıkar', value: '__color_remove__', description: 'Listeden renk rolü çıkar' },
       { label: '🎨 Renk Rollerini Listele', value: '__color_list__', description: 'Mevcut renk rollerini gör' },
       { label: '📋 Log Kanallarını Ayarla', value: '__log_submenu__',    description: 'XP, Coin, Backup, Error vb. log kanalları' },
@@ -8823,12 +8863,6 @@ const SLOT_SYMBOLS_DEF = [
 ];
 const SLOT_MAX_DAILY = 10;
 const BLACKJACK_MAX_DAILY = 8;
-const BOMBA_MAX_DAILY = 15;
-const BOMBA_TOTAL_SLOTS = 20;      // toplam sayı adedi (1-20)
-const BOMBA_BOMB_COUNT = 2;        // bomba adedi
-const BOMBA_MIN_CASHOUT_PICKS = 5; // çekebilmek için gereken minimum doğru sayısı
-const BOMBA_HOUSE_EDGE = 0.95;     // ödeme anında uygulanan house edge (%5)
-const BOMBA_LOSE_REFUND = 0.30;    // bombaya basınca bahsin %30'u iade (yani %70 kayıp)
 
 // ~50% RTP slot sonucu üret
 // Returns: { reels, multiplier, label }
