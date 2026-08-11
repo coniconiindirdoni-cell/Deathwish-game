@@ -41,7 +41,7 @@ const GITHUB_TOKEN   = process.env.GITHUB_TOKEN  || '';
 // /bomba oyunu sabitleri — SLASH_COMMANDS dizisi bu dosyanın ilerisinde
 // tanımlandığı için (ve modül yüklenirken hemen çalıştığı için) bu sabitler
 // dosyanın en başında olmak zorunda, aksi halde "before initialization" hatası alınır.
-const BOMBA_MAX_DAILY = 15;
+// (BOMBA_MAX_DAILY kaldırıldı — bomba oyununda artık günlük limit yok)
 const BOMBA_TOTAL_SLOTS = 20;      // toplam sayı adedi (1-20)
 const BOMBA_BOMB_COUNT = 2;        // bomba adedi
 const BOMBA_MIN_CASHOUT_PICKS = 5; // çekebilmek için gereken minimum doğru sayısı
@@ -1784,7 +1784,12 @@ function resolveFishCast(gid, uid, boosted) {
 function resolveWinAmount(bet, gid, uid) {
   const base = Math.random() < 0.001 ? bet * 4 : bet * 2;
   if (!gid || !uid) return base; // gid/uid verilmediyse eski davranış (bonussuz)
-  const bonusPct = getTotalCoinBonusPct(gid, uid);
+  // ÖNEMLİ: Kumar oyunlarında (blackjack/at yarışı) SADECE kumara özel relic
+  // bonusu (RELIC_SETS'teki "slotPct" — örn. Fırtına Seti) etkili olur.
+  // Antika/mülk/pet/market "Kalıcı Coin Boost" gibi genel ekonomi bonusları
+  // buraya SIZDIRILMAZ — onlar sadece madencilik/odunculuk/sohbet gibi pasif
+  // kazançları etkiler.
+  const bonusPct = getRelicSetSlotBonus(gid, uid);
   return Math.round(base * (1 + bonusPct / 100));
 }
 
@@ -3531,13 +3536,13 @@ const SLASH_COMMANDS = [
   // /blackjack — blackjack (21)
   new SlashCommandBuilder()
     .setName('blackjack')
-    .setDescription('Blackjack (21) oyna — botla (günlük max 8 kez)')
+    .setDescription('Blackjack (21) oyna — botla')
     .addIntegerOption(o => o.setName('bahis').setDescription('Bahis miktarı (max 100.000)').setRequired(true).setMinValue(1).setMaxValue(100000)),
 
   // /bomba — 20 sayıdan 2 bombayı bulmadan ilerle, en az 5 doğrudan sonra çekebilirsin
   new SlashCommandBuilder()
     .setName('bomba')
-    .setDescription(`Bomba oyunu: ${BOMBA_TOTAL_SLOTS} sayı, ${BOMBA_BOMB_COUNT} bomba! En az ${BOMBA_MIN_CASHOUT_PICKS} doğru bulunca çekebilirsin. (günlük max ${BOMBA_MAX_DAILY} kez)`)
+    .setDescription(`Bomba oyunu: ${BOMBA_TOTAL_SLOTS} sayı, ${BOMBA_BOMB_COUNT} bomba! En az ${BOMBA_MIN_CASHOUT_PICKS} doğru bulunca çekebilirsin.`)
     .addIntegerOption(o => o.setName('bahis').setDescription('Bahis miktarı (min 50, max 100.000)').setRequired(true).setMinValue(50).setMaxValue(100000)),
 
   // /atyarisi — at yarışı (çok oyunculu bahis)
@@ -5923,18 +5928,11 @@ client.on('interactionCreate', async interaction => {
       const bkey = `${gid}:${uid}`;
       if (activeBlackjack.has(bkey)) return interaction.reply({ ephemeral: true, content: '⛔ Zaten aktif bir blackjack elin var.' });
 
-      const bjDay   = todayTR();
-      const bjPlays = getDailyCount(gid, uid, bjDay, 'blackjack');
-      if (bjPlays >= BLACKJACK_MAX_DAILY) {
-        return interaction.reply({ ephemeral: true, content: `🃏 Günlük ${BLACKJACK_MAX_DAILY} blackjack hakkın doldu! Yarın tekrar gel.` });
-      }
-
       const bal = getBalance(gid, uid);
       if (bal.balance < bet) return interaction.reply({ ephemeral: true, content: `⛔ Yetersiz coin! Bakiye: **${bal.balance}**` });
 
       let betCharged = false;
       try {
-        incDailyCount(gid, uid, bjDay, 'blackjack');
         addBalance(gid, uid, -bet);
         betCharged = true;
 
@@ -5954,7 +5952,7 @@ client.on('interactionCreate', async interaction => {
               { name: `${interaction.user.username} (${handValue(player)})`, value: cardsStr(player), inline: true },
               { name: `Bot (${reveal ? handValue(dealer) : '?'})`, value: reveal ? cardsStr(dealer) : `${dealer[0]} + ?`, inline: true },
             )
-            .setFooter({ text: `Bahis: ${bet} coin • Hak: ${bjPlays + 1}/${BLACKJACK_MAX_DAILY}` });
+            .setFooter({ text: `Bahis: ${bet} coin` });
           if (desc) e.setDescription(desc);
           return e;
         };
@@ -6057,18 +6055,11 @@ client.on('interactionCreate', async interaction => {
         return interaction.reply({ ephemeral: true, content: '⛔ Zaten aktif bir bomba oyunun var.' });
       }
 
-      const bombaDay   = todayTR();
-      const bombaPlays = getDailyCount(gid, uid, bombaDay, 'bomba');
-      if (bombaPlays >= BOMBA_MAX_DAILY) {
-        return interaction.reply({ ephemeral: true, content: `💣 Günlük ${BOMBA_MAX_DAILY} bomba hakkın doldu! Yarın tekrar gel.` });
-      }
-
       const bal = getBalance(gid, uid);
       if (bal.balance < bet) return interaction.reply({ ephemeral: true, content: `⛔ Yetersiz coin! Bakiye: **${bal.balance}**` });
 
       let betCharged = false;
       try {
-        incDailyCount(gid, uid, bombaDay, 'bomba');
         addBalance(gid, uid, -bet);
         betCharged = true;
 
@@ -6140,7 +6131,7 @@ client.on('interactionCreate', async interaction => {
               `En az **${BOMBA_MIN_CASHOUT_PICKS}** doğru bulunca çekebilirsin.\n\n` +
               `💰 Bahis: **${bet} coin** • Doğru: **${state.correctCount}** • Çarpan: **x${state.multiplier.toFixed(2)}**`
             )
-            .setFooter({ text: `Hak: ${bombaPlays + 1}/${BOMBA_MAX_DAILY}` });
+            .setFooter({ text: `Bahis: ${bet} coin` });
           return e;
         };
 
@@ -8861,8 +8852,7 @@ const SLOT_SYMBOLS_DEF = [
   { key: 'star',    emoji: '⭐', tier: 4 },
   { key: 'diamond', emoji: '💎', tier: 5 },
 ];
-const SLOT_MAX_DAILY = 10;
-const BLACKJACK_MAX_DAILY = 8;
+// (SLOT_MAX_DAILY / BLACKJACK_MAX_DAILY kaldırıldı — bu oyunlarda artık günlük limit yok)
 
 // ~50% RTP slot sonucu üret
 // Returns: { reels, multiplier, label }
@@ -9165,16 +9155,7 @@ function enhanceItem(gid, uid, table, id) {
 // ─────────────────────────────────────────────────────────────────────────
 //  VERİTABANI YARDIMCILARI — Slot Makinesi
 // ─────────────────────────────────────────────────────────────────────────
-function getSlotPlays(gid, uid) {
-  const date = todayTR();
-  const r = db.prepare('SELECT plays FROM mmo_slot_daily WHERE guildId=? AND userId=? AND date=?').get(gid, uid, date);
-  return r ? r.plays : 0;
-}
-function incSlotPlays(gid, uid) {
-  const date = todayTR();
-  db.prepare('INSERT OR IGNORE INTO mmo_slot_daily(guildId,userId,date,plays)VALUES(?,?,?,0)').run(gid, uid, date);
-  db.prepare('UPDATE mmo_slot_daily SET plays=plays+1 WHERE guildId=? AND userId=? AND date=?').run(gid, uid, date);
-}
+// (Günlük oynama limiti kaldırıldı — slot artık sınırsız oynanabiliyor)
 
 // ─────────────────────────────────────────────────────────────────────────
 //  VERİTABANI YARDIMCILARI — Zindan Cooldown
@@ -9630,7 +9611,7 @@ const MMORPG_SLASH_COMMANDS = [
   // /slot — slot makinesi
   new SlashCommandBuilder()
     .setName('slot')
-    .setDescription(`Slot makinesi oyna (günlük max ${SLOT_MAX_DAILY} kez)`)
+    .setDescription('Slot makinesi oyna')
     .addIntegerOption(o => o.setName('bahis').setDescription('Bahis miktarı (min 50, max 100.000)').setRequired(true).setMinValue(50).setMaxValue(100000)),
 
   // /relic-set — yeni relic set görüntüle
@@ -10163,12 +10144,6 @@ async function handleMMOCommand(interaction, cmd, sub, gid, uid) {
     const bal = getBalance(gid, uid);
     if (bal.balance < bet) return interaction.reply({ ephemeral: true, content: `⛔ Yetersiz coin! Bakiye: **${bal.balance}**` });
 
-    const plays = getSlotPlays(gid, uid);
-    if (plays >= SLOT_MAX_DAILY) {
-      return interaction.reply({ ephemeral: true, content: `🎰 Günlük ${SLOT_MAX_DAILY} hakkın doldu! Yarın tekrar gel.` });
-    }
-
-    incSlotPlays(gid, uid);
     addBalance(gid, uid, -bet);
 
     const spin = spinSlot();
@@ -10240,9 +10215,8 @@ async function handleMMOCommand(interaction, cmd, sub, gid, uid) {
         { name: '🎁 Kazanç',  value: `${payout} coin`,   inline: true },
         { name: `${net >= 0 ? '📈' : '📉'} Net`,  value: `${net >= 0 ? '+' : ''}${net} coin`, inline: true },
         { name: '💳 Bakiye',  value: `**${newBal}** coin`, inline: true },
-        { name: '🎮 Hak',     value: `${plays + 1}/${SLOT_MAX_DAILY}`, inline: true },
       )
-      .setFooter({ text: 'Slot: Günlük 10 hak • Max ödül 5x • Uzun vadede -%50' });
+      .setFooter({ text: 'Slot: Max ödül 5x • Uzun vadede -%50' });
 
     return interaction.editReply({ embeds: [embed] });
   }
