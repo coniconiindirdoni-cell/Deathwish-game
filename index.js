@@ -128,6 +128,7 @@ function ensureSchema() {
 
     -- ── /banka sistemi + balıkçılık riskleri ─────────────────
     CREATE TABLE IF NOT EXISTS bank_accounts (guildId TEXT, userId TEXT, createdAt INTEGER, PRIMARY KEY(guildId,userId));
+    CREATE TABLE IF NOT EXISTS game_bans (guildId TEXT, userId TEXT, reason TEXT, bannedBy TEXT, bannedAt TEXT, PRIMARY KEY(guildId,userId));
     CREATE TABLE IF NOT EXISTS fish_cast_state (
       guildId TEXT, userId TEXT,
       sinceLine INTEGER DEFAULT 0, lineThreshold INTEGER DEFAULT 0,
@@ -634,6 +635,26 @@ function addBalance(gid, uid, amt)     {
 function addBank(gid, uid, amt)        { db.prepare('INSERT OR IGNORE INTO economy(guildId,userId,balance,bank)VALUES(?,?,0,0)').run(gid, uid); db.prepare('UPDATE economy SET bank=MAX(0,bank+?) WHERE guildId=? AND userId=?').run(amt, gid, uid); return getBalance(gid, uid); }
 function transfer(gid, from, to, amt)  { if (getBalance(gid, from).balance < amt) return false; addBalance(gid, from, -amt); addBalance(gid, to, amt); return true; }
 function topBalance(gid, n = 10)       { return db.prepare('SELECT userId,balance,bank FROM economy WHERE guildId=? ORDER BY (balance+bank) DESC LIMIT ?').all(gid, n); }
+// Owner'ın kullanıcıdan coin ALMASI için: önce cüzdandan, yetmezse kalanı bankadan düşer.
+// Kullanıcı parasını bankaya yatırmış olsa bile owner komutu her durumda çalışır.
+function removeCoinsAnywhere(gid, uid, amt) {
+  const bal = getBalance(gid, uid);
+  const total = bal.balance + bal.bank;
+  const actuallyRemoved = Math.min(amt, total);
+  const fromWallet = Math.min(bal.balance, actuallyRemoved);
+  const fromBank = actuallyRemoved - fromWallet;
+  if (fromWallet > 0) addBalance(gid, uid, -fromWallet);
+  if (fromBank > 0) addBank(gid, uid, -fromBank);
+  return { removed: actuallyRemoved, ...getBalance(gid, uid) };
+}
+
+// ── Oyun yasağı (game ban) yardımcıları ───────────────────────
+function isGameBanned(gid, uid)   { return !!db.prepare('SELECT 1 FROM game_bans WHERE guildId=? AND userId=?').get(gid, uid); }
+function getGameBan(gid, uid)     { return db.prepare('SELECT * FROM game_bans WHERE guildId=? AND userId=?').get(gid, uid) || null; }
+function addGameBan(gid, uid, reason, bannedBy) {
+  db.prepare('INSERT OR REPLACE INTO game_bans(guildId,userId,reason,bannedBy,bannedAt)VALUES(?,?,?,?,?)').run(gid, uid, reason || 'Belirtilmedi', bannedBy, nowTR());
+}
+function removeGameBan(gid, uid)  { db.prepare('DELETE FROM game_bans WHERE guildId=? AND userId=?').run(gid, uid); }
 
 function getMarriage(gid, uid)         { return db.prepare('SELECT * FROM marriages WHERE guildId=? AND (user1=? OR user2=?)').get(gid, uid, uid); }
 function setMarriage(gid, u1, u2)      { const now = nowTR(); db.prepare('INSERT OR IGNORE INTO marriages(guildId,user1,user2,marriedAt)VALUES(?,?,?,?)').run(gid, u1, u2, now); db.prepare('INSERT OR IGNORE INTO marriages(guildId,user1,user2,marriedAt)VALUES(?,?,?,?)').run(gid, u2, u1, now); }
@@ -3594,6 +3615,20 @@ const SLASH_COMMANDS = [
     .addSubcommand(s => s.setName('panel').setDescription('[OWNER] Odunculuk panelini kanala gönder'))
     .addSubcommand(s => s.setName('siralama').setDescription('Odunculuk sıralamasını gör')),
 
+  // /game-yasakla (owner) — kullanıcının TÜM komutlarını engeller
+  new SlashCommandBuilder()
+    .setName('game-yasakla')
+    .setDescription('[OWNER] Kullanıcıyı oyun komutlarını kullanmaktan yasakla / yasağı kaldır')
+    .addSubcommand(s => s.setName('ekle')
+      .setDescription('[OWNER] Kullanıcıyı yasakla — hiçbir komutu kullanamaz')
+      .addUserOption(o => o.setName('hedef').setDescription('Hedef').setRequired(true))
+      .addStringOption(o => o.setName('sebep').setDescription('Yasaklama sebebi')))
+    .addSubcommand(s => s.setName('kaldir')
+      .setDescription('[OWNER] Kullanıcının yasağını kaldır')
+      .addUserOption(o => o.setName('hedef').setDescription('Hedef').setRequired(true)))
+    .addSubcommand(s => s.setName('liste')
+      .setDescription('[OWNER] Yasaklı kullanıcıları listele')),
+
 ].map(c => c.toJSON());
 
 // ──────────────────────────────────────────────────────────────
@@ -4093,6 +4128,21 @@ client.on('interactionCreate', async interaction => {
       }
     }
 
+    // ── OYUN YASAĞI (game ban) ────────────────────────────────
+    // Yasaklı kullanıcı — owner değilse — HİÇBİR komutu kullanamaz.
+    if (interaction.isChatInputCommand() && interaction.guild) {
+      const _uid2 = interaction.user.id;
+      if (!hasOwnerAccess(_uid2, interaction.member)) {
+        const ban = getGameBan(interaction.guild.id, _uid2);
+        if (ban) {
+          return interaction.reply({
+            ephemeral: true,
+            content: `⛔ Oyun komutlarını kullanmaktan yasaklandın.\n📄 Sebep: **${ban.reason}**`,
+          });
+        }
+      }
+    }
+
     // ── SETUP PANELİ ─────────────────────────────────────────
     if (interaction.isChatInputCommand() && interaction.commandName === 'setup') {
       return sendSetupPanel(interaction);
@@ -4570,17 +4620,71 @@ client.on('interactionCreate', async interaction => {
         if (!hasOwnerAccess(uid, interaction.member)) return interaction.reply({ ephemeral: true, content: '⛔ Sadece bot sahipleri kullanabilir.' });
         const target = interaction.options.getUser('hedef');
         const amt    = interaction.options.getInteger('miktar');
-        addBalance(gid, target.id, -amt);
+        // Cüzdan yetersizse kalan kısmı bankadan düşer — kullanıcı parayı bankaya yatırsa bile komut çalışır.
+        const result = removeCoinsAnywhere(gid, target.id, amt);
         sendLog(gid, 'coin', new EmbedBuilder()
           .setTitle('💰 Coin — Owner Çıkarma')
           .setColor(0xED4245)
           .addFields(
             { name: 'Yetkili', value: `<@${uid}>`, inline: true },
             { name: 'Kullanıcı', value: `<@${target.id}>`, inline: true },
-            { name: 'Çıkarılan', value: `-${amt} coin`, inline: true },
+            { name: 'Çıkarılan', value: `-${result.removed} coin`, inline: true },
           ).setTimestamp()
         );
-        return interaction.reply(`✅ <@${target.id}> kullanıcısından **${amt}** coin alındı. Bakiye: **${getBalance(gid, target.id).balance}**`);
+        return interaction.reply(`✅ <@${target.id}> kullanıcısından **${result.removed}** coin alındı${result.removed < amt ? ' (kullanıcının toplam bakiyesi bu kadardı)' : ''}.\n💰 Cüzdan: **${result.balance}** | 🏦 Banka: **${result.bank}**`);
+      }
+    }
+
+    // ─────────────────────────────────────────────────────────
+    //  /game-yasakla (owner)
+    // ─────────────────────────────────────────────────────────
+    if (cmd === 'game-yasakla') {
+      if (!hasOwnerAccess(uid, interaction.member)) return interaction.reply({ ephemeral: true, content: '⛔ Sadece bot sahipleri kullanabilir.' });
+
+      if (sub === 'ekle') {
+        const target = interaction.options.getUser('hedef');
+        const reason = interaction.options.getString('sebep') || 'Belirtilmedi';
+        if (target.id === uid) return interaction.reply({ ephemeral: true, content: '⛔ Kendini yasaklayamazsın.' });
+        if (target.bot) return interaction.reply({ ephemeral: true, content: '⛔ Botları yasaklayamazsın.' });
+        if (hasOwnerAccess(target.id, await interaction.guild.members.fetch(target.id).catch(() => null))) {
+          return interaction.reply({ ephemeral: true, content: '⛔ Bir bot sahibini yasaklayamazsın.' });
+        }
+        addGameBan(gid, target.id, reason, uid);
+        sendLog(gid, 'moderation', new EmbedBuilder()
+          .setTitle('🚫 Oyun Yasağı — Eklendi')
+          .setColor(0xED4245)
+          .addFields(
+            { name: 'Yetkili', value: `<@${uid}>`, inline: true },
+            { name: 'Kullanıcı', value: `<@${target.id}>`, inline: true },
+            { name: 'Sebep', value: reason, inline: false },
+          ).setTimestamp()
+        );
+        return interaction.reply(`🚫 <@${target.id}> artık hiçbir oyun komutunu kullanamayacak.\n📄 Sebep: **${reason}**`);
+      }
+
+      if (sub === 'kaldir') {
+        const target = interaction.options.getUser('hedef');
+        if (!isGameBanned(gid, target.id)) return interaction.reply({ ephemeral: true, content: `⚠️ <@${target.id}> zaten yasaklı değil.` });
+        removeGameBan(gid, target.id);
+        sendLog(gid, 'moderation', new EmbedBuilder()
+          .setTitle('✅ Oyun Yasağı — Kaldırıldı')
+          .setColor(0x57F287)
+          .addFields(
+            { name: 'Yetkili', value: `<@${uid}>`, inline: true },
+            { name: 'Kullanıcı', value: `<@${target.id}>`, inline: true },
+          ).setTimestamp()
+        );
+        return interaction.reply(`✅ <@${target.id}> kullanıcısının oyun yasağı kaldırıldı.`);
+      }
+
+      if (sub === 'liste') {
+        const rows = db.prepare('SELECT * FROM game_bans WHERE guildId=?').all(gid);
+        if (!rows.length) return interaction.reply({ ephemeral: true, content: '📭 Yasaklı kullanıcı yok.' });
+        const embed = new EmbedBuilder()
+          .setTitle('🚫 Yasaklı Kullanıcılar')
+          .setColor(0xED4245)
+          .setDescription(rows.map(r => `<@${r.userId}> — **${r.reason}** _(<@${r.bannedBy}> tarafından)_`).join('\n'));
+        return interaction.reply({ ephemeral: true, embeds: [embed] });
       }
     }
 
