@@ -1879,12 +1879,18 @@ const WORKER_TIERS = [
   { price: 4000, minLevel: 20, maxPurchases: 5 },
 ];
 
-const MINING_COOLDOWNS = new Map(); // key: guildId:userId → timestamp
+const MINING_COOLDOWNS = new Map(); // key: guildId:userId:action → timestamp
 
-function miningCooldownCheck(gid, uid) {
-  const key = `${gid}:${uid}`;
+// mine_dig (Madene Gönder) = 1 dakika, diğer tüm butonlar = 5 saniye
+function getMiningCooldownMs(customId) {
+  return customId === 'mine_dig' ? 60000 : 5000;
+}
+
+function miningCooldownCheck(gid, uid, action = 'default') {
+  const key = `${gid}:${uid}:${action}`;
   const last = MINING_COOLDOWNS.get(key) || 0;
-  const remaining = 10000 - (Date.now() - last);
+  const cdMs = getMiningCooldownMs(action);
+  const remaining = cdMs - (Date.now() - last);
   if (remaining > 0) return Math.ceil(remaining / 1000);
   MINING_COOLDOWNS.set(key, Date.now());
   return 0;
@@ -2003,7 +2009,7 @@ function buildMiningPanel() {
     .setDescription(
       '**Madene işçi gönder, maden çıkar, envanterini sat!**\n\n' +
       '🔒 Tüm oyun verilerin yalnızca sana görünür.\n' +
-      '⏱️ Her eylem için **10 saniye** bekleme süresi var.\n' +
+      '⏱️ **Madene Gönder**: 1 dakikada bir | Diğer butonlar: 5 saniyede bir kullanılabilir.\n' +
       '⚡ Enerji her **2 dakikada bir** 1 adet yenilenir.\n' +
       '💸 Her gezi için işçi başına **3 coin** ücret ödenir.\n' +
       '🍽️ Madencilerin aç kalırsa verim düşer!'
@@ -2039,7 +2045,7 @@ async function handleMineButton(interaction) {
   const uid = interaction.user.id;
   if (!gid) return interaction.reply({ ephemeral: true, content: '⛔ Bu bir sunucu içinde kullanılabilir.' });
 
-  const cd = miningCooldownCheck(gid, uid);
+  const cd = miningCooldownCheck(gid, uid, interaction.customId);
   if (cd > 0) return interaction.reply({ ephemeral: true, content: `⏳ **${cd}** saniye beklemelisin!` });
 
   if (!hasBankAccount(gid, uid)) {
@@ -3682,6 +3688,42 @@ setInterval(() => {
 }, 14 * 60 * 1000);
 
 // ──────────────────────────────────────────────────────────────
+//  BAĞLANTI BEKÇİSİ (WATCHDOG)
+// ──────────────────────────────────────────────────────────────
+// Bazı barındırma ortamlarında Discord gateway WebSocket bağlantısı
+// zamanla "zombi" hale gelebilir: TCP soketi teknik olarak açık kalır
+// (bot Discord'da "çevrimiçi" görünmeye devam eder) ama artık hiçbir
+// event işlenmez, hiçbir komuta yanıt verilmez. discord.js'in kendi
+// heartbeat/reconnect mekanizması bunu her zaman güvenilir şekilde
+// yakalayamayabilir.
+//
+// Bu bekçi her 3 dakikada bir gerçek bir REST isteği (client.user.fetch)
+// göndererek bağlantının GERÇEKTEN canlı olup olmadığını test eder.
+// İstek 20 saniye içinde tamamlanmazsa ya da hata verirse, process
+// kasıtlı olarak sonlandırılır — Render (ve benzeri barındırma
+// platformları) bir process kapandığında onu otomatik olarak yeniden
+// başlatır, böylece bot kendi kendine "iyileşmiş" olur.
+const WATCHDOG_INTERVAL_MS = 3 * 60 * 1000;
+const WATCHDOG_TIMEOUT_MS  = 20 * 1000;
+
+setInterval(async () => {
+  try {
+    if (!client.isReady()) {
+      console.warn('🐕 Watchdog: client.isReady() false — bağlantı henüz hazır değil, atlanıyor.');
+      return;
+    }
+    const timeoutPromise = new Promise((_, reject) =>
+      setTimeout(() => reject(new Error('watchdog timeout')), WATCHDOG_TIMEOUT_MS)
+    );
+    await Promise.race([client.user.fetch(), timeoutPromise]);
+    // Başarılı — bağlantı canlı, bir şey yapmaya gerek yok.
+  } catch (err) {
+    console.error('🐕⛔ Watchdog: Discord bağlantısı yanıt vermiyor (' + (err?.message || err) + '). Process kasıtlı olarak sonlandırılıyor, barındırma platformu otomatik yeniden başlatacak.');
+    process.exit(1);
+  }
+}, WATCHDOG_INTERVAL_MS);
+
+// ──────────────────────────────────────────────────────────────
 //  SES TAKİBİ + GÜNLÜK SES GÖREVİ
 // ──────────────────────────────────────────────────────────────
 // Ses sistemi: dakika başına 5 coin (çıkışta ödenir)
@@ -5139,7 +5181,8 @@ client.on('interactionCreate', async interaction => {
       }
 
       const homePayload = buildMarketHome();
-      const msg = await interaction.reply({ ...homePayload, fetchReply: true });
+      await interaction.reply(homePayload);
+      const msg = await interaction.fetchReply();
 
       const collector = msg.createMessageComponentCollector({
         filter: i => i.user.id === uid && i.customId.startsWith('mkt_'),
@@ -6978,7 +7021,8 @@ client.on('interactionCreate', async interaction => {
         .setPlaceholder('Ne yükseltmek istiyorsun?')
         .addOptions(options);
 
-      const msg = await interaction.reply({ embeds: [embed], components: [new ActionRowBuilder().addComponents(menu)], fetchReply: true });
+      await interaction.reply({ embeds: [embed], components: [new ActionRowBuilder().addComponents(menu)] });
+      const msg = await interaction.fetchReply();
 
       const collector = msg.createMessageComponentCollector({ filter: i => i.user.id === uid, time: 30_000 });
       collector.on('collect', async i => {
@@ -8315,70 +8359,70 @@ const DUNGEONS = [
   {
     key: 'goblin',      name: 'Goblin Mağarası',    emoji: '👺',
     minLevel: 1,  xpReward: [30,60],   coinReward: [80,200],
-    color: 0x2ECC71, cd: 120000, requiredPower: 20,
+    color: 0x2ECC71, cd: 300000, requiredPower: 20,
     desc: 'Goblinlerin ininden coin ve malzeme topla.',
     matPool: ['demir_cevheri','bakir_cevheri'],
   },
   {
     key: 'iskelet',     name: 'İskelet Mezarlığı',  emoji: '💀',
     minLevel: 3,  xpReward: [50,90],   coinReward: [150,350],
-    color: 0x95A5A6, cd: 120000, requiredPower: 40,
+    color: 0x95A5A6, cd: 300000, requiredPower: 40,
     desc: 'Ölümsüzlerin arasında gizli hazineler var.',
     matPool: ['demir_cevheri','obsidyen'],
   },
   {
     key: 'orumcek',     name: 'Örümcek Yuvası',     emoji: '🕷️',
     minLevel: 5,  xpReward: [80,130],  coinReward: [250,500],
-    color: 0x8E44AD, cd: 120000, requiredPower: 60,
+    color: 0x8E44AD, cd: 300000, requiredPower: 60,
     desc: 'Dev örümcekler değerli iplik ve malzeme bırakır.',
     matPool: ['demir_cevheri','altin_cevheri','ruh_tozu'],
   },
   {
     key: 'hayalet',     name: 'Hayalet Şatosu',     emoji: '👻',
     minLevel: 8,  xpReward: [110,180], coinReward: [400,750],
-    color: 0x6C3483, cd: 120000, requiredPower: 90,
+    color: 0x6C3483, cd: 300000, requiredPower: 90,
     desc: 'Şatonun hayaletleri Ruh Tozu bırakır.',
     matPool: ['ruh_tozu','obsidyen','saf_kristal'],
   },
   {
     key: 'lav',         name: 'Lav Tapınağı',       emoji: '🌋',
     minLevel: 12, xpReward: [160,250], coinReward: [600,1100],
-    color: 0xFF4500, cd: 120000, requiredPower: 130,
+    color: 0xFF4500, cd: 300000, requiredPower: 130,
     desc: 'Cehennem ateşi içinde Lav Taşları bulunur.',
     matPool: ['lav_tasi','obsidyen','ejder_pulu'],
   },
   {
     key: 'buz',         name: 'Buz Sarayı',         emoji: '❄️',
     minLevel: 16, xpReward: [210,320], coinReward: [850,1500],
-    color: 0x00BFFF, cd: 120000, requiredPower: 170,
+    color: 0x00BFFF, cd: 300000, requiredPower: 170,
     desc: 'Sonsuz soğukta Buz Çekirdekleri gizlidir.',
     matPool: ['buz_cekirdegi','saf_kristal','yildirim_kristali'],
   },
   {
     key: 'orman',       name: 'Orman Mabedi',       emoji: '🌲',
     minLevel: 20, xpReward: [280,420], coinReward: [1200,2000],
-    color: 0x27AE60, cd: 120000, requiredPower: 210,
+    color: 0x27AE60, cd: 300000, requiredPower: 210,
     desc: 'Antik ormanın ruhu değerli taşlar saklar.',
     matPool: ['ay_tasi','gunes_parcasi','saf_kristal'],
   },
   {
     key: 'karanlik',    name: 'Karanlık Orman',     emoji: '🌑',
     minLevel: 25, xpReward: [370,560], coinReward: [1700,2800],
-    color: 0x2C3E50, cd: 120000, requiredPower: 260,
+    color: 0x2C3E50, cd: 300000, requiredPower: 260,
     desc: 'Karanlık öz bu ormanda kendiliğinden oluşur.',
     matPool: ['karanlik_oz','ruh_tozu','ejder_pulu'],
   },
   {
     key: 'ejder',       name: 'Ejder Zirvesi',      emoji: '🐉',
     minLevel: 35, xpReward: [550,800], coinReward: [2500,4000],
-    color: 0xFF6B00, cd: 120000, requiredPower: 360,
+    color: 0xFF6B00, cd: 300000, requiredPower: 360,
     desc: 'Ejderin yatağında Ejder Pulu ve nadirlikler var.',
     matPool: ['ejder_pulu','elmas_cevheri','karanlik_oz','ay_tasi'],
   },
   {
     key: 'cehennem',    name: 'Cehennem Kapısı',    emoji: '🔥',
     minLevel: 45, xpReward: [750,1100],coinReward: [4000,7000],
-    color: 0xC0392B, cd: 120000, requiredPower: 460,
+    color: 0xC0392B, cd: 300000, requiredPower: 460,
     desc: 'Cehennemin kapısında en değerli malzemeler bulunur.',
     matPool: ['ejder_pulu','karanlik_oz','ay_tasi','gunes_parcasi','yildirim_kristali','buz_cekirdegi'],
   },
