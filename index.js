@@ -3764,6 +3764,9 @@ client.on('voiceStateUpdate', async (oldState, newState) => {
 //  HATA LOG YARDIMCISI (tüm try/catch'lerde kullanılır)
 // ──────────────────────────────────────────────────────────────
 function sendErrorLog(gid, context, err) {
+  // Hata her zaman konsola da yazılır — Discord log kanalı ayarlı olmasa
+  // bile barındırma (hosting) konsolunda görülebilsin diye.
+  console.error(`⛔ [${context}]`, err?.stack || err);
   try {
     const stack = err?.stack || String(err);
     const embed = new EmbedBuilder()
@@ -4692,30 +4695,8 @@ client.on('interactionCreate', async interaction => {
     //  /xp
     // ─────────────────────────────────────────────────────────
     if (cmd === 'xp') {
-      if (sub === 'seviye') {
-        const target = interaction.options.getUser('hedef') || interaction.user;
-        const lvl = getLevel(gid, target.id);
-        const needed = Math.round((lvl.level + 1) * 100 * 0.8925);
-        const embed = new EmbedBuilder()
-          .setTitle(`📊 ${target.username} — Seviye`)
-          .setColor(0x57F287)
-          .setThumbnail(target.displayAvatarURL())
-          .addFields(
-            { name: '🏆 Seviye', value: `**${lvl.level}**`, inline: true },
-            { name: '⚡ XP', value: `**${lvl.xp} / ${needed}**`, inline: true },
-          );
-        return interaction.reply({ embeds: [embed] });
-      }
-
-      if (sub === 'siralama') {
-        const top = topLevels(gid, 10);
-        if (!top.length) return interaction.reply('🏁 Henüz seviye verisi yok.');
-        const embed = new EmbedBuilder()
-          .setTitle('📊 Seviye Sıralaması')
-          .setColor(0x57F287)
-          .setDescription(top.map((r, i) => `**${i + 1}.** <@${r.userId}> — Seviye **${r.level}**`).join('\n'));
-        return interaction.reply({ embeds: [embed] });
-      }
+      // NOT: 'seviye' ve 'siralama' subcommand'ları /xp komutunda ARTIK KAYITLI DEĞİL.
+      // Bu işlevler ayrı komutlara taşındı: /hakkimda (seviye bilgisi) ve /siralama.
 
       if (sub === 'ver') {
         if (!hasOwnerAccess(uid, interaction.member)) return interaction.reply({ ephemeral: true, content: '⛔ Sadece bot sahipleri kullanabilir.' });
@@ -4991,83 +4972,23 @@ client.on('interactionCreate', async interaction => {
     if (cmd === 'evlilik') {
       if (sub === 'yuzuk-al') {
         if (getMarriage(gid, uid)) return interaction.reply({ ephemeral: true, content: 'Zaten evlisin babuş, yüzüğe gerek kalmadı 😅' });
-        if (hasRing(gid, uid)) return interaction.reply({ ephemeral: true, content: 'Zaten bir yüzüğün var 💍 Teklif etmeyi dene: `/evlilik evlen`' });
+        if (hasRing(gid, uid)) return interaction.reply({ ephemeral: true, content: 'Zaten bir yüzüğün var 💍 Teklif etmeyi dene: `/evlen`' });
         const bal = getBalance(gid, uid);
         if (bal.balance < 1500) return interaction.reply({ ephemeral: true, content: `⛔ Yetersiz coin! Gerekli: **1500 coin**, Bakiye: **${bal.balance}**` });
         addBalance(gid, uid, -1500);
         giveRing(gid, uid);
-        return interaction.reply('✅ **-1500 coin** ile **tek kullanımlık** bir yüzük aldın! `/evlilik evlen @kişi` ile teklif et 💍');
+        return interaction.reply('✅ **-1500 coin** ile **tek kullanımlık** bir yüzük aldın! `/evlen @kişi` ile teklif et 💍');
       }
 
       if (sub === 'yuzugum') {
-        if (hasRing(gid, uid)) return interaction.reply('💍 Bir yüzüğün var. Şansını dene: `/evlilik evlen`');
+        if (hasRing(gid, uid)) return interaction.reply('💍 Bir yüzüğün var. Şansını dene: `/evlen`');
         if (getMarriage(gid, uid)) return interaction.reply('💍 Evlisin zaten; yüzüğün kalbinde ✨');
         return interaction.reply('💍 Henüz yüzüğün yok. Almak için: `/evlilik yuzuk-al` (1500 coin)');
       }
 
-      if (sub === 'evlen') {
-        const target = interaction.options.getUser('hedef');
-        if (target.bot) return interaction.reply({ ephemeral: true, content: 'Botlarla evlenemezsin babuş 😅' });
-        if (target.id === uid) return interaction.reply({ ephemeral: true, content: 'Kendinle evlenemezsin… ama kendini sevmen güzel 😌' });
-        const now2 = Date.now();
-        const cdKey = `${gid}:${uid}`;
-        if ((now2 - (proposalCooldown.get(cdKey) || 0)) < 5 * 60 * 1000) {
-          return interaction.reply({ ephemeral: true, content: '⏳ Biraz bekle. 5 dakikada bir teklif edebilirsin.' });
-        }
-        if (!hasRing(gid, uid)) return interaction.reply({ ephemeral: true, content: '💍 Önce yüzük al: `/evlilik yuzuk-al` (**1500 coin**)' });
-        if (getMarriage(gid, uid)) return interaction.reply({ ephemeral: true, content: 'Zaten evlisin babuş.' });
-        if (getMarriage(gid, target.id)) return interaction.reply({ ephemeral: true, content: 'Hedef kişi zaten evli görünüyor.' });
-        const accId = `macc_${uid}_${target.id}_${Date.now()}`;
-        const rejId = `mrej_${uid}_${target.id}_${Date.now()}`;
-        const row = new ActionRowBuilder().addComponents(
-          new ButtonBuilder().setCustomId(accId).setLabel('Kabul Et').setStyle(ButtonStyle.Success).setEmoji('💍'),
-          new ButtonBuilder().setCustomId(rejId).setLabel('Reddet').setStyle(ButtonStyle.Danger).setEmoji('❌'),
-        );
-        await interaction.reply({
-          content: `${target}, **${interaction.user.username}** sana **evlilik teklifi** ediyor! 💞`,
-          files: [pick(PROPOSAL_HAPPY_GIFS)],
-          components: [row],
-        });
-        const m2 = await interaction.fetchReply();
-        let resolved = false;
-        const coll = m2.createMessageComponentCollector({
-          time: 30000,
-          componentType: ComponentType.Button,
-          filter: i => (i.customId === accId || i.customId === rejId) && i.user.id === target.id,
-        });
-        coll.on('collect', async i => {
-          resolved = true;
-          proposalCooldown.set(cdKey, Date.now());
-          if (i.customId === rejId) {
-            await i.update({ content: `💔 ${target.username} teklifi **reddetti**.`, files: [pick(PROPOSAL_SAD_GIFS)], components: [] });
-            sendLog(gid, 'marriage', new EmbedBuilder().setTitle('💔 Evlilik Teklifi Reddedildi').setColor(0xED4245)
-              .addFields({ name: 'Teklif Eden', value: `<@${uid}>`, inline: true }, { name: 'Reddeden', value: `<@${target.id}>`, inline: true }).setTimestamp());
-          } else {
-            if (!hasRing(gid, uid) || getMarriage(gid, uid) || getMarriage(gid, target.id)) {
-              return i.update({ content: '⛔ Teklif geçersiz (durum değişti).', components: [] });
-            }
-            setMarriage(gid, uid, target.id);
-            consumeRing(gid, uid);
-            await i.update({ content: `💍 **${interaction.user.username}** ve **${target.username}** artık **EVLİ!** 🎉`, components: [] });
-            sendLog(gid, 'marriage', new EmbedBuilder().setTitle('💍 Yeni Evlilik!').setColor(0xFF73FA)
-              .addFields({ name: 'Eş 1', value: `<@${uid}>`, inline: true }, { name: 'Eş 2', value: `<@${target.id}>`, inline: true }, { name: 'Tarih', value: nowTR(), inline: true }).setTimestamp());
-          }
-        });
-        coll.on('end', async () => {
-          if (!resolved) {
-            proposalCooldown.set(cdKey, Date.now());
-            await m2.edit({ content: '⏰ Süre doldu, teklif geçersiz oldu.', components: [] }).catch(() => {});
-          }
-        });
-        return;
-      }
-
-      if (sub === 'esim') {
-        const m = getMarriage(gid, uid);
-        if (!m) return interaction.reply('Bekârsın babuş. Belki bugün değişir? `/evlilik evlen`');
-        const spouse = m.user1 === uid ? m.user2 : m.user1;
-        return interaction.reply(`💞 Eşin: <@${spouse}>\n📅 Evlilik tarihi: **${m.marriedAt}**`);
-      }
+      // NOT: 'evlen' ve 'esim' subcommand'ları /evlilik komutunda ARTIK KAYITLI DEĞİL
+      // (SlashCommandBuilder'da yok) — bu iki işlev ayrı, bağımsız komutlara taşındı:
+      // teklif etmek için /evlen, eş bilgisi için /esim kullanılır (aşağıda tanımlı).
 
       if (sub === 'bosan') {
         const m = getMarriage(gid, uid);
@@ -5096,7 +5017,7 @@ client.on('interactionCreate', async interaction => {
 
       if (sub === 'ciftyazitura') {
         const secim = interaction.options.getString('secim');
-        if (!getMarriage(gid, uid)) return interaction.reply({ ephemeral: true, content: '⛔ Bu oyun **sadece evliler** için. `/evlilik evlen` ile başlayabilirsin.' });
+        if (!getMarriage(gid, uid)) return interaction.reply({ ephemeral: true, content: '⛔ Bu oyun **sadece evliler** için. `/evlen` ile başlayabilirsin.' });
         const day  = todayTR();
         const used = getDailyCount(gid, uid, day, 'ciftyazitura');
         if (used >= 10) return interaction.reply({ ephemeral: true, content: '⛔ Günlük oyun limitine ulaştın (**10**). Yarın tekrar gel!' });
@@ -5747,71 +5668,8 @@ client.on('interactionCreate', async interaction => {
         return interaction.reply({ embeds: [embed] });
       }
 
-      if (sub === 'cal') {
-        const calCh = getSetting(gid, 'cal_channel');
-        if (calCh && interaction.channelId !== calCh) {
-          return interaction.reply({ ephemeral: true, content: `⛔ Bu komutu sadece <#${calCh}> kanalında kullanabilirsin.` });
-        }
-        const victim = interaction.options.getUser('hedef');
-        if (victim.bot) return interaction.reply({ ephemeral: true, content: 'Botlardan çalamazsın 😅' });
-        if (victim.id === uid) return interaction.reply({ ephemeral: true, content: 'Kendinden çalamazsın 🙂' });
-        if (hasShield(gid, victim.id)) return interaction.reply({ ephemeral: true, content: `🛡️ ${victim.username} şu anda **Hırsızlık Kalkanı** ile korunuyor, çalamazsın.` });
-        // Aynı anda yalnızca 1 kişi soyulabilir (aynı saldırgan başka hırsızlık işlemi yapamasın)
-        const alreadyThieving = [...activeSteals].some(k => k.startsWith(`${uid}:`));
-        if (alreadyThieving) return interaction.reply({ ephemeral: true, content: '⛔ Zaten aktif bir hırsızlık işlemin var! Önce o bitsin.' });
-        const key = `${uid}:${victim.id}`;
-        const stealAmount = getTheftStealAmount(gid, uid);
-        if (getBalance(gid, victim.id).balance < stealAmount) return interaction.reply({ ephemeral: true, content: 'Hedefin coin\'i yetersiz.' });
-        activeSteals.add(key);
-        const cancelId = `cancel_steal_${Date.now()}_${uid}`;
-        // Gölge Seti — Hırsızlık başarı bonusu: hedefin iptal etmek için ayrılan süre kısalır
-        const stealSetBonusPct = getRelicSetStealBonus(gid, uid);
-        const stealWindowMs    = Math.max(10000, Math.round(30000 * (1 - stealSetBonusPct / 100)));
-        const stealWindowSec   = Math.round(stealWindowMs / 1000);
-        const row = new ActionRowBuilder().addComponents(
-          new ButtonBuilder().setCustomId(cancelId).setLabel(`İptal Et (${stealWindowSec}s)`).setStyle(ButtonStyle.Danger).setEmoji('⛔')
-        );
-        await interaction.reply({
-          content: `${victim}, **${interaction.user.username}** senden **${stealAmount} coin** çalmaya çalışıyor! ${stealWindowSec} saniye içinde butona basmazsan para gider 😈`,
-          components: [row],
-        });
-        const m2 = await interaction.fetchReply();
-        let prevented = false;
-        const coll = m2.createMessageComponentCollector({
-          componentType: ComponentType.Button,
-          time: stealWindowMs,
-          filter: i => i.customId === cancelId && i.user.id === victim.id,
-        });
-        coll.on('collect', async i => {
-          prevented = true;
-          activeSteals.delete(key);
-          await i.update({ content: `🛡️ ${victim.username} çalmayı **iptal etti**! ${interaction.user.username} eli boş döndü.`, components: [] });
-        });
-        coll.on('end', async () => {
-          if (prevented) return;
-          activeSteals.delete(key);
-          if (getBalance(gid, victim.id).balance < stealAmount) return m2.edit({ content: '⚠️ Hedef zaten fakirleşmiş.', components: [] });
-          transfer(gid, victim.id, uid, stealAmount);
-          const theftResult = addTheftXp(gid, uid);
-          const levelUpMsg = theftResult.leveled ? ` 📈 Hırsızlık seviyen **${theftResult.newLevel}** oldu!` : '';
-          await m2.edit({ content: `💰 **${interaction.user.username}**, **${victim.username}**'den **${stealAmount} coin** çaldı! (+${THEFT_XP_PER_WIN} hırsızlık XP)${levelUpMsg}`, components: [] });
-          stealUseCounter++;
-          if (stealUseCounter >= 50) {
-            stealUseCounter = 0;
-            if (calCh) {
-              const ch = await client.channels.fetch(calCh).catch(() => null);
-              if (ch?.isTextBased?.()) {
-                const fetched = await ch.messages.fetch({ limit: 100 }).catch(() => null);
-                if (fetched) {
-                  const botMsgs = fetched.filter(m => m.author.id === client.user.id);
-                  if (botMsgs.size) await ch.bulkDelete(botMsgs, true).catch(() => {});
-                }
-              }
-            }
-          }
-        });
-        return;
-      }
+      // NOT: 'cal' subcommand'ı /oyunlar komutunda ARTIK KAYITLI DEĞİL.
+      // Hırsızlık işlevi ayrı, bağımsız /çal komutuna taşındı (aşağıda tanımlı).
     }
 
     // ─────────────────────────────────────────────────────────
@@ -7444,7 +7302,7 @@ async function sendSetupPanel(interaction) {
       { label: '📊 Seviye Kanalı',        value: 'level_channel',       description: 'Seviye atlama mesajı kanalı' },
       { label: '💬 Sohbet Kanalı',        value: 'sohbet_channel',       description: 'Mesaj sayacı ve pasif coin kanalı' },
       { label: '⌨️ Yazı Oyunu Kanalı',   value: 'yazi_oyunu_channel',   description: '/yazioyunu baslat için özel kanal' },
-      { label: '💰 Çal Komutu Kanalı',   value: 'cal_channel',           description: '/oyunlar cal komutunun kanalı' },
+      { label: '💰 Çal Komutu Kanalı',   value: 'cal_channel',           description: '/çal komutunun kullanılabileceği özel kanal' },
       { label: '🤫 İtiraf Kanalı',       value: 'itiraf_channel',        description: 'Anonim itiraf mesajlarının gönderileceği kanal' },
       { label: '🎨 Renk Rolü Çıkar', value: '__color_remove__', description: 'Listeden renk rolü çıkar' },
       { label: '🎨 Renk Rollerini Listele', value: '__color_list__', description: 'Mevcut renk rollerini gör' },
