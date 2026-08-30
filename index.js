@@ -123,6 +123,9 @@ function ensureSchema() {
     CREATE TABLE IF NOT EXISTS xp_boosts (guildId TEXT, userId TEXT, PRIMARY KEY(guildId,userId));
     CREATE TABLE IF NOT EXISTS coin_boosts (guildId TEXT, userId TEXT, PRIMARY KEY(guildId,userId));
     CREATE TABLE IF NOT EXISTS message_counts (guildId TEXT, channelId TEXT, userId TEXT, date TEXT, count INTEGER DEFAULT 0, PRIMARY KEY(guildId,channelId,userId,date));
+    -- Kümülatif (tüm zamanlar) mesaj toplamı — message_counts'taki eski günlük
+    -- kayıtlar temizlense bile burada kalıcı olarak korunur.
+    CREATE TABLE IF NOT EXISTS message_totals (guildId TEXT, channelId TEXT, userId TEXT, total INTEGER DEFAULT 0, PRIMARY KEY(guildId,channelId,userId));
     CREATE TABLE IF NOT EXISTS market_roles (guildId TEXT, roleId TEXT, price INTEGER, isPremium INTEGER DEFAULT 0, PRIMARY KEY(guildId,roleId));
     CREATE TABLE IF NOT EXISTS level_data (guildId TEXT, userId TEXT, xp INTEGER DEFAULT 0, level INTEGER DEFAULT 0, PRIMARY KEY(guildId,userId));
 
@@ -310,6 +313,7 @@ function ensureSchema() {
 function initDatabase() {
   db = new Database(DB_PATH);
   ensureSchema();
+  migrateMessageTotalsIfNeeded();
   console.log('✅ Veritabanı hazır.');
 }
 
@@ -616,6 +620,16 @@ function startAutoBackup() {
   console.log(`🕒 Otomatik GitHub yedeklemesi başlatıldı (${Math.round(AUTO_BACKUP_INTERVAL_MS / 60000)} dakikada bir).`);
 }
 
+// Eski mesaj kayıtlarını (message_counts) günde bir kez temizler. Kümülatif
+// toplamlar (message_totals) korunur, yalnızca artık gerekmeyen günlük
+// ayrıntı satırları (retention süresinden eski) silinir.
+const MESSAGE_CLEANUP_INTERVAL_MS = 24 * 60 * 60 * 1000; // 24 saat
+function startMessageCountsCleanup() {
+  cleanupOldMessageCounts(); // açılışta bir kez hemen çalıştır
+  setInterval(cleanupOldMessageCounts, MESSAGE_CLEANUP_INTERVAL_MS);
+  console.log(`🧹 Eski mesaj kaydı temizliği başlatıldı (${MESSAGE_COUNTS_RETENTION_DAYS} günden eski kayıtlar, günde bir kez).`);
+}
+
 /**
  * Açılışta veritabanı "boş" görünüyorsa (ör. barındırma ortamı diski sıfırladıysa)
  * GitHub'daki en güncel yedeği otomatik olarak geri yükler. Bu, kullanıcıların
@@ -705,14 +719,56 @@ function setBoost(gid, uid)            { db.prepare('INSERT OR IGNORE INTO xp_bo
 function hasCoinBoost(gid, uid)        { return !!db.prepare('SELECT 1 FROM coin_boosts WHERE guildId=? AND userId=?').get(gid, uid); }
 function setCoinBoost(gid, uid)        { db.prepare('INSERT OR IGNORE INTO coin_boosts(guildId,userId)VALUES(?,?)').run(gid, uid); }
 
-function addMsgCount(gid, cid, uid, date) { db.prepare('INSERT OR IGNORE INTO message_counts(guildId,channelId,userId,date,count)VALUES(?,?,?,?,0)').run(gid, cid, uid, date); db.prepare('UPDATE message_counts SET count=count+1 WHERE guildId=? AND channelId=? AND userId=? AND date=?').run(gid, cid, uid, date); }
+function addMsgCount(gid, cid, uid, date) {
+  db.prepare('INSERT OR IGNORE INTO message_counts(guildId,channelId,userId,date,count)VALUES(?,?,?,?,0)').run(gid, cid, uid, date);
+  db.prepare('UPDATE message_counts SET count=count+1 WHERE guildId=? AND channelId=? AND userId=? AND date=?').run(gid, cid, uid, date);
+  // Kümülatif toplam — günlük kayıtlar temizlense bile bu asla silinmez.
+  db.prepare('INSERT INTO message_totals(guildId,channelId,userId,total) VALUES (?,?,?,1) ON CONFLICT(guildId,channelId,userId) DO UPDATE SET total=total+1').run(gid, cid, uid);
+}
 function getMsgCount(gid, cid, uid, date) { const r = db.prepare('SELECT count FROM message_counts WHERE guildId=? AND channelId=? AND userId=? AND date=?').get(gid, cid, uid, date); return r ? r.count : 0; }
 function topMsgs(gid, cid, date, n = 10) { return db.prepare('SELECT userId,count FROM message_counts WHERE guildId=? AND channelId=? AND date=? ORDER BY count DESC LIMIT ?').all(gid, cid, date, n); }
-function resetSohbet(gid)              { db.prepare('DELETE FROM message_counts WHERE guildId=?').run(gid); }
+function resetSohbet(gid) {
+  db.prepare('DELETE FROM message_counts WHERE guildId=?').run(gid);
+  db.prepare('DELETE FROM message_totals WHERE guildId=?').run(gid);
+}
+
+// Bir sunucunun message_counts'ta olup message_totals'ta henüz olmayan
+// geçmiş verisini kümülatif tabloya bir kerelik aktarır (geriye dönük uyumluluk
+// için — bu fonksiyon eklenmeden ÖNCE birikmiş veriler kaybolmasın diye).
+function migrateMessageTotalsIfNeeded() {
+  const already = db.prepare('SELECT COUNT(*) as c FROM message_totals').get().c;
+  if (already > 0) return; // zaten dolu, tekrar migrate etmeye gerek yok
+  const rows = db.prepare('SELECT guildId, channelId, userId, SUM(count) as total FROM message_counts GROUP BY guildId, channelId, userId').all();
+  if (!rows.length) return;
+  const insert = db.prepare('INSERT OR IGNORE INTO message_totals(guildId,channelId,userId,total) VALUES (?,?,?,?)');
+  const tx = db.transaction(rs => { for (const r of rs) insert.run(r.guildId, r.channelId, r.userId, r.total); });
+  tx(rows);
+  console.log(`✅ message_totals: ${rows.length} kayıt geçmişten aktarıldı (bir kerelik migrasyon).`);
+}
+
+// Eski günlük mesaj kayıtlarını temizler. Kümülatif toplamlar (message_totals)
+// bundan ETKİLENMEZ — s.top / s.me'deki "toplam" ve "en çok yazılan kanal"
+// gibi tüm-zamanlar istatistikleri sağlam kalır. Yalnızca 1g/7g/14g gibi
+// zaman-pencereli hesaplamalar için gereken günlük ayrıntı satırları silinir.
+const MESSAGE_COUNTS_RETENTION_DAYS = 30;
+function cleanupOldMessageCounts() {
+  try {
+    const cutoff = daysAgoTR(MESSAGE_COUNTS_RETENTION_DAYS);
+    const result = db.prepare('DELETE FROM message_counts WHERE date < ?').run(cutoff);
+    if (result.changes > 0) {
+      console.log(`🧹 Eski mesaj kayıtları temizlendi: ${result.changes} satır silindi (${MESSAGE_COUNTS_RETENTION_DAYS} günden eski).`);
+    }
+  } catch (e) {
+    console.error('⛔ cleanupOldMessageCounts hatası:', e.message);
+  }
+}
 
 // ── s.top / s.me İstatistik Sorguları ───────────────────────────────
+// Not: "toplam"/"en çok" sorguları kümülatif message_totals tablosunu kullanır
+// (eski günlük kayıtlar silinse de doğru kalır). Yalnızca zaman-pencereli
+// (1g/7g/14g) sorgular message_counts'u (henüz silinmemiş son N günü) kullanır.
 function getUserTotalMsgCount(gid, uid) {
-  const r = db.prepare('SELECT COALESCE(SUM(count),0) as total FROM message_counts WHERE guildId=? AND userId=?').get(gid, uid);
+  const r = db.prepare('SELECT COALESCE(SUM(total),0) as total FROM message_totals WHERE guildId=? AND userId=?').get(gid, uid);
   return r.total;
 }
 function getUserMsgCountSince(gid, uid, sinceDateStr) {
@@ -720,18 +776,18 @@ function getUserMsgCountSince(gid, uid, sinceDateStr) {
   return r.total;
 }
 function getUserRankByMsgCount(gid, uid) {
-  const rows = db.prepare('SELECT userId, SUM(count) as total FROM message_counts WHERE guildId=? GROUP BY userId ORDER BY total DESC').all(gid);
+  const rows = db.prepare('SELECT userId, SUM(total) as total FROM message_totals WHERE guildId=? GROUP BY userId ORDER BY total DESC').all(gid);
   const idx = rows.findIndex(r => r.userId === uid);
   return { rank: idx === -1 ? null : idx + 1, totalUsers: rows.length };
 }
 function topUsersByMsgCount(gid, n = 5) {
-  return db.prepare('SELECT userId, SUM(count) as total FROM message_counts WHERE guildId=? GROUP BY userId ORDER BY total DESC LIMIT ?').all(gid, n);
+  return db.prepare('SELECT userId, SUM(total) as total FROM message_totals WHERE guildId=? GROUP BY userId ORDER BY total DESC LIMIT ?').all(gid, n);
 }
 function topChannelsByMsgCount(gid, n = 5) {
-  return db.prepare('SELECT channelId, SUM(count) as total FROM message_counts WHERE guildId=? GROUP BY channelId ORDER BY total DESC LIMIT ?').all(gid, n);
+  return db.prepare('SELECT channelId, SUM(total) as total FROM message_totals WHERE guildId=? GROUP BY channelId ORDER BY total DESC LIMIT ?').all(gid, n);
 }
 function getUserTopChannels(gid, uid, n = 4) {
-  return db.prepare('SELECT channelId, SUM(count) as total FROM message_counts WHERE guildId=? AND userId=? GROUP BY channelId ORDER BY total DESC LIMIT ?').all(gid, uid, n);
+  return db.prepare('SELECT channelId, SUM(total) as total FROM message_totals WHERE guildId=? AND userId=? GROUP BY channelId ORDER BY total DESC LIMIT ?').all(gid, uid, n);
 }
 // gün cinsinden N gün öncesinin tarihini (YYYY-MM-DD, Europe/Istanbul) döner
 function daysAgoTR(n) {
@@ -11970,4 +12026,5 @@ async function startBot() {
   startFishMarketRefresh();
   await startBot();
   startAutoBackup();
+  startMessageCountsCleanup();
 })();
