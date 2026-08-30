@@ -2,13 +2,20 @@
 // ║         DeathWish Game Bot — TEK DOSYA                      ║
 // ║  Özellikler: Seviye/XP, Ekonomi, Ses Takibi, Sohbet,       ║
 // ║  Yazı Oyunu, Market, Evlilik, Balıkçılık, Blackjack,        ║
-// ║  At Yarışı, Renk Rolleri, Gelişmiş Backup & Log             ║
+// ║  At Yarışı, Renk Rolleri, Gelişmiş Backup & Log,            ║
+// ║  Kozmetik Profil Sistemi (banner/çerçeve/renk/unvan)         ║
 // ║  Tüm komutlar SLASH (/) komutu                              ║
 // ╠══════════════════════════════════════════════════════════════╣
 // ║  Gerekli paketler (npm install):                             ║
 // ║    discord.js  better-sqlite3  express  archiver             ║
-// ║    @octokit/rest  dotenv  adm-zip                            ║
+// ║    @octokit/rest  dotenv  adm-zip  sharp                     ║
 // ║  adm-zip yalnızca /veriyukle (restore) için gereklidir.     ║
+// ║  sharp yalnızca /profil çerçeve (avatar üzerine PNG bindirme) ║
+// ║  özelliği için gereklidir — native bağımlılık, npm install   ║
+// ║  sırasında derlenir (Render/Railway gibi platformlarda        ║
+// ║  genelde sorunsuz kurulur, prebuilt binary indirir).          ║
+// ║  NOT: /profil kartında global fetch() kullanılıyor — Node.js  ║
+// ║  18 veya üzeri gerekir (Render varsayılan olarak yeterli).    ║
 // ╚══════════════════════════════════════════════════════════════╝
 
 require('dotenv').config();
@@ -17,7 +24,7 @@ const {
   EmbedBuilder, ActionRowBuilder, ButtonBuilder, ButtonStyle,
   StringSelectMenuBuilder, ChannelSelectMenuBuilder, RoleSelectMenuBuilder,
   SlashCommandBuilder, PermissionFlagsBits, ComponentType, ChannelType,
-  ModalBuilder, TextInputBuilder, TextInputStyle,
+  ModalBuilder, TextInputBuilder, TextInputStyle, AttachmentBuilder,
 } = require('discord.js');
 const Database = require('better-sqlite3');
 const express  = require('express');
@@ -25,6 +32,8 @@ const path     = require('path');
 const fs       = require('fs');
 const archiver = require('archiver');
 const { Octokit } = require('@octokit/rest');
+let sharp = null;
+try { sharp = require('sharp'); } catch { console.warn('⚠️ "sharp" paketi kurulu değil — /profil çerçeve önizlemesi çalışmayacak (npm install sharp).'); }
 
 // ──────────────────────────────────────────────────────────────
 //  AYARLAR
@@ -129,6 +138,23 @@ function ensureSchema() {
     -- ── /banka sistemi + balıkçılık riskleri ─────────────────
     CREATE TABLE IF NOT EXISTS bank_accounts (guildId TEXT, userId TEXT, createdAt INTEGER, PRIMARY KEY(guildId,userId));
     CREATE TABLE IF NOT EXISTS game_bans (guildId TEXT, userId TEXT, reason TEXT, bannedBy TEXT, bannedAt TEXT, PRIMARY KEY(guildId,userId));
+
+    -- ── Profil Kartı Sistemi ─────────────────────────────────────
+    -- hasBackground/hasMessage = satın alındı mı (bir kez ödenir, sonra
+    -- ücretsiz değiştirilebilir). backgroundUrl/messageText = güncel değer.
+    -- activeIcon = şu an kuşanılı rozet (icons_owned tablosundan, tek seferde 1 tane).
+    CREATE TABLE IF NOT EXISTS profile_cosmetics (
+      guildId TEXT, userId TEXT,
+      hasBackground INTEGER DEFAULT 0, backgroundUrl TEXT,
+      hasMessage INTEGER DEFAULT 0, messageText TEXT,
+      activeIcon TEXT,
+      PRIMARY KEY(guildId, userId)
+    );
+    -- Sahip olunan rozetler (birden fazla satın alınabilir, biri aktif olur)
+    CREATE TABLE IF NOT EXISTS profile_icons_owned (
+      guildId TEXT, userId TEXT, iconKey TEXT, boughtAt TEXT,
+      PRIMARY KEY(guildId, userId, iconKey)
+    );
     CREATE TABLE IF NOT EXISTS fish_cast_state (
       guildId TEXT, userId TEXT,
       sinceLine INTEGER DEFAULT 0, lineThreshold INTEGER DEFAULT 0,
@@ -683,6 +709,35 @@ function addMsgCount(gid, cid, uid, date) { db.prepare('INSERT OR IGNORE INTO me
 function getMsgCount(gid, cid, uid, date) { const r = db.prepare('SELECT count FROM message_counts WHERE guildId=? AND channelId=? AND userId=? AND date=?').get(gid, cid, uid, date); return r ? r.count : 0; }
 function topMsgs(gid, cid, date, n = 10) { return db.prepare('SELECT userId,count FROM message_counts WHERE guildId=? AND channelId=? AND date=? ORDER BY count DESC LIMIT ?').all(gid, cid, date, n); }
 function resetSohbet(gid)              { db.prepare('DELETE FROM message_counts WHERE guildId=?').run(gid); }
+
+// ── s.top / s.me İstatistik Sorguları ───────────────────────────────
+function getUserTotalMsgCount(gid, uid) {
+  const r = db.prepare('SELECT COALESCE(SUM(count),0) as total FROM message_counts WHERE guildId=? AND userId=?').get(gid, uid);
+  return r.total;
+}
+function getUserMsgCountSince(gid, uid, sinceDateStr) {
+  const r = db.prepare('SELECT COALESCE(SUM(count),0) as total FROM message_counts WHERE guildId=? AND userId=? AND date>=?').get(gid, uid, sinceDateStr);
+  return r.total;
+}
+function getUserRankByMsgCount(gid, uid) {
+  const rows = db.prepare('SELECT userId, SUM(count) as total FROM message_counts WHERE guildId=? GROUP BY userId ORDER BY total DESC').all(gid);
+  const idx = rows.findIndex(r => r.userId === uid);
+  return { rank: idx === -1 ? null : idx + 1, totalUsers: rows.length };
+}
+function topUsersByMsgCount(gid, n = 5) {
+  return db.prepare('SELECT userId, SUM(count) as total FROM message_counts WHERE guildId=? GROUP BY userId ORDER BY total DESC LIMIT ?').all(gid, n);
+}
+function topChannelsByMsgCount(gid, n = 5) {
+  return db.prepare('SELECT channelId, SUM(count) as total FROM message_counts WHERE guildId=? GROUP BY channelId ORDER BY total DESC LIMIT ?').all(gid, n);
+}
+function getUserTopChannels(gid, uid, n = 4) {
+  return db.prepare('SELECT channelId, SUM(count) as total FROM message_counts WHERE guildId=? AND userId=? GROUP BY channelId ORDER BY total DESC LIMIT ?').all(gid, uid, n);
+}
+// gün cinsinden N gün öncesinin tarihini (YYYY-MM-DD, Europe/Istanbul) döner
+function daysAgoTR(n) {
+  const d = new Date(Date.now() - n * 24 * 60 * 60 * 1000);
+  return d.toLocaleDateString('tr-TR', { timeZone: 'Europe/Istanbul' }).split('.').reverse().join('-');
+}
 
 function getMarketRoles(gid)           { return db.prepare('SELECT * FROM market_roles WHERE guildId=?').all(gid); }
 function addMarketRole(gid, rid, price, prem) { db.prepare('INSERT OR REPLACE INTO market_roles(guildId,roleId,price,isPremium)VALUES(?,?,?,?)').run(gid, rid, price, prem ? 1 : 0); }
@@ -3564,20 +3619,20 @@ const SLASH_COMMANDS = [
   new SlashCommandBuilder()
     .setName('blackjack')
     .setDescription('Blackjack (21) oyna — botla')
-    .addIntegerOption(o => o.setName('bahis').setDescription('Bahis miktarı (max 100.000)').setRequired(true).setMinValue(1).setMaxValue(100000)),
+    .addIntegerOption(o => o.setName('bahis').setDescription('Bahis miktarı (max 20.000)').setRequired(true).setMinValue(1).setMaxValue(20000)),
 
   // /bomba — 20 sayıdan 2 bombayı bulmadan ilerle, en az 5 doğrudan sonra çekebilirsin
   new SlashCommandBuilder()
     .setName('bomba')
     .setDescription(`Bomba oyunu: ${BOMBA_TOTAL_SLOTS} sayı, ${BOMBA_BOMB_COUNT} bomba! En az ${BOMBA_MIN_CASHOUT_PICKS} doğru bulunca çekebilirsin.`)
-    .addIntegerOption(o => o.setName('bahis').setDescription('Bahis miktarı (min 50, max 100.000)').setRequired(true).setMinValue(50).setMaxValue(100000)),
+    .addIntegerOption(o => o.setName('bahis').setDescription('Bahis miktarı (min 50, max 20.000)').setRequired(true).setMinValue(50).setMaxValue(20000)),
 
   // /atyarisi — at yarışı (çok oyunculu bahis)
   new SlashCommandBuilder()
     .setName('atyarisi')
     .setDescription('At yarışına bahis koy (20 saniyelik paylaşımlı yarış penceresi)')
     .addIntegerOption(o => o.setName('at').setDescription('At numarası (1-6)').setRequired(true).setMinValue(1).setMaxValue(6))
-    .addIntegerOption(o => o.setName('bahis').setDescription('Bahis miktarı (max 100.000)').setRequired(true).setMinValue(1).setMaxValue(100000)),
+    .addIntegerOption(o => o.setName('bahis').setDescription('Bahis miktarı (max 20.000)').setRequired(true).setMinValue(1).setMaxValue(20000)),
 
   // /sifirla (owner)
   new SlashCommandBuilder()
@@ -3634,6 +3689,12 @@ const SLASH_COMMANDS = [
       .addUserOption(o => o.setName('hedef').setDescription('Hedef').setRequired(true)))
     .addSubcommand(s => s.setName('liste')
       .setDescription('[OWNER] Yasaklı kullanıcıları listele')),
+
+  // /profil — özelleştirilebilir profil kartı
+  new SlashCommandBuilder()
+    .setName('profil')
+    .setDescription('Profil kartını görüntüle veya özelleştir')
+    .addUserOption(o => o.setName('hedef').setDescription('Kartını görmek istediğin kişi (boş bırakırsan kendi kartın)')),
 
 ].map(c => c.toJSON());
 
@@ -3865,6 +3926,26 @@ client.on('messageCreate', async message => {
   const uid = message.author.id;
   const cid = message.channel.id;
 
+  // ── s.top / s.me — MESAJ İSTATİSTİK KARTLARI (prefix komut) ─
+  const rawContent = message.content.trim().toLowerCase();
+  if (rawContent === 's.top' || rawContent === 's.me' || rawContent.startsWith('s.me ')) {
+    try {
+      if (rawContent === 's.top') {
+        const buf = await renderTopStatsCard(message.guild);
+        if (!buf) return message.reply('⚠️ İstatistik kartı oluşturulamadı. (`sharp` paketi kurulu olmayabilir.)');
+        return message.reply({ files: [new AttachmentBuilder(buf, { name: 'siralama.png' })] });
+      } else {
+        const targetMember = message.mentions.members?.first() || message.member;
+        const buf = await renderMeStatsCard(message.guild, targetMember, targetMember.user);
+        if (!buf) return message.reply('⚠️ İstatistik kartı oluşturulamadı. (`sharp` paketi kurulu olmayabilir.)');
+        return message.reply({ files: [new AttachmentBuilder(buf, { name: 'istatistik.png' })] });
+      }
+    } catch (e) {
+      console.error('⛔ s.top/s.me hatası:', e);
+      return message.reply('⛔ Bir hata oluştu, tekrar dene.');
+    }
+  }
+
   // ── 🤫 İTİRAF KANALI ────────────────────────────────────────
   // Bu kanala yazılan HER mesaj silinir ve içeriği kimliği belirtilmeden
   // anonim bir embed olarak aynı kanala "İtiraf!" başlığıyla tekrar gönderilir.
@@ -3945,11 +4026,14 @@ client.on('messageCreate', async message => {
     }
   } catch {}
 
-  // ── SOHBET MESAJ SAYACI + PASİF COIN (her 2 mesaj = 4 coin) ─
+  // ── SUNUCU GENELİ MESAJ SAYACI (s.top / s.me istatistikleri için) ──
+  // Her kanalda, her mesajda çalışır — kanal kısıtlaması yok.
+  addMsgCount(gid, cid, uid, todayTR());
+
+  // ── SOHBET MESAJ SAYACI (pasif coin — sadece ayarlı sohbet kanalında) ──
   // Coin ödülü banka hesabı ister — hesabı yoksa mesaj sayılır ama coin verilmez.
   const sohbetCh = getSetting(gid, 'sohbet_channel');
   if (sohbetCh && cid === sohbetCh && hasBankAccount(gid, uid)) {
-    addMsgCount(gid, cid, uid, todayTR());
     const total = incChatCoinCounter(gid, uid);
     if (total % 2 === 0) {
       const coinBonusPct = getTotalCoinBonusPct(gid, uid);
@@ -4018,44 +4102,7 @@ client.on('interactionCreate', async interaction => {
 
       let choices = [];
 
-      if (commandName === 'craft' && focused.name === 'item') {
-        const kategori = interaction.options.getString('kategori');
-
-        if (kategori === 'silah') {
-          choices = WEAPON_TYPES.flatMap(t => WEAPON_TIERS.map(r => ({
-            key:   `${t.key}_${r.key}`,
-            label: `${t.emoji} ${t.name} — ${r.emoji}[${r.grade}] ${r.name}`,
-          })));
-        } else if (kategori === 'zirh') {
-          choices = ARMOR_SLOTS.flatMap(s => ARMOR_TIERS.map(t => ({
-            key:   `${s.key}_${t.key}`,
-            label: `${s.emoji} ${s.name} — ${t.emoji}[${t.grade}] ${t.name}`,
-          })));
-        } else if (kategori === 'yumurta') {
-          choices = Object.keys(CRAFT_EGG_RECIPES).map(key => {
-            const def = PET_EGG_TYPES.find(e => e.key === key);
-            return { key, label: def ? `${def.emoji} ${def.name}` : key };
-          });
-        } else if (kategori === 'sandik') {
-          choices = Object.keys(CRAFT_SANDIK_RECIPES).map(key => {
-            const def = MMORPG_CHESTS.find(c => c.key === key);
-            return { key, label: def ? `${def.emoji} ${def.name}` : key };
-          });
-        } else if (kategori === 'malzeme') {
-          choices = ADVANCED_CRAFT_MATERIALS.map(m => ({ key: m.key, label: `${m.emoji} ${m.name}` }));
-        } else if (kategori === 'set') {
-          choices = Object.entries(RELIC_SETS).map(([key, def]) => ({
-            key, label: `${def.emoji} ${def.name} [${def.tier}]${def.classKey ? ' 🔒' : ''}`,
-          }));
-        }
-
-        choices = choices
-          .filter(c => !typed || c.key.toLowerCase().includes(typed) || c.label.toLowerCase().includes(typed))
-          .slice(0, 25)
-          .map(c => ({ name: c.label.slice(0, 100), value: c.key }));
-      }
-
-      else if (commandName === 'relic-set' && focused.name === 'set') {
+      if (commandName === 'relic-set' && focused.name === 'set') {
         choices = Object.entries(RELIC_SETS)
           .map(([key, def]) => ({ key, label: `${def.emoji} ${def.name} [${def.tier}]` }))
           .filter(c => !typed || c.key.toLowerCase().includes(typed) || c.label.toLowerCase().includes(typed))
@@ -5164,6 +5211,7 @@ client.on('interactionCreate', async interaction => {
             { name: '📿 Relikler',       value: 'Kalıcı güç bonusları kazandıran kutsal eserler.',       inline: true },
             { name: '🍖 Hayvan Maması',  value: '⚠️ Petlerini besle! 1 gün beslenmezse ölür!',          inline: true },
             { name: '🎨 Renk Al',        value: 'İsim rengi rolü satın al.',                            inline: true },
+            { name: '✨ Profil Kozmetikleri', value: 'Arkaplan, özel yazı ve rozet ile `/profil` kartını süsle.', inline: true },
           )
           .setFooter({ text: '/market-yonet ile rol ekle/çıkar (admin)' });
         const r1 = new ActionRowBuilder().addComponents(
@@ -5177,7 +5225,10 @@ client.on('interactionCreate', async interaction => {
           new ButtonBuilder().setCustomId(`mkt_relikler_${uid}`).setLabel('📿 Relikler').setStyle(ButtonStyle.Success),
           new ButtonBuilder().setCustomId(`mkt_mama_${uid}`).setLabel('🍖 Hayvan Maması').setStyle(ButtonStyle.Danger),
         );
-        return { embeds: [e], components: [r1, r2] };
+        const r3 = new ActionRowBuilder().addComponents(
+          new ButtonBuilder().setCustomId(`mkt_profil_${uid}`).setLabel('✨ Profil Kozmetikleri').setStyle(ButtonStyle.Primary),
+        );
+        return { embeds: [e], components: [r1, r2, r3] };
       }
 
       const homePayload = buildMarketHome();
@@ -5603,6 +5654,58 @@ client.on('interactionCreate', async interaction => {
           addBalance(gid, uid, -foodDef.price);
           setPetFedDate(gid, uid, petKey, today);
           return i.reply({ ephemeral: true, content: `${def.emoji} **${def.name}** beslendi! **-${foodDef.price} coin** | Bakiye: **${getBalance(gid, uid).balance}**` });
+        }
+
+        // ── ✨ PROFİL KOZMETİKLERİ ────────────────────────────
+        if (section === 'profil') {
+          const cur = getProfileCosmetics(gid, uid);
+          const bgLabel  = cur.hasBackground ? `🔄 Arkaplanı Değiştir (Ücretsiz)` : `🖼️ Arkaplan Satın Al (${PROFILE_BG_PRICE.toLocaleString('tr-TR')} coin)`;
+          const msgLabel = cur.hasMessage    ? `🔄 Yazıyı Değiştir (Ücretsiz)`     : `✍️ Yazı Alanı Satın Al (${PROFILE_MSG_PRICE.toLocaleString('tr-TR')} coin)`;
+          const e = new EmbedBuilder()
+            .setTitle('✨ Profil Kozmetikleri')
+            .setColor(0x9B59B6)
+            .setDescription('`/profil` kartını özelleştir:')
+            .addFields(
+              { name: '🖼️ Arkaplan', value: `Kendi GIF/resim linkinle kart arkaplanı (${PROFILE_BG_PRICE.toLocaleString('tr-TR')} coin, sonra ücretsiz değiştirilir).`, inline: false },
+              { name: '✍️ Özel Yazı', value: `Kartında görünecek serbest metin (${PROFILE_MSG_PRICE.toLocaleString('tr-TR')} coin, sonra ücretsiz değiştirilir).`, inline: false },
+              { name: '🎖️ Rozet', value: 'Kartının sol altına küçük bir rozet ekle.', inline: false },
+            );
+          const row = new ActionRowBuilder().addComponents(
+            new ButtonBuilder().setCustomId(`mkt_profilbg_${uid}`).setLabel(bgLabel).setStyle(cur.hasBackground ? ButtonStyle.Secondary : ButtonStyle.Success),
+            new ButtonBuilder().setCustomId(`mkt_profilmsg_${uid}`).setLabel(msgLabel).setStyle(cur.hasMessage ? ButtonStyle.Secondary : ButtonStyle.Success),
+            new ButtonBuilder().setCustomId(`mkt_profilikon_${uid}`).setLabel('🎖️ Rozetler').setStyle(ButtonStyle.Primary),
+          );
+          const backRow2 = new ActionRowBuilder().addComponents(new ButtonBuilder().setCustomId(`mkt_back_${uid}`).setLabel('← Geri').setStyle(ButtonStyle.Danger));
+          return i.update({ embeds: [e], components: [row, backRow2] });
+        }
+
+        if (section === 'profilbg') {
+          return runProfileBgPurchaseFlow(interaction.channel, i, gid, uid);
+        }
+
+        if (section === 'profilmsg') {
+          return runProfileMsgPurchaseFlow(i, gid, uid);
+        }
+
+        if (section === 'profilikon') {
+          return i.update(buildProfilIconPanel(gid, uid));
+        }
+
+        if (section === 'profilikonbuy') {
+          const iconKey = parts[2];
+          const iconDef = findIcon(iconKey);
+          if (!iconDef) return i.reply({ ephemeral: true, content: '⛔ Geçersiz rozet.' });
+          const already = ownsIcon(gid, uid, iconKey);
+          if (!already) {
+            const bal = getBalance(gid, uid);
+            if (bal.balance < iconDef.price) {
+              return i.reply({ ephemeral: true, content: `⛔ Yetersiz bakiye! **${iconDef.name}** için **${iconDef.price.toLocaleString('tr-TR')} coin** gerekiyor, bakiyen **${bal.balance.toLocaleString('tr-TR')} coin**.` });
+            }
+            addBalance(gid, uid, -iconDef.price);
+            buyIcon(gid, uid, iconKey);
+          }
+          setActiveIcon(gid, uid, iconKey);
+          return i.update(buildProfilIconPanel(gid, uid));
         }
       });
 
@@ -6448,9 +6551,6 @@ client.on('interactionCreate', async interaction => {
     if (cmd === 'hakkimda') {
       const target = interaction.options.getUser('hedef') || interaction.user;
       const tid = target.id;
-      const lvl = getLevel(gid, tid);
-      const needed = lvl.level >= NORMAL_MAX_LEVEL ? 0 : Math.round((lvl.level + 1) * 100 * 0.7809375);
-      const xpStr = lvl.level >= NORMAL_MAX_LEVEL ? 'MAX SEVİYE 🔥' : `${lvl.xp} / ${needed} XP`;
 
       let boostInfo = '❌ Yok';
       if (hasBoost(gid, tid)) boostInfo = '✅ Kalıcı 1.5x XP';
@@ -6518,8 +6618,6 @@ client.on('interactionCreate', async interaction => {
         .setColor(0x5865F2)
         .setThumbnail(target.displayAvatarURL())
         .addFields(
-          { name: '🏆 Seviye',            value: `**${lvl.level}** / ${NORMAL_MAX_LEVEL}`, inline: true },
-          { name: '⚡ XP',                value: xpStr,                                    inline: true },
           { name: '🔥 XP Boost',          value: boostInfo,                                inline: true },
           { name: '💰 Coin Boost',        value: coinBoostInfo,                            inline: true },
           { name: '🏺 Aktif Antika',      value: antiqueStr,                               inline: false },
@@ -6533,6 +6631,33 @@ client.on('interactionCreate', async interaction => {
           { name: '👑 Kraliyet Unvanları', value: royalStr,                                inline: false },
         );
       return interaction.reply({ embeds: [embed] });
+    }
+    // ─────────────────────────────────────────────────────────
+    //  /profil — özelleştirilebilir profil kartı
+    // ─────────────────────────────────────────────────────────
+    if (cmd === 'profil') {
+      const target = interaction.options.getUser('hedef') || interaction.user;
+      const member = await interaction.guild.members.fetch(target.id).catch(() => null);
+
+      await interaction.deferReply();
+
+      const cardBuffer = await renderProfileCard(gid, member, target);
+
+      if (!cardBuffer) {
+        // sharp kurulu değil ya da render başarısız oldu — basit embed'e düş
+        const fallback = new EmbedBuilder()
+          .setTitle(`👤 ${target.username} — Profil`)
+          .setColor(0x5865F2)
+          .setThumbnail(target.displayAvatarURL())
+          .setDescription('⚠️ Profil kartı şu anda oluşturulamadı. (Sunucu tarafında `sharp` paketi kurulu olmayabilir.)');
+        return interaction.editReply({ embeds: [fallback] });
+      }
+
+      const attachment = new AttachmentBuilder(cardBuffer, { name: 'profil.png' });
+      return interaction.editReply({
+        files: [attachment],
+        content: target.id === uid ? '-# 🏪 Arkaplan, yazı ve rozet satın almak/değiştirmek için `/market` → ✨ Profil Kozmetikleri' : undefined,
+      });
     }
 
     // ─────────────────────────────────────────────────────────
@@ -8087,6 +8212,18 @@ function getRelicSetCraftRecipe(tierGrade) {
   }
   return recipe;
 }
+// Tam set reçetesini 6 parçaya böler — her malzeme miktarı yukarı yuvarlanarak
+// (minimum 1) dağıtılır, böylece bir seti parça parça craftlamak toplamda tam
+// sete yakın (yuvarlama nedeniyle biraz fazla) malzemeye mal olur; tek seferde
+// tüm seti craftlamaktan bariz ucuz olmasın diye kasıtlı.
+function getRelicPieceCraftRecipe(tierGrade) {
+  const fullRecipe = getRelicSetCraftRecipe(tierGrade);
+  const perPiece = {};
+  for (const [mat, qty] of Object.entries(fullRecipe)) {
+    perPiece[mat] = Math.max(1, Math.ceil(qty / 6));
+  }
+  return perPiece;
+}
 // 6 parçalı bir seti tek satırda üretir — Lav/Buz/Fırtına/Gölge/Güneş ile
 // aynı isimlendirme kalıbını (Tacı/Kolyesi/Yüzüğü/Kristali/Mührü/Çekirdeği) kullanır.
 function mkRelicPieces(prefix, theme, emoji, price) {
@@ -9105,6 +9242,491 @@ function hasCraftMats(gid, uid, recipe) {
   }
   return true;
 }
+
+// ─────────────────────────────────────────────────────────────────────────
+//  PROFİL KARTI SİSTEMİ (/profil)
+// ─────────────────────────────────────────────────────────────────────────
+// Kullanıcı, kendi profil kartını özelleştirebilir:
+//   🖼️ Arkaplan (20.000 coin, tek seferlik satın alma — sonra istediği kadar
+//      değiştirebilir) — kendi verdiği bir GIF/resim linki kullanılır.
+//   ✍️ Özel Yazı (10.000 coin, tek seferlik satın alma — sonra istediği kadar
+//      değiştirebilir) — modal üzerinden serbest metin girer.
+// Kart görseli her /profil çağrısında ANLIK olarak (sharp + SVG ile) üretilir;
+// GIF arkaplan kullanılıyorsa yalnızca İLK KARE statik görsel olarak kullanılır.
+const PROFILE_BG_PRICE  = 20000;
+const PROFILE_MSG_PRICE = 10000;
+const PROFILE_CARD_W = 900;
+const PROFILE_CARD_H = 300;
+
+function getProfileCosmetics(gid, uid) {
+  return db.prepare('SELECT * FROM profile_cosmetics WHERE guildId=? AND userId=?').get(gid, uid)
+    || { hasBackground: 0, backgroundUrl: null, hasMessage: 0, messageText: null };
+}
+function ensureProfileRow(gid, uid) {
+  db.prepare('INSERT OR IGNORE INTO profile_cosmetics(guildId,userId,hasBackground,hasMessage) VALUES (?,?,0,0)').run(gid, uid);
+}
+function setProfileBackground(gid, uid, url) {
+  ensureProfileRow(gid, uid);
+  db.prepare('UPDATE profile_cosmetics SET hasBackground=1, backgroundUrl=? WHERE guildId=? AND userId=?').run(url, gid, uid);
+}
+function setProfileMessage(gid, uid, text) {
+  ensureProfileRow(gid, uid);
+  db.prepare('UPDATE profile_cosmetics SET hasMessage=1, messageText=? WHERE guildId=? AND userId=?').run(text, gid, uid);
+}
+
+// Metindeki ilk http(s) linkini bulur (kullanıcının attığı GIF/resim linki için).
+function extractFirstUrl(text) {
+  const m = (text || '').match(/https?:\/\/[^\s<>"]+/i);
+  return m ? m[0] : null;
+}
+
+// XML/SVG içine gömülecek metni güvenli hale getirir.
+function escXml(str) {
+  return String(str ?? '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+}
+
+// Uzun metni verilen karakter genişliğine göre birden fazla <tspan> satırına böler,
+// tam bir <text> elemanı olarak döner (metin boşsa boş string döner).
+function svgWrappedText(text, x, startY, lineHeight, maxCharsPerLine, maxLines, cssClass) {
+  const words = String(text || '').split(/\s+/).filter(Boolean);
+  if (!words.length) return '';
+  const lines = [];
+  let cur = '';
+  for (const w of words) {
+    const test = cur ? cur + ' ' + w : w;
+    if (test.length > maxCharsPerLine && cur) { lines.push(cur); cur = w; }
+    else cur = test;
+    if (lines.length >= maxLines) break;
+  }
+  if (cur && lines.length < maxLines) lines.push(cur);
+  if (lines.length > maxLines) lines.length = maxLines;
+  const tspans = lines.map((line, i) => `<tspan x="${x}" y="${startY + i * lineHeight}">${escXml(line)}</tspan>`).join('');
+  return `<text class="${cssClass}">${tspans}</text>`;
+}
+
+// Kullanıcının sunucudaki en yüksek renkli rolünün hex rengini döner.
+function getMemberRoleColorHex(member) {
+  try {
+    const color = member?.displayColor;
+    if (color && color !== 0) return '#' + color.toString(16).padStart(6, '0');
+  } catch {}
+  return '#5865F2'; // Discord varsayılan mavi-mor
+}
+
+// ── Profil Rozetleri (İkonlar) ──────────────────────────────────────
+// Dışarıdan görsel almıyoruz — her rozet, SVG ile anlık olarak (emoji +
+// renkli daire) üretilir. Böylece bozuk link / telif riski hiç olmaz.
+const COSMETIC_ICONS = [
+  { key: 'sakura',    name: 'Sakura Rozeti',      emoji: '🌸', price: 3000, bg: '#FF8FC4' },
+  { key: 'hayalet',   name: 'Hayalet Rozeti',     emoji: '👻', price: 3000, bg: '#B0B0B8' },
+  { key: 'simsek',    name: 'Şimşek Rozeti',      emoji: '⚡', price: 3500, bg: '#FFD83D' },
+  { key: 'ejderha',   name: 'Ejderha Rozeti',     emoji: '🐉', price: 4500, bg: '#3FA34D' },
+  { key: 'yildiztozu',name: 'Yıldız Tozu Rozeti', emoji: '🌟', price: 4500, bg: '#7C5CFF' },
+];
+function findIcon(key) { return COSMETIC_ICONS.find(i => i.key === key); }
+function ownsIcon(gid, uid, key) {
+  return !!db.prepare('SELECT 1 FROM profile_icons_owned WHERE guildId=? AND userId=? AND iconKey=?').get(gid, uid, key);
+}
+function getOwnedIcons(gid, uid) {
+  return db.prepare('SELECT iconKey FROM profile_icons_owned WHERE guildId=? AND userId=?').all(gid, uid).map(r => r.iconKey);
+}
+function buyIcon(gid, uid, key) {
+  ensureProfileRow(gid, uid);
+  db.prepare('INSERT OR IGNORE INTO profile_icons_owned(guildId,userId,iconKey,boughtAt) VALUES (?,?,?,?)').run(gid, uid, key, nowTR());
+}
+function setActiveIcon(gid, uid, key) {
+  ensureProfileRow(gid, uid);
+  db.prepare('UPDATE profile_cosmetics SET activeIcon=? WHERE guildId=? AND userId=?').run(key, gid, uid);
+}
+
+// Profil kartını üretir → PNG Buffer döner. Herhangi bir adımda hata olursa
+// (ör. sharp kurulu değil, arkaplan linki artık erişilemiyor) null döner;
+// çağıran taraf bu durumda basit bir embed'e düşer.
+async function renderProfileCard(gid, member, targetUser) {
+  if (!sharp) return null;
+  try {
+    const uid = targetUser.id;
+    const cosmetics = getProfileCosmetics(gid, uid);
+    const lvl = getLevel(gid, uid);
+    const ring = getMemberRoleColorHex(member);
+    const joinedAt = member?.joinedAt ? member.joinedAt : null;
+    const joinStr = joinedAt
+      ? `${String(joinedAt.getDate()).padStart(2, '0')}.${String(joinedAt.getMonth() + 1).padStart(2, '0')}.${joinedAt.getFullYear()} - ${String(joinedAt.getHours()).padStart(2, '0')}:${String(joinedAt.getMinutes()).padStart(2, '0')}`
+      : 'Bilinmiyor';
+
+    // Sunucu seviye sıralaması
+    const allLevels = db.prepare('SELECT userId FROM level_data WHERE guildId=? ORDER BY level DESC, xp DESC').all(gid);
+    const rankIdx = allLevels.findIndex(r => r.userId === uid);
+    const rankStr = rankIdx === -1 ? '—' : `#${rankIdx + 1}`;
+
+    // ── Arkaplan ──────────────────────────────────────────────
+    let bgBuffer;
+    if (cosmetics.hasBackground && cosmetics.backgroundUrl) {
+      try {
+        const res = await fetch(cosmetics.backgroundUrl);
+        if (!res.ok) throw new Error('arkaplan indirilemedi');
+        const raw = Buffer.from(await res.arrayBuffer());
+        bgBuffer = await sharp(raw, { animated: false }).resize(PROFILE_CARD_W, PROFILE_CARD_H, { fit: 'cover' }).png().toBuffer();
+      } catch {
+        bgBuffer = null;
+      }
+    }
+    if (!bgBuffer) {
+      // Varsayılan gradient arkaplan (arkaplan satın alınmamışsa / linke erişilemiyorsa)
+      const gradSvg = `<svg width="${PROFILE_CARD_W}" height="${PROFILE_CARD_H}" xmlns="http://www.w3.org/2000/svg">
+        <defs><linearGradient id="g" x1="0" y1="0" x2="1" y2="1">
+          <stop offset="0%" stop-color="#1e1f26"/><stop offset="100%" stop-color="#2c2f3a"/>
+        </linearGradient></defs>
+        <rect width="100%" height="100%" fill="url(#g)"/>
+      </svg>`;
+      bgBuffer = await sharp(Buffer.from(gradSvg)).png().toBuffer();
+    }
+
+    // Okunabilirlik için üstüne koyu vinyet
+    const vignetteSvg = `<svg width="${PROFILE_CARD_W}" height="${PROFILE_CARD_H}" xmlns="http://www.w3.org/2000/svg">
+      <defs><linearGradient id="v" x1="0" y1="0" x2="0" y2="1">
+        <stop offset="0%" stop-color="#000000" stop-opacity="0.55"/>
+        <stop offset="45%" stop-color="#000000" stop-opacity="0.25"/>
+        <stop offset="100%" stop-color="#000000" stop-opacity="0.65"/>
+      </linearGradient></defs>
+      <rect width="100%" height="100%" fill="url(#v)"/>
+    </svg>`;
+
+    // ── Avatar (yuvarlak + rol rengi halka) ─────────────────────
+    const AV_SIZE = 128;
+    const AV_X = 36, AV_Y = 36;
+    const avatarUrl = targetUser.displayAvatarURL({ extension: 'png', size: 256 });
+    const avatarRes = await fetch(avatarUrl);
+    const avatarRaw = Buffer.from(await avatarRes.arrayBuffer());
+    const avatarMaskSvg = `<svg width="${AV_SIZE}" height="${AV_SIZE}"><circle cx="${AV_SIZE / 2}" cy="${AV_SIZE / 2}" r="${AV_SIZE / 2}" fill="#fff"/></svg>`;
+    const avatarRounded = await sharp(avatarRaw).resize(AV_SIZE, AV_SIZE)
+      .composite([{ input: Buffer.from(avatarMaskSvg), blend: 'dest-in' }])
+      .png().toBuffer();
+    const RING_W = 6;
+    const ringSvg = `<svg width="${AV_SIZE + RING_W * 2}" height="${AV_SIZE + RING_W * 2}" xmlns="http://www.w3.org/2000/svg">
+      <circle cx="${AV_SIZE / 2 + RING_W}" cy="${AV_SIZE / 2 + RING_W}" r="${AV_SIZE / 2 + RING_W - 2}" fill="none" stroke="${ring}" stroke-width="${RING_W}"/>
+    </svg>`;
+    const avatarWithRing = await sharp(Buffer.from(ringSvg))
+      .composite([{ input: avatarRounded, top: RING_W, left: RING_W }])
+      .png().toBuffer();
+
+    // ── Aktif rozet (avatarın sol altına bindirilen küçük ikon) ──
+    let badgeLayer = null;
+    const iconDef = cosmetics.activeIcon ? findIcon(cosmetics.activeIcon) : null;
+    if (iconDef) {
+      const BADGE_SIZE = 44;
+      const badgeSvg = `<svg width="${BADGE_SIZE}" height="${BADGE_SIZE}" xmlns="http://www.w3.org/2000/svg">
+        <circle cx="${BADGE_SIZE / 2}" cy="${BADGE_SIZE / 2}" r="${BADGE_SIZE / 2 - 2}" fill="${iconDef.bg}" stroke="#1e1f26" stroke-width="3"/>
+        <text x="${BADGE_SIZE / 2}" y="${BADGE_SIZE / 2 + 8}" font-size="22" text-anchor="middle">${iconDef.emoji}</text>
+      </svg>`;
+      badgeLayer = { input: Buffer.from(badgeSvg), top: AV_Y - RING_W + AV_SIZE + RING_W * 2 - 34, left: AV_X - RING_W - 10 };
+    }
+
+    // ── Metin & rozet katmanı (SVG) ─────────────────────────────
+    const nameX = AV_X + AV_SIZE + RING_W * 2 + 24;
+    const nameY = AV_Y + 46;
+    const displayName = (member?.displayName || targetUser.username).slice(0, 28);
+    const msgText = cosmetics.hasMessage && cosmetics.messageText ? cosmetics.messageText : '';
+
+    const textSvg = `<svg width="${PROFILE_CARD_W}" height="${PROFILE_CARD_H}" xmlns="http://www.w3.org/2000/svg">
+      <style>
+        .name   { font: 700 34px sans-serif; fill: #ffffff; }
+        .join   { font: 400 16px sans-serif; fill: #d0d0d5; }
+        .badge  { font: 700 18px sans-serif; fill: #ffffff; }
+        .msg    { font: 400 18px sans-serif; fill: #e8e8ec; }
+        .rank   { font: 700 16px sans-serif; fill: #ffffff; }
+      </style>
+      <text class="name" x="${nameX}" y="${nameY}">${escXml(displayName)}</text>
+      <text class="join" x="${nameX}" y="${nameY + 28}">${escXml(joinStr)}</text>
+
+      <!-- Seviye rozeti (sağ üst) -->
+      <rect x="${PROFILE_CARD_W - 150}" y="30" width="114" height="38" rx="19" fill="#ffffff" fill-opacity="0.14" stroke="#ffffff" stroke-opacity="0.35"/>
+      <text class="badge" x="${PROFILE_CARD_W - 133}" y="55">⭐ Lv.${lvl.level}</text>
+
+      <!-- Özel mesaj -->
+      ${svgWrappedText(msgText, AV_X, AV_Y + AV_SIZE + 20 + 30, 26, 60, 2, 'msg')}
+
+      <!-- Sunucu sıralaması (sağ alt) -->
+      <text class="rank" x="${PROFILE_CARD_W - 130}" y="${PROFILE_CARD_H - 24}">🏆 Sıralama: ${escXml(rankStr)}</text>
+    </svg>`;
+
+    const compositeLayers = [
+      { input: await sharp(Buffer.from(vignetteSvg)).png().toBuffer(), top: 0, left: 0 },
+      { input: avatarWithRing, top: AV_Y - RING_W, left: AV_X - RING_W },
+    ];
+    if (badgeLayer) compositeLayers.push(badgeLayer);
+    compositeLayers.push({ input: Buffer.from(textSvg), top: 0, left: 0 });
+
+    const finalCard = await sharp(bgBuffer)
+      .composite(compositeLayers)
+      .png()
+      .toBuffer();
+
+    return finalCard;
+  } catch (e) {
+    console.error('⛔ renderProfileCard hatası:', e.message);
+    return null;
+  }
+}
+// ─────────────────────────────────────────────────────────────────────────
+//  MESAJ İSTATİSTİK KARTLARI — s.top / s.me
+// ─────────────────────────────────────────────────────────────────────────
+const STATS_CARD_W = 760;
+const STATS_BG_TOP    = '#1b1c22';
+const STATS_BG_BOX     = '#26272f';
+const STATS_BG_BOX_ALT = '#2d2e38';
+const STATS_ACCENT      = '#f1c40f';
+
+function statsRowSvg(x, y, w, h, rank, label, value, opts = {}) {
+  const rankColor = rank === 1 ? '#FFD700' : rank === 2 ? '#C0C0C0' : rank === 3 ? '#CD7F32' : '#8a8b95';
+  return `
+    <rect x="${x}" y="${y}" width="${w}" height="${h}" rx="10" fill="${STATS_BG_BOX_ALT}"/>
+    <text x="${x + 18}" y="${y + h / 2 + 6}" font-family="sans-serif" font-weight="700" font-size="17" fill="${rankColor}">${rank}</text>
+    <text x="${x + 46}" y="${y + h / 2 + 6}" font-family="sans-serif" font-weight="500" font-size="16" fill="#e6e6ea">${escXml(label).slice(0, 300)}</text>
+    <rect x="${x + w - 108}" y="${y + h / 2 - 15}" width="92" height="30" rx="8" fill="${opts.valueBg || '#1e1f26'}"/>
+    <text x="${x + w - 62}" y="${y + h / 2 + 6}" text-anchor="middle" font-family="sans-serif" font-weight="700" font-size="14" fill="${opts.valueColor || STATS_ACCENT}">${escXml(String(value))}</text>
+  `;
+}
+
+// s.top — sunucu geneli mesaj sıralaması (top kullanıcılar + top kanallar)
+async function renderTopStatsCard(guild) {
+  if (!sharp) return null;
+  try {
+    const gid = guild.id;
+    const topUsers = topUsersByMsgCount(gid, 5);
+    const topChans = topChannelsByMsgCount(gid, 5);
+
+    const userNames = await Promise.all(topUsers.map(async r => {
+      const m = await guild.members.fetch(r.userId).catch(() => null);
+      return m ? (m.displayName || m.user.username) : `Kullanıcı`;
+    }));
+    const chanNames = topChans.map(r => {
+      const ch = guild.channels.cache.get(r.channelId);
+      return ch ? `#${ch.name}` : 'silinmiş-kanal';
+    });
+
+    const ROW_H = 46, ROW_GAP = 10, COL_W = (STATS_CARD_W - 60) / 2;
+    const rowsCount = Math.max(topUsers.length, topChans.length, 1);
+    const H = 140 + rowsCount * (ROW_H + ROW_GAP);
+
+    let usersSvg = '';
+    if (!topUsers.length) {
+      usersSvg = `<text x="30" y="150" font-family="sans-serif" font-size="15" fill="#9a9ba5">Henüz veri yok.</text>`;
+    } else {
+      topUsers.forEach((r, i) => {
+        usersSvg += statsRowSvg(30, 128 + i * (ROW_H + ROW_GAP), COL_W, ROW_H, i + 1, userNames[i], r.total.toLocaleString('tr-TR'));
+      });
+    }
+    let chansSvg = '';
+    if (!topChans.length) {
+      chansSvg = `<text x="${30 + COL_W + 20}" y="150" font-family="sans-serif" font-size="15" fill="#9a9ba5">Henüz veri yok.</text>`;
+    } else {
+      topChans.forEach((r, i) => {
+        chansSvg += statsRowSvg(30 + COL_W + 20, 128 + i * (ROW_H + ROW_GAP), COL_W, ROW_H, i + 1, chanNames[i], r.total.toLocaleString('tr-TR'), { valueColor: '#5DADE2' });
+      });
+    }
+
+    const svg = `<svg width="${STATS_CARD_W}" height="${H}" xmlns="http://www.w3.org/2000/svg">
+      <rect width="100%" height="100%" rx="18" fill="${STATS_BG_TOP}"/>
+      <text x="30" y="46" font-family="sans-serif" font-weight="800" font-size="24" fill="#ffffff">🏆 ${escXml(guild.name).slice(0, 40)} — Mesaj Sıralaması</text>
+      <text x="30" y="70" font-family="sans-serif" font-size="14" fill="#9a9ba5">Sunucu genelinde en çok mesaj atan üyeler ve en aktif kanallar</text>
+
+      <text x="30" y="106" font-family="sans-serif" font-weight="700" font-size="15" fill="#c8c9d2"># En Çok Mesaj Atanlar</text>
+      <text x="${30 + COL_W + 20}" y="106" font-family="sans-serif" font-weight="700" font-size="15" fill="#c8c9d2"># En Aktif Kanallar</text>
+
+      ${usersSvg}
+      ${chansSvg}
+    </svg>`;
+
+    return await sharp(Buffer.from(svg)).png().toBuffer();
+  } catch (e) {
+    console.error('⛔ renderTopStatsCard hatası:', e.message);
+    return null;
+  }
+}
+
+// s.me — kişisel mesaj istatistik kartı
+async function renderMeStatsCard(guild, member, targetUser) {
+  if (!sharp) return null;
+  try {
+    const gid = guild.id;
+    const uid = targetUser.id;
+    const { rank, totalUsers } = getUserRankByMsgCount(gid, uid);
+    const c1d  = getUserMsgCountSince(gid, uid, daysAgoTR(1));
+    const c7d  = getUserMsgCountSince(gid, uid, daysAgoTR(7));
+    const c14d = getUserMsgCountSince(gid, uid, daysAgoTR(14));
+    const total = getUserTotalMsgCount(gid, uid);
+    const topChans = getUserTopChannels(gid, uid, 4);
+    const chanRows = topChans.map(r => {
+      const ch = guild.channels.cache.get(r.channelId);
+      return { name: ch ? `#${ch.name}` : 'silinmiş-kanal', total: r.total };
+    });
+
+    const AV_SIZE = 84;
+    const avatarUrl = targetUser.displayAvatarURL({ extension: 'png', size: 256 });
+    const avatarRes = await fetch(avatarUrl);
+    const avatarRaw = Buffer.from(await avatarRes.arrayBuffer());
+    const avatarMaskSvg = `<svg width="${AV_SIZE}" height="${AV_SIZE}"><circle cx="${AV_SIZE / 2}" cy="${AV_SIZE / 2}" r="${AV_SIZE / 2}" fill="#fff"/></svg>`;
+    const avatarRounded = await sharp(avatarRaw).resize(AV_SIZE, AV_SIZE)
+      .composite([{ input: Buffer.from(avatarMaskSvg), blend: 'dest-in' }])
+      .png().toBuffer();
+    const ring = getMemberRoleColorHex(member);
+    const RING_W = 5;
+    const ringSvg = `<svg width="${AV_SIZE + RING_W * 2}" height="${AV_SIZE + RING_W * 2}" xmlns="http://www.w3.org/2000/svg">
+      <circle cx="${AV_SIZE / 2 + RING_W}" cy="${AV_SIZE / 2 + RING_W}" r="${AV_SIZE / 2 + RING_W - 2}" fill="none" stroke="${ring}" stroke-width="${RING_W}"/>
+    </svg>`;
+    const avatarWithRing = await sharp(Buffer.from(ringSvg))
+      .composite([{ input: avatarRounded, top: RING_W, left: RING_W }])
+      .png().toBuffer();
+
+    const displayName = (member?.displayName || targetUser.username).slice(0, 26);
+    const chanRowsCount = Math.max(chanRows.length, 1);
+    const H = 340 + chanRowsCount * 44;
+
+    let chanListSvg = '';
+    if (!chanRows.length) {
+      chanListSvg = `<text x="30" y="330" font-family="sans-serif" font-size="14" fill="#9a9ba5">Henüz mesaj verisi yok.</text>`;
+    } else {
+      chanRows.forEach((r, i) => {
+        chanListSvg += statsRowSvg(30, 300 + i * 54, STATS_CARD_W - 60, 46, i + 1, r.name, r.total.toLocaleString('tr-TR'), { valueColor: '#5DADE2' });
+      });
+    }
+
+    const svg = `<svg width="${STATS_CARD_W}" height="${H}" xmlns="http://www.w3.org/2000/svg">
+      <rect width="100%" height="100%" rx="18" fill="${STATS_BG_TOP}"/>
+
+      <text x="${30 + AV_SIZE + RING_W * 2 + 20}" y="56" font-family="sans-serif" font-weight="800" font-size="26" fill="#ffffff">${escXml(displayName)}</text>
+      <text x="${30 + AV_SIZE + RING_W * 2 + 20}" y="82" font-family="sans-serif" font-size="14" fill="#9a9ba5">${escXml(guild.name).slice(0, 40)}</text>
+
+      <!-- Sunucu sıralaması -->
+      <rect x="${STATS_CARD_W - 220}" y="24" width="190" height="46" rx="12" fill="${STATS_BG_BOX}"/>
+      <text x="${STATS_CARD_W - 200}" y="53" font-family="sans-serif" font-size="20">🏆</text>
+      <text x="${STATS_CARD_W - 172}" y="53" font-family="sans-serif" font-weight="700" font-size="16" fill="#ffffff">Mesaj #${rank ?? '—'}</text>
+
+      <!-- Mesaj sayıları kutuları -->
+      <text x="30" y="128" font-family="sans-serif" font-weight="700" font-size="16" fill="#c8c9d2"># Mesajlar</text>
+
+      <rect x="30" y="140" width="${(STATS_CARD_W - 60 - 20) / 3}" height="70" rx="12" fill="${STATS_BG_BOX}"/>
+      <text x="${30 + 16}" y="168" font-family="sans-serif" font-size="13" fill="#9a9ba5">1 gün</text>
+      <text x="${30 + 16}" y="195" font-family="sans-serif" font-weight="800" font-size="22" fill="#ffffff">${c1d.toLocaleString('tr-TR')}</text>
+
+      <rect x="${30 + (STATS_CARD_W - 60 - 20) / 3 + 10}" y="140" width="${(STATS_CARD_W - 60 - 20) / 3}" height="70" rx="12" fill="${STATS_BG_BOX}"/>
+      <text x="${30 + (STATS_CARD_W - 60 - 20) / 3 + 26}" y="168" font-family="sans-serif" font-size="13" fill="#9a9ba5">7 gün</text>
+      <text x="${30 + (STATS_CARD_W - 60 - 20) / 3 + 26}" y="195" font-family="sans-serif" font-weight="800" font-size="22" fill="#ffffff">${c7d.toLocaleString('tr-TR')}</text>
+
+      <rect x="${30 + 2 * ((STATS_CARD_W - 60 - 20) / 3 + 10)}" y="140" width="${(STATS_CARD_W - 60 - 20) / 3}" height="70" rx="12" fill="${STATS_BG_BOX}"/>
+      <text x="${30 + 2 * ((STATS_CARD_W - 60 - 20) / 3 + 10) + 16}" y="168" font-family="sans-serif" font-size="13" fill="#9a9ba5">14 gün</text>
+      <text x="${30 + 2 * ((STATS_CARD_W - 60 - 20) / 3 + 10) + 16}" y="195" font-family="sans-serif" font-weight="800" font-size="22" fill="#ffffff">${c14d.toLocaleString('tr-TR')}</text>
+
+      <text x="30" y="245" font-family="sans-serif" font-size="13" fill="#9a9ba5">Toplam (tüm zamanlar): <tspan font-weight="700" fill="#ffffff">${total.toLocaleString('tr-TR')}</tspan> mesaj</text>
+
+      <text x="30" y="278" font-family="sans-serif" font-weight="700" font-size="16" fill="#c8c9d2"># En Çok Yazdığım Kanallar</text>
+      ${chanListSvg}
+    </svg>`;
+
+    const finalCard = await sharp(Buffer.from(svg))
+      .composite([{ input: avatarWithRing, top: 24, left: 30 }])
+      .png()
+      .toBuffer();
+    return finalCard;
+  } catch (e) {
+    console.error('⛔ renderMeStatsCard hatası:', e.message);
+    return null;
+  }
+}
+
+
+
+// ── Profil kozmetik satın alma akışları (Market'ten çağrılır) ──────────────
+async function runProfileBgPurchaseFlow(channel, i, gid, uid) {
+  const cur = getProfileCosmetics(gid, uid);
+  if (!cur.hasBackground) {
+    const bal = getBalance(gid, uid);
+    if (bal.balance < PROFILE_BG_PRICE) {
+      return i.reply({ ephemeral: true, content: `⛔ Yetersiz bakiye! Arkaplan **${PROFILE_BG_PRICE.toLocaleString('tr-TR')} coin**, senin bakiyen **${bal.balance.toLocaleString('tr-TR')} coin**.` });
+    }
+    addBalance(gid, uid, -PROFILE_BG_PRICE);
+  }
+  await i.reply({ ephemeral: true, content: '📎 Şimdi bu kanala arkaplan olarak kullanmak istediğin **GIF/resim linkini** (veya dosyayı) gönder. **60 saniyen** var.\n*(GIF hareketli olsa da kartta yalnızca ilk kare kullanılır.)*' });
+  const filter = m => m.author.id === uid;
+  try {
+    const collected = await channel.awaitMessages({ filter, max: 1, time: 60_000, errors: ['time'] });
+    const linkMsg = collected.first();
+    let url = extractFirstUrl(linkMsg.content);
+    if (!url && linkMsg.attachments.size) url = linkMsg.attachments.first().url;
+    if (!url) {
+      await i.followUp({ ephemeral: true, content: '⛔ Bir link ya da dosya bulamadım, arkaplan ayarlanmadı. Tekrar deneyebilirsin.' });
+      if (!cur.hasBackground) addBalance(gid, uid, PROFILE_BG_PRICE);
+      return;
+    }
+    setProfileBackground(gid, uid, url);
+    linkMsg.delete().catch(() => {});
+    await i.followUp({ ephemeral: true, content: '✅ Arkaplan güncellendi! `/profil` ile görebilirsin.' });
+  } catch {
+    await i.followUp({ ephemeral: true, content: '⛔ Süre doldu, link gelmedi. Arkaplan ayarlanmadı.' });
+    if (!cur.hasBackground) addBalance(gid, uid, PROFILE_BG_PRICE);
+  }
+}
+
+async function runProfileMsgPurchaseFlow(i, gid, uid) {
+  const cur = getProfileCosmetics(gid, uid);
+  if (!cur.hasMessage) {
+    const bal = getBalance(gid, uid);
+    if (bal.balance < PROFILE_MSG_PRICE) {
+      return i.reply({ ephemeral: true, content: `⛔ Yetersiz bakiye! Yazı alanı **${PROFILE_MSG_PRICE.toLocaleString('tr-TR')} coin**, senin bakiyen **${bal.balance.toLocaleString('tr-TR')} coin**.` });
+    }
+  }
+  const modal = new ModalBuilder().setCustomId('profil_msg_modal').setTitle('Profil Yazısı');
+  const input = new TextInputBuilder()
+    .setCustomId('profil_msg_input')
+    .setLabel('Profilinde görünecek yazı (max 100 karakter)')
+    .setStyle(TextInputStyle.Paragraph)
+    .setMaxLength(100)
+    .setRequired(true)
+    .setValue(cur.messageText || '');
+  modal.addComponents(new ActionRowBuilder().addComponents(input));
+  await i.showModal(modal);
+  try {
+    const modalSubmit = await i.awaitModalSubmit({ time: 120_000, filter: mi => mi.user.id === uid && mi.customId === 'profil_msg_modal' });
+    const text = modalSubmit.fields.getTextInputValue('profil_msg_input').trim().slice(0, 100);
+    if (!cur.hasMessage) addBalance(gid, uid, -PROFILE_MSG_PRICE);
+    setProfileMessage(gid, uid, text);
+    await modalSubmit.reply({ ephemeral: true, content: '✅ Yazın kaydedildi! `/profil` ile görebilirsin.' });
+  } catch {
+    // modal zaman aşımına uğradı ya da iptal edildi — ücret zaten alınmamıştı
+  }
+}
+
+function buildProfilIconPanel(gid, uid) {
+  const owned  = getOwnedIcons(gid, uid);
+  const active = getProfileCosmetics(gid, uid).activeIcon;
+  const e = new EmbedBuilder()
+    .setTitle('🎖️ Profil Rozetleri')
+    .setColor(0x9B59B6)
+    .setDescription(
+      'Profil kartının sol altında görünecek küçük bir rozet seç. Birden fazla rozet satın alabilirsin, aynı anda yalnızca 1 tanesi kuşanılı olur.\n\n' +
+      COSMETIC_ICONS.map(ic => {
+        const has = owned.includes(ic.key);
+        const isActive = active === ic.key;
+        return `${ic.emoji} **${ic.name}** — ${ic.price.toLocaleString('tr-TR')} coin${isActive ? ' ✅ Kuşanılı' : has ? ' 📦 Sende var' : ''}`;
+      }).join('\n')
+    );
+  const buttons = COSMETIC_ICONS.map(ic => {
+    const has = owned.includes(ic.key);
+    const isActive = active === ic.key;
+    return new ButtonBuilder()
+      .setCustomId(`mkt_profilikonbuy_${ic.key}_${uid}`)
+      .setLabel(has ? (isActive ? 'Kuşanılı' : 'Kuşan') : `${ic.price.toLocaleString('tr-TR')}c`)
+      .setEmoji(ic.emoji)
+      .setStyle(isActive ? ButtonStyle.Secondary : has ? ButtonStyle.Primary : ButtonStyle.Success)
+      .setDisabled(isActive);
+  });
+  const rows = [];
+  for (let i2 = 0; i2 < buttons.length; i2 += 5) rows.push(new ActionRowBuilder().addComponents(...buttons.slice(i2, i2 + 5)));
+  rows.push(new ActionRowBuilder().addComponents(new ButtonBuilder().setCustomId(`mkt_profil_${uid}`).setLabel('← Geri').setStyle(ButtonStyle.Danger)));
+  return { embeds: [e], components: rows.slice(0, 5) };
+}
+
 function spendCraftMats(gid, uid, recipe) {
   for (const [mat, qty] of Object.entries(recipe)) consumeCraftMat(gid, uid, mat, qty);
 }
@@ -9585,23 +10207,10 @@ const MMORPG_SLASH_COMMANDS = [
         .setRequired(true)
         .addChoices(...PET_EGG_TYPES.map(e => ({ name: `${e.emoji} ${e.name}`, value: e.key }))))),
 
-  // /craft — craft yap
+  // /craft — craft yap (buton tabanlı panel — /market ile aynı stil)
   new SlashCommandBuilder()
     .setName('craft')
-    .setDescription('Craft sistemi — silah, zırh ve diğer eşyaları üret')
-    .addStringOption(o => o
-      .setName('kategori')
-      .setDescription('Craft kategorisi')
-      .setRequired(true)
-      .addChoices(
-        { name: '⚔️ Silah', value: 'silah' },
-        { name: '🛡️ Zırh',  value: 'zirh'  },
-        { name: '🥚 Yumurta', value: 'yumurta' },
-        { name: '📦 Sandık',  value: 'sandik'  },
-        { name: '🌀 Gelişmiş Malzeme', value: 'malzeme' },
-        { name: '💎 Relic Seti (Tam Set)', value: 'set' },
-      ))
-    .addStringOption(o => o.setName('item').setDescription('Üretilecek eşya').setRequired(true).setAutocomplete(true)),
+    .setDescription('Craft atölyesi — silah, zırh, relic parçası ve diğer eşyaları üret'),
 
   // /yukselt — ekipman güçlendirme
   new SlashCommandBuilder()
@@ -9618,7 +10227,7 @@ const MMORPG_SLASH_COMMANDS = [
   new SlashCommandBuilder()
     .setName('slot')
     .setDescription('Slot makinesi oyna')
-    .addIntegerOption(o => o.setName('bahis').setDescription('Bahis miktarı (min 50, max 100.000)').setRequired(true).setMinValue(50).setMaxValue(100000)),
+    .addIntegerOption(o => o.setName('bahis').setDescription('Bahis miktarı (min 50, max 20.000)').setRequired(true).setMinValue(50).setMaxValue(20000)),
 
   // /relic-set — yeni relic set görüntüle
   new SlashCommandBuilder()
@@ -10656,181 +11265,485 @@ function buildInventoryEmbed(gid, uid, tab, tabs) {
 //  CRAFT KOMUTU
 // ─────────────────────────────────────────────────────────────────────────
 async function handleCraftCommand(interaction, gid, uid) {
-  const kategori = interaction.options.getString('kategori');
-  const itemStr  = interaction.options.getString('item').trim().toLowerCase();
+  // ── Yardımcılar ──────────────────────────────────────────────
+  function fmtRecipe(recipe, owned) {
+    const entries = Object.entries(recipe);
+    if (!entries.length) return '*(malzeme gerekmiyor)*';
+    return entries.map(([k, v]) => {
+      const d = findAnyCraftMaterial(k);
+      const have = owned.find(m => m.matKey === k)?.quantity || 0;
+      const ok = have >= v;
+      return `${d?.emoji || '🔩'} **${d?.name || k}**: ${have}/${v} ${ok ? '✅' : '❌'}`;
+    }).join('\n');
+  }
 
-  if (kategori === 'silah') {
-    // itemStr = "kilic_altin"
-    const parts = itemStr.split('_');
-    const typeKey = parts[0];
-    const tierKey = parts.slice(1).join('_');
+  function buildCraftHome() {
+    const e = new EmbedBuilder()
+      .setTitle('🛠️ Craft Atölyesi')
+      .setColor(0x9B59B6)
+      .setDescription('Ne üretmek istersin? Bir kategori seç:')
+      .addFields(
+        { name: '⚔️ Silah',           value: 'Kılıç, yay, asa, hançer, tırpan — E→SSS tier.',        inline: true },
+        { name: '🛡️ Zırh',            value: '17 slot, E→SSS tier zırh parçası.',                     inline: true },
+        { name: '🥚 Yumurta',         value: 'Pet yumurtası üret.',                                    inline: true },
+        { name: '📦 Sandık',          value: 'Ödül sandığı üret.',                                     inline: true },
+        { name: '🌀 Gelişmiş Malzeme', value: 'SSS tier üretimde kullanılan özel malzemeler.',         inline: true },
+        { name: '💎 Relic Parçası',   value: 'Bir set seç, tek tek parça üret (tam set şart değil!).', inline: true },
+      )
+      .setFooter({ text: '🎒 Malzeme envanterin için aşağıdaki butona bas' });
+    const r1 = new ActionRowBuilder().addComponents(
+      new ButtonBuilder().setCustomId('craft_silah').setLabel('⚔️ Silah').setStyle(ButtonStyle.Primary),
+      new ButtonBuilder().setCustomId('craft_zirh').setLabel('🛡️ Zırh').setStyle(ButtonStyle.Primary),
+      new ButtonBuilder().setCustomId('craft_yumurta').setLabel('🥚 Yumurta').setStyle(ButtonStyle.Success),
+    );
+    const r2 = new ActionRowBuilder().addComponents(
+      new ButtonBuilder().setCustomId('craft_sandik').setLabel('📦 Sandık').setStyle(ButtonStyle.Success),
+      new ButtonBuilder().setCustomId('craft_malzeme').setLabel('🌀 Gelişmiş Malzeme').setStyle(ButtonStyle.Secondary),
+      new ButtonBuilder().setCustomId('craft_relicparca').setLabel('💎 Relic Parçası').setStyle(ButtonStyle.Danger),
+    );
+    const r3 = new ActionRowBuilder().addComponents(
+      new ButtonBuilder().setCustomId('craft_mats').setLabel('🎒 Malzeme Envanterim').setStyle(ButtonStyle.Secondary),
+    );
+    return { embeds: [e], components: [r1, r2, r3] };
+  }
+
+  function backRow(extraCustomId) {
+    const comps = [];
+    if (extraCustomId) comps.push(extraCustomId);
+    comps.push(new ButtonBuilder().setCustomId('craft_home').setLabel('← Ana Menü').setStyle(ButtonStyle.Danger));
+    return new ActionRowBuilder().addComponents(...comps);
+  }
+
+  // ⚔️ Silah — TYPE seçim ekranı
+  function buildWeaponTypeView() {
+    const cls = getPlayerClass(gid, uid);
+    const clsDef = cls ? RPG_CLASSES.find(c => c.key === cls) : null;
+    const e = new EmbedBuilder()
+      .setTitle('⚔️ Silah Craft — Tür Seç')
+      .setColor(0x9B59B6)
+      .setDescription(WEAPON_TYPES.map(t => {
+        const locked = cls && !classAllowsStat(cls, t.stat);
+        return `${t.emoji} **${t.name}**${locked ? ` — 🔒 (${clsDef?.name || cls} kullanamaz)` : ''}`;
+      }).join('\n'));
+    const select = new StringSelectMenuBuilder()
+      .setCustomId('craft_silah_typesel')
+      .setPlaceholder('Silah türü seç...')
+      .addOptions(WEAPON_TYPES.map(t => ({
+        label: `${t.emoji} ${t.name}`.slice(0, 100),
+        value: t.key,
+        description: (cls && !classAllowsStat(cls, t.stat)) ? '🔒 Sınıfın kullanamıyor' : undefined,
+      })));
+    return { embeds: [e], components: [new ActionRowBuilder().addComponents(select), backRow()] };
+  }
+
+  // ⚔️ Silah — TIER seçim ekranı (type seçildikten sonra)
+  function buildWeaponTierView(typeKey) {
     const wType = WEAPON_TYPES.find(t => t.key === typeKey);
-    const wTier = WEAPON_TIERS.find(t => t.key === tierKey);
-
-    if (!wType || !wTier) {
-      const options = WEAPON_TYPES.map(t => WEAPON_TIERS.map(r => `\`${t.key}_${r.key}\``).join(', ')).join('\n');
-      return interaction.reply({ ephemeral: true, content: `⛔ Geçersiz silah! Seçenekler:\n${options}` });
-    }
-
-    const wCls = getPlayerClass(gid, uid);
-    if (wCls && !classAllowsStat(wCls, wType.stat)) {
-      const clsDef = RPG_CLASSES.find(c => c.key === wCls);
-      return interaction.reply({ ephemeral: true, content: `⛔ **${clsDef.emoji} ${clsDef.name}** sınıfın **${wType.emoji} ${wType.name}** craftlamana izin vermiyor!` });
-    }
-
-    if (!hasCraftMats(gid, uid, wTier.craft)) {
-      const needed = Object.entries(wTier.craft).map(([k,v]) => {
-        const d = findAnyCraftMaterial(k);
-        const have = getCraftMats(gid, uid).find(m => m.matKey === k)?.quantity || 0;
-        return `${d?.emoji} ${d?.name}: ${have}/${v}`;
-      }).join('\n');
-      return interaction.reply({ ephemeral: true, content: `⛔ Yetersiz malzeme!\n${needed}` });
-    }
-
-    spendCraftMats(gid, uid, wTier.craft);
-    const id = addWeapon(gid, uid, `${typeKey}_${tierKey}`);
-    // Craft XP
-    const craftXp = wTier.key === 'godslayer' ? 150 : wTier.key === 'ejder' ? 80 : wTier.key === 'kristal' ? 50 : wTier.key === 'altin' ? 30 : 15;
-    addRpgXp(gid, uid, craftXp);
-
-    return interaction.reply({
-      content: `✅ **${getWeaponName(`${typeKey}_${tierKey}`)}** crafted! (ID: ${id})\n+${craftXp} RPG XP kazandın!\n🛡️ \`/yukselt tur:silah id:${id}\` ile güçlendirebilirsin.`,
-    });
+    const owned = getCraftMats(gid, uid);
+    const e = new EmbedBuilder()
+      .setTitle(`⚔️ ${wType.emoji} ${wType.name} — Tier Seç`)
+      .setColor(0x9B59B6)
+      .setDescription(WEAPON_TIERS.map(tier => {
+        const ok = hasCraftMats(gid, uid, tier.craft) ? '✅' : '❌';
+        return `${tier.emoji} **[${tier.grade}] ${tier.name}** ${ok}\n${fmtRecipe(tier.craft, owned)}`;
+      }).join('\n\n'));
+    const select = new StringSelectMenuBuilder()
+      .setCustomId(`craft_silah_tiersel_${typeKey}`)
+      .setPlaceholder('Tier seç...')
+      .addOptions(WEAPON_TIERS.map(t => ({
+        label: `${t.emoji} [${t.grade}] ${t.name}`.slice(0, 100),
+        value: t.key,
+        description: (hasCraftMats(gid, uid, t.craft) ? '✅ Malzeme yeterli' : '❌ Malzeme yetersiz').slice(0, 100),
+      })));
+    const backToType = new ButtonBuilder().setCustomId('craft_silah').setLabel('← Tür Seçimine Dön').setStyle(ButtonStyle.Secondary);
+    return { embeds: [e], components: [new ActionRowBuilder().addComponents(select), backRow(backToType)] };
   }
 
-  else if (kategori === 'zirh') {
-    // itemStr = "miğfer_altin"
-    const lastUnder = itemStr.lastIndexOf('_');
-    const slotKey   = itemStr.substring(0, lastUnder);
-    const tierKey   = itemStr.substring(lastUnder + 1);
+  // 🛡️ Zırh — SLOT seçim ekranı
+  function buildArmorSlotView() {
+    const cls = getPlayerClass(gid, uid);
+    const clsDef = cls ? RPG_CLASSES.find(c => c.key === cls) : null;
+    const e = new EmbedBuilder()
+      .setTitle('🛡️ Zırh Craft — Slot Seç')
+      .setColor(0x9B59B6)
+      .setDescription(ARMOR_SLOTS.map(s => {
+        const locked = cls && !classAllowsStat(cls, s.stat);
+        return `${s.emoji} **${s.name}**${locked ? ` — 🔒 (${clsDef?.name || cls} kullanamaz)` : ''}`;
+      }).join('\n'));
+    const slotOptions = ARMOR_SLOTS.map(s => ({
+      label: `${s.emoji} ${s.name}`.slice(0, 100),
+      value: s.key,
+      description: (cls && !classAllowsStat(cls, s.stat)) ? '🔒 Sınıfın kullanamıyor' : undefined,
+    }));
+    // Discord select menüsü max 25 seçenek destekler — ARMOR_SLOTS 17 olduğu için sorun yok.
+    const select = new StringSelectMenuBuilder()
+      .setCustomId('craft_zirh_slotsel')
+      .setPlaceholder('Zırh slotu seç...')
+      .addOptions(slotOptions);
+    return { embeds: [e], components: [new ActionRowBuilder().addComponents(select), backRow()] };
+  }
+
+  // 🛡️ Zırh — TIER seçim ekranı
+  function buildArmorTierView(slotKey) {
     const aSlot = ARMOR_SLOTS.find(s => s.key === slotKey);
-    const aTier = ARMOR_TIERS.find(t => t.key === tierKey);
+    const owned = getCraftMats(gid, uid);
+    const e = new EmbedBuilder()
+      .setTitle(`🛡️ ${aSlot.emoji} ${aSlot.name} — Tier Seç`)
+      .setColor(0x9B59B6)
+      .setDescription(ARMOR_TIERS.map(tier => {
+        const ok = hasCraftMats(gid, uid, tier.craft) ? '✅' : '❌';
+        return `${tier.emoji} **[${tier.grade}] ${tier.name}** ${ok}\n${fmtRecipe(tier.craft, owned)}`;
+      }).join('\n\n'));
+    const select = new StringSelectMenuBuilder()
+      .setCustomId(`craft_zirh_tiersel_${slotKey}`)
+      .setPlaceholder('Tier seç...')
+      .addOptions(ARMOR_TIERS.map(t => ({
+        label: `${t.emoji} [${t.grade}] ${t.name}`.slice(0, 100),
+        value: t.key,
+        description: (hasCraftMats(gid, uid, t.craft) ? '✅ Malzeme yeterli' : '❌ Malzeme yetersiz').slice(0, 100),
+      })));
+    const backToSlot = new ButtonBuilder().setCustomId('craft_zirh').setLabel('← Slot Seçimine Dön').setStyle(ButtonStyle.Secondary);
+    return { embeds: [e], components: [new ActionRowBuilder().addComponents(select), backRow(backToSlot)] };
+  }
 
-    if (!aSlot || !aTier) {
-      const options = ARMOR_SLOTS.map(s => ARMOR_TIERS.map(t => `\`${s.key}_${t.key}\``).join(', ')).join('\n');
-      return interaction.reply({ ephemeral: true, content: `⛔ Geçersiz zırh! Seçenekler (örn):\n${ARMOR_SLOTS.slice(0,2).flatMap(s => ARMOR_TIERS.slice(0,3).map(t => `\`${s.key}_${t.key}\``)).join(', ')} ...` });
-    }
-
-    const aCls = getPlayerClass(gid, uid);
-    if (aCls && !classAllowsStat(aCls, aSlot.stat)) {
-      const clsDef = RPG_CLASSES.find(c => c.key === aCls);
-      return interaction.reply({ ephemeral: true, content: `⛔ **${clsDef.emoji} ${clsDef.name}** sınıfın **${aSlot.emoji} ${aSlot.name}** craftlamana izin vermiyor!` });
-    }
-
-    if (!hasCraftMats(gid, uid, aTier.craft)) {
-      const needed = Object.entries(aTier.craft).map(([k,v]) => {
-        const d = findAnyCraftMaterial(k);
-        const have = getCraftMats(gid, uid).find(m => m.matKey === k)?.quantity || 0;
-        return `${d?.emoji} ${d?.name}: ${have}/${v}`;
-      }).join('\n');
-      return interaction.reply({ ephemeral: true, content: `⛔ Yetersiz malzeme!\n${needed}` });
-    }
-
-    spendCraftMats(gid, uid, aTier.craft);
-    const id = addArmor(gid, uid, `${slotKey}_${tierKey}`, slotKey);
-    const craftXp = aTier.key === 'godslayer' ? 130 : aTier.key === 'ejder' ? 70 : aTier.key === 'kristal' ? 45 : aTier.key === 'altin' ? 25 : 12;
-    addRpgXp(gid, uid, craftXp);
-
-    return interaction.reply({
-      content: `✅ **${getArmorName(slotKey, tierKey)}** crafted! (ID: ${id})\n+${craftXp} RPG XP kazandın!\n🛡️ \`/yukselt tur:zirh id:${id}\` ile güçlendirebilirsin.`,
+  // 🥚 Yumurta view
+  function buildEggView() {
+    const owned = getCraftMats(gid, uid);
+    const e = new EmbedBuilder()
+      .setTitle('🥚 Yumurta Craft')
+      .setColor(0x9B59B6)
+      .setDescription(Object.entries(CRAFT_EGG_RECIPES).map(([key, recipe]) => {
+        const def = PET_EGG_TYPES.find(x => x.key === key);
+        const ok = hasCraftMats(gid, uid, recipe) ? '✅' : '❌';
+        return `${def?.emoji || '🥚'} **${def?.name || key}** ${ok}\n${fmtRecipe(recipe, owned)}`;
+      }).join('\n\n'));
+    const buttons = Object.keys(CRAFT_EGG_RECIPES).map(key => {
+      const def = PET_EGG_TYPES.find(x => x.key === key);
+      return new ButtonBuilder().setCustomId(`craft_do_egg_${key}`).setLabel(def?.name || key).setEmoji(def?.emoji || '🥚')
+        .setStyle(hasCraftMats(gid, uid, CRAFT_EGG_RECIPES[key]) ? ButtonStyle.Success : ButtonStyle.Secondary);
     });
+    const rows = [];
+    for (let i = 0; i < buttons.length; i += 5) rows.push(new ActionRowBuilder().addComponents(...buttons.slice(i, i + 5)));
+    rows.push(backRow());
+    return { embeds: [e], components: rows.slice(0, 5) };
   }
 
-  else if (kategori === 'yumurta') {
-    const recipe = CRAFT_EGG_RECIPES[itemStr];
-    if (!recipe) return interaction.reply({ ephemeral: true, content: `⛔ Geçerli yumurta türleri: ${Object.keys(CRAFT_EGG_RECIPES).join(', ')}` });
-    if (!hasCraftMats(gid, uid, recipe)) {
-      const needed = Object.entries(recipe).map(([k,v]) => {
-        const d = findAnyCraftMaterial(k);
-        const have = getCraftMats(gid, uid).find(m => m.matKey === k)?.quantity || 0;
-        return `${d?.emoji} ${d?.name}: ${have}/${v}`;
-      }).join('\n');
-      return interaction.reply({ ephemeral: true, content: `⛔ Yetersiz malzeme!\n${needed}` });
-    }
-    spendCraftMats(gid, uid, recipe);
-    addEgg(gid, uid, itemStr, 1);
-    const eggDef = PET_EGG_TYPES.find(e => e.key === itemStr);
-    addRpgXp(gid, uid, 20);
-    return interaction.reply({ content: `✅ **${eggDef?.name}** crafted! (+20 RPG XP)` });
-  }
-
-  else if (kategori === 'sandik') {
-    const recipe = CRAFT_SANDIK_RECIPES[itemStr];
-    if (!recipe) return interaction.reply({ ephemeral: true, content: `⛔ Geçerli sandık türleri: ${Object.keys(CRAFT_SANDIK_RECIPES).join(', ')}` });
-    if (!hasCraftMats(gid, uid, recipe)) {
-      const needed = Object.entries(recipe).map(([k,v]) => {
-        const d = findAnyCraftMaterial(k);
-        const have = getCraftMats(gid, uid).find(m => m.matKey === k)?.quantity || 0;
-        return `${d?.emoji} ${d?.name}: ${have}/${v}`;
-      }).join('\n');
-      return interaction.reply({ ephemeral: true, content: `⛔ Yetersiz malzeme!\n${needed}` });
-    }
-    spendCraftMats(gid, uid, recipe);
-    addChest(gid, uid, itemStr, 1);
-    const chestDef = MMORPG_CHESTS.find(c => c.key === itemStr);
-    addRpgXp(gid, uid, 15);
-    return interaction.reply({ content: `✅ **${chestDef?.name}** crafted! (+15 RPG XP)` });
-  }
-
-  else if (kategori === 'malzeme') {
-    // Gelişmiş malzeme craftlama — madenden düşmez, tek yol burası.
-    const def = ADVANCED_CRAFT_MATERIALS.find(m => m.key === itemStr);
-    if (!def) return interaction.reply({ ephemeral: true, content: `⛔ Geçerli gelişmiş malzemeler: ${ADVANCED_CRAFT_MATERIALS.map(m => `\`${m.key}\``).join(', ')}` });
-
-    if (!hasCraftMats(gid, uid, def.craft)) {
-      const needed = Object.entries(def.craft).map(([k, v]) => {
-        const d = findAnyCraftMaterial(k);
-        const have = getCraftMats(gid, uid).find(m => m.matKey === k)?.quantity || 0;
-        return `${d?.emoji || ''} ${d?.name || k}: ${have}/${v}`;
-      }).join('\n');
-      return interaction.reply({ ephemeral: true, content: `⛔ Yetersiz malzeme!\n${needed}` });
-    }
-
-    spendCraftMats(gid, uid, def.craft);
-    addCraftMat(gid, uid, def.key, 1);
-    addRpgXp(gid, uid, 60);
-
-    return interaction.reply({
-      content: `✅ ${def.emoji} **${def.name}** × 1 crafted! (+60 RPG XP)\n🌀 SSS tier ekipman/relic set üretiminde ve +5 sonrası geliştirmelerde kullanılır.`,
+  // 📦 Sandık view
+  function buildChestView() {
+    const owned = getCraftMats(gid, uid);
+    const e = new EmbedBuilder()
+      .setTitle('📦 Sandık Craft')
+      .setColor(0x9B59B6)
+      .setDescription(Object.entries(CRAFT_SANDIK_RECIPES).map(([key, recipe]) => {
+        const def = MMORPG_CHESTS.find(x => x.key === key);
+        const ok = hasCraftMats(gid, uid, recipe) ? '✅' : '❌';
+        return `${def?.emoji || '📦'} **${def?.name || key}** ${ok}\n${fmtRecipe(recipe, owned)}`;
+      }).join('\n\n'));
+    const buttons = Object.keys(CRAFT_SANDIK_RECIPES).map(key => {
+      const def = MMORPG_CHESTS.find(x => x.key === key);
+      return new ButtonBuilder().setCustomId(`craft_do_chest_${key}`).setLabel(def?.name || key).setEmoji(def?.emoji || '📦')
+        .setStyle(hasCraftMats(gid, uid, CRAFT_SANDIK_RECIPES[key]) ? ButtonStyle.Success : ButtonStyle.Secondary);
     });
+    const rows = [];
+    for (let i = 0; i < buttons.length; i += 5) rows.push(new ActionRowBuilder().addComponents(...buttons.slice(i, i + 5)));
+    rows.push(backRow());
+    return { embeds: [e], components: rows.slice(0, 5) };
   }
 
-  else if (kategori === 'set') {
-    // Tam Relic Seti craftlama — kılıç craft sisteminden örnek alınmış, %60 daha zor.
-    const def = RELIC_SETS[itemStr];
-    if (!def) return interaction.reply({ ephemeral: true, content: `⛔ Geçersiz set! Seçenekler: ${Object.keys(RELIC_SETS).join(', ')}` });
+  // 🌀 Gelişmiş Malzeme view
+  function buildAdvMatView() {
+    const owned = getCraftMats(gid, uid);
+    const e = new EmbedBuilder()
+      .setTitle('🌀 Gelişmiş Malzeme Craft')
+      .setColor(0x9B59B6)
+      .setDescription('SSS tier ekipman/relic üretiminde ve +5 sonrası geliştirmelerde kullanılır.\n\n' +
+        ADVANCED_CRAFT_MATERIALS.map(m => {
+          const ok = hasCraftMats(gid, uid, m.craft) ? '✅' : '❌';
+          return `${m.emoji} **${m.name}** ${ok}\n${fmtRecipe(m.craft, owned)}`;
+        }).join('\n\n'));
+    const buttons = ADVANCED_CRAFT_MATERIALS.map(m =>
+      new ButtonBuilder().setCustomId(`craft_do_advmat_${m.key}`).setLabel(m.name).setEmoji(m.emoji)
+        .setStyle(hasCraftMats(gid, uid, m.craft) ? ButtonStyle.Success : ButtonStyle.Secondary)
+    );
+    const rows = [];
+    for (let i = 0; i < buttons.length; i += 5) rows.push(new ActionRowBuilder().addComponents(...buttons.slice(i, i + 5)));
+    rows.push(backRow());
+    return { embeds: [e], components: rows.slice(0, 5) };
+  }
 
-    if (def.classKey && getPlayerClass(gid, uid) !== def.classKey) {
-      const clsDef = RPG_CLASSES.find(c => c.key === def.classKey);
-      return interaction.reply({ ephemeral: true, content: `⛔ **${def.emoji} ${def.name}** yalnızca **${clsDef?.emoji || ''} ${clsDef?.name || def.classKey}** sınıfı tarafından craftlanabilir!` });
+  // 💎 Relic Parçası — SET seçim ekranı (27 set var, Discord select menu limiti 25 — sayfalı)
+  function buildRelicSetSelectView(offset = 0) {
+    const allSets = Object.entries(RELIC_SETS);
+    const page = allSets.slice(offset, offset + 25);
+    const e = new EmbedBuilder()
+      .setTitle('💎 Relic Parçası Craft — Set Seç')
+      .setColor(0x9B59B6)
+      .setDescription(
+        'Bir set seç, ardından tek tek parça üretebilirsin. **Tam seti tek seferde craftlamak zorunda değilsin!**\n' +
+        '🔒 = sınıfa özel set (parçayı yine de üretebilirsin, ama bonusu sadece o sınıf kullanabilir).' +
+        (allSets.length > 25 ? `\n\n📄 Gösterilen: ${offset + 1}-${offset + page.length} / ${allSets.length}` : '')
+      );
+    const options = page.map(([key, def]) => ({
+      label: `${def.emoji} ${def.name} [${def.tier}]`.slice(0, 100),
+      value: key,
+      description: (def.classKey ? `🔒 ${RPG_CLASSES.find(c => c.key === def.classKey)?.name || def.classKey} özel` : 'Herkese açık').slice(0, 100),
+    }));
+    const select = new StringSelectMenuBuilder()
+      .setCustomId('craft_relic_setsel')
+      .setPlaceholder('Relic seti seç...')
+      .addOptions(options);
+    const rows = [new ActionRowBuilder().addComponents(select)];
+    if (allSets.length > 25) {
+      rows.push(new ActionRowBuilder().addComponents(
+        new ButtonBuilder().setCustomId(`craft_relic_setpage_${Math.max(0, offset - 25)}`).setLabel('◀ Önceki').setStyle(ButtonStyle.Secondary).setDisabled(offset === 0),
+        new ButtonBuilder().setCustomId(`craft_relic_setpage_${offset + 25}`).setLabel('Sonraki ▶').setStyle(ButtonStyle.Secondary).setDisabled(offset + 25 >= allSets.length),
+      ));
     }
+    rows.push(backRow());
+    return { embeds: [e], components: rows.slice(0, 5) };
+  }
 
+  // 💎 Relic Parçası — PARÇA seçim ekranı (set seçildikten sonra)
+  function buildRelicPieceView(setKey) {
+    const def = RELIC_SETS[setKey];
     const ownedKeys = getRelics(gid, uid);
-    const missing   = def.pieces.filter(p => !ownedKeys.includes(p.key));
-    if (!missing.length) return interaction.reply({ ephemeral: true, content: `${def.emoji} **${def.name}** zaten tam (6/6) sende var.` });
+    const perPieceRecipe = getRelicPieceCraftRecipe(def.tier);
+    const owned = getCraftMats(gid, uid);
+    const clsDef = def.classKey ? RPG_CLASSES.find(c => c.key === def.classKey) : null;
 
-    const recipe = getRelicSetCraftRecipe(def.tier);
-    if (!hasCraftMats(gid, uid, recipe)) {
-      const needed = Object.entries(recipe).map(([k, v]) => {
-        const d = CRAFT_MATERIALS.find(m => m.key === k) || ADVANCED_CRAFT_MATERIALS.find(m => m.key === k);
-        const have = getCraftMats(gid, uid).find(m => m.matKey === k)?.quantity || 0;
-        return `${d?.emoji || ''} ${d?.name || k}: ${have}/${v}`;
-      }).join('\n');
-      return interaction.reply({ ephemeral: true, content: `⛔ Yetersiz malzeme! **${def.emoji} ${def.name}** [${def.tier}] tam seti için gerekli:\n${needed}` });
-    }
+    const haveCount = def.pieces.filter(p => ownedKeys.includes(p.key)).length;
+    const e = new EmbedBuilder()
+      .setTitle(`${def.emoji} ${def.name} [${def.tier}] — Parça Craft`)
+      .setColor(def.color || 0x9B59B6)
+      .setDescription(
+        (clsDef ? `🔒 Bonus yalnızca **${clsDef.emoji} ${clsDef.name}** sınıfı için aktif olur.\n` : '') +
+        `📦 Sahip olduğun: **${haveCount}/6** parça\n\n` +
+        `**Her parça için gerekli malzeme:**\n${fmtRecipe(perPieceRecipe, owned)}\n\n` +
+        def.pieces.map(p => `${p.emoji} **${p.name}** ${ownedKeys.includes(p.key) ? '✅ Sende var' : '⬜ Yok'}`).join('\n')
+      );
 
-    spendCraftMats(gid, uid, recipe);
-    for (const p of missing) buyRelic(gid, uid, p.key);
-    const craftXp = { B: 60, A: 90, S: 130, SSS: 200 }[def.tier] || 60;
-    addRpgXp(gid, uid, craftXp);
-
-    return interaction.reply({
-      content: `✅ **${def.emoji} ${def.name}** tam set (6/6) crafted! (+${craftXp} RPG XP)\n💎 \`/relic-set\` ekranından kuşanabilirsin (aynı anda max ${RELIC_SET_MAX_EQUIPPED} set).`,
+    const buttons = def.pieces.map((p, idx) => {
+      const has = ownedKeys.includes(p.key);
+      return new ButtonBuilder()
+        .setCustomId(`craft_do_relicpiece_${setKey}_${idx}`)
+        .setLabel(p.name.replace(def.name.split(' ')[0], '').trim() || p.name)
+        .setEmoji(p.emoji)
+        .setStyle(has ? ButtonStyle.Secondary : ButtonStyle.Success)
+        .setDisabled(has);
     });
+    const rows = [];
+    for (let i = 0; i < buttons.length; i += 3) rows.push(new ActionRowBuilder().addComponents(...buttons.slice(i, i + 3)));
+    const backToSetSelect = new ButtonBuilder().setCustomId('craft_relicparca').setLabel('← Set Seçimine Dön').setStyle(ButtonStyle.Secondary);
+    rows.push(backRow(backToSetSelect));
+    return { embeds: [e], components: rows.slice(0, 5) };
   }
 
-  return interaction.reply({ ephemeral: true, content: '⛔ Geçersiz kategori.' });
+  // 🎒 Malzeme envanteri view
+  function buildMatsView() {
+    const owned = getCraftMats(gid, uid);
+    const e = new EmbedBuilder()
+      .setTitle('🎒 Craft Malzeme Envanterin')
+      .setColor(0x9B59B6);
+    if (!owned.length) {
+      e.setDescription('Hiç craft malzemen yok. Madencilik yaparak malzeme toplayabilirsin.');
+    } else {
+      const temel = owned.filter(o => CRAFT_MATERIALS.find(m => m.key === o.matKey));
+      const gelismis = owned.filter(o => ADVANCED_CRAFT_MATERIALS.find(m => m.key === o.matKey));
+      if (temel.length) e.addFields({ name: '🔩 Temel Malzemeler', value: temel.map(o => { const d = CRAFT_MATERIALS.find(m => m.key === o.matKey); return `${d?.emoji || ''} **${d?.name || o.matKey}**: ${o.quantity}`; }).join('\n') });
+      if (gelismis.length) e.addFields({ name: '🌀 Gelişmiş Malzemeler', value: gelismis.map(o => { const d = ADVANCED_CRAFT_MATERIALS.find(m => m.key === o.matKey); return `${d?.emoji || ''} **${d?.name || o.matKey}**: ${o.quantity}`; }).join('\n') });
+    }
+    return { embeds: [e], components: [backRow()] };
+  }
+
+  // ── Ana panel gönder ─────────────────────────────────────────
+  await interaction.reply(buildCraftHome());
+  const msg = await interaction.fetchReply();
+
+  const collector = msg.createMessageComponentCollector({
+    filter: i => i.user.id === uid,
+    time: 180_000,
+  });
+
+  collector.on('collect', async i => {
+    const id = i.customId;
+
+    // ── Ana menü ────────────────────────────────────────────
+    if (id === 'craft_home')      return i.update(buildCraftHome());
+    if (id === 'craft_silah')     return i.update(buildWeaponTypeView());
+    if (id === 'craft_zirh')      return i.update(buildArmorSlotView());
+    if (id === 'craft_yumurta')   return i.update(buildEggView());
+    if (id === 'craft_sandik')    return i.update(buildChestView());
+    if (id === 'craft_malzeme')   return i.update(buildAdvMatView());
+    if (id === 'craft_relicparca')return i.update(buildRelicSetSelectView());
+    if (id === 'craft_mats')      return i.update(buildMatsView());
+
+    // ── Relic: sayfalama ──────────────────────────────────────
+    if (id.startsWith('craft_relic_setpage_')) {
+      const offset = parseInt(id.slice('craft_relic_setpage_'.length), 10) || 0;
+      return i.update(buildRelicSetSelectView(offset));
+    }
+
+    // ── Silah: tür seçildi → tier ekranı ─────────────────────
+    if (id === 'craft_silah_typesel') {
+      return i.update(buildWeaponTierView(i.values[0]));
+    }
+
+    // ── Silah: tier seçildi → craft dene ─────────────────────
+    if (id.startsWith('craft_silah_tiersel_')) {
+      const typeKey = id.slice('craft_silah_tiersel_'.length);
+      const tierKey = i.values[0];
+      const wType = WEAPON_TYPES.find(t => t.key === typeKey);
+      const wTier = WEAPON_TIERS.find(t => t.key === tierKey);
+      if (!wType || !wTier) return i.update({ content: '⛔ Geçersiz seçim.', embeds: [], components: [backRow()] });
+
+      const wCls = getPlayerClass(gid, uid);
+      if (wCls && !classAllowsStat(wCls, wType.stat)) {
+        const clsDef = RPG_CLASSES.find(c => c.key === wCls);
+        return i.update({ content: `⛔ **${clsDef.emoji} ${clsDef.name}** sınıfın **${wType.emoji} ${wType.name}** craftlamana izin vermiyor!`, embeds: [], components: [backRow()] });
+      }
+      if (!hasCraftMats(gid, uid, wTier.craft)) {
+        const owned = getCraftMats(gid, uid);
+        return i.update({ content: `⛔ Yetersiz malzeme!\n${fmtRecipe(wTier.craft, owned)}`, embeds: [], components: [backRow()] });
+      }
+
+      spendCraftMats(gid, uid, wTier.craft);
+      const newId = addWeapon(gid, uid, `${typeKey}_${tierKey}`);
+      const craftXp = wTier.key === 'godslayer' ? 150 : wTier.key === 'ejder' ? 80 : wTier.key === 'kristal' ? 50 : wTier.key === 'altin' ? 30 : 15;
+      addRpgXp(gid, uid, craftXp);
+
+      return i.update({
+        content: `✅ **${getWeaponName(`${typeKey}_${tierKey}`)}** crafted! (ID: ${newId})\n+${craftXp} RPG XP kazandın!\n🛠️ \`/yukselt tur:silah id:${newId}\` ile güçlendirebilirsin.`,
+        embeds: [], components: [backRow()],
+      });
+    }
+
+    // ── Zırh: slot seçildi → tier ekranı ─────────────────────
+    if (id === 'craft_zirh_slotsel') {
+      return i.update(buildArmorTierView(i.values[0]));
+    }
+
+    // ── Zırh: tier seçildi → craft dene ──────────────────────
+    if (id.startsWith('craft_zirh_tiersel_')) {
+      const slotKey = id.slice('craft_zirh_tiersel_'.length);
+      const tierKey = i.values[0];
+      const aSlot = ARMOR_SLOTS.find(s => s.key === slotKey);
+      const aTier = ARMOR_TIERS.find(t => t.key === tierKey);
+      if (!aSlot || !aTier) return i.update({ content: '⛔ Geçersiz seçim.', embeds: [], components: [backRow()] });
+
+      const aCls = getPlayerClass(gid, uid);
+      if (aCls && !classAllowsStat(aCls, aSlot.stat)) {
+        const clsDef = RPG_CLASSES.find(c => c.key === aCls);
+        return i.update({ content: `⛔ **${clsDef.emoji} ${clsDef.name}** sınıfın **${aSlot.emoji} ${aSlot.name}** craftlamana izin vermiyor!`, embeds: [], components: [backRow()] });
+      }
+      if (!hasCraftMats(gid, uid, aTier.craft)) {
+        const owned = getCraftMats(gid, uid);
+        return i.update({ content: `⛔ Yetersiz malzeme!\n${fmtRecipe(aTier.craft, owned)}`, embeds: [], components: [backRow()] });
+      }
+
+      spendCraftMats(gid, uid, aTier.craft);
+      const newId = addArmor(gid, uid, `${slotKey}_${tierKey}`, slotKey);
+      const craftXp = aTier.key === 'godslayer' ? 130 : aTier.key === 'ejder' ? 70 : aTier.key === 'kristal' ? 45 : aTier.key === 'altin' ? 25 : 12;
+      addRpgXp(gid, uid, craftXp);
+
+      return i.update({
+        content: `✅ **${getArmorName(slotKey, tierKey)}** crafted! (ID: ${newId})\n+${craftXp} RPG XP kazandın!\n🛠️ \`/yukselt tur:zirh id:${newId}\` ile güçlendirebilirsin.`,
+        embeds: [], components: [backRow()],
+      });
+    }
+
+    // ── Yumurta craft ────────────────────────────────────────
+    if (id.startsWith('craft_do_egg_')) {
+      const key = id.slice('craft_do_egg_'.length);
+      const recipe = CRAFT_EGG_RECIPES[key];
+      if (!recipe) return i.update({ content: '⛔ Geçersiz yumurta.', embeds: [], components: [backRow()] });
+      if (!hasCraftMats(gid, uid, recipe)) {
+        const owned = getCraftMats(gid, uid);
+        return i.update({ content: `⛔ Yetersiz malzeme!\n${fmtRecipe(recipe, owned)}`, embeds: [], components: [backRow()] });
+      }
+      spendCraftMats(gid, uid, recipe);
+      addEgg(gid, uid, key, 1);
+      const eggDef = PET_EGG_TYPES.find(e => e.key === key);
+      addRpgXp(gid, uid, 20);
+      return i.update({ content: `✅ **${eggDef?.name}** crafted! (+20 RPG XP)`, embeds: [], components: [backRow()] });
+    }
+
+    // ── Sandık craft ─────────────────────────────────────────
+    if (id.startsWith('craft_do_chest_')) {
+      const key = id.slice('craft_do_chest_'.length);
+      const recipe = CRAFT_SANDIK_RECIPES[key];
+      if (!recipe) return i.update({ content: '⛔ Geçersiz sandık.', embeds: [], components: [backRow()] });
+      if (!hasCraftMats(gid, uid, recipe)) {
+        const owned = getCraftMats(gid, uid);
+        return i.update({ content: `⛔ Yetersiz malzeme!\n${fmtRecipe(recipe, owned)}`, embeds: [], components: [backRow()] });
+      }
+      spendCraftMats(gid, uid, recipe);
+      addChest(gid, uid, key, 1);
+      const chestDef = MMORPG_CHESTS.find(c => c.key === key);
+      addRpgXp(gid, uid, 15);
+      return i.update({ content: `✅ **${chestDef?.name}** crafted! (+15 RPG XP)`, embeds: [], components: [backRow()] });
+    }
+
+    // ── Gelişmiş malzeme craft ───────────────────────────────
+    if (id.startsWith('craft_do_advmat_')) {
+      const key = id.slice('craft_do_advmat_'.length);
+      const def = ADVANCED_CRAFT_MATERIALS.find(m => m.key === key);
+      if (!def) return i.update({ content: '⛔ Geçersiz malzeme.', embeds: [], components: [backRow()] });
+      if (!hasCraftMats(gid, uid, def.craft)) {
+        const owned = getCraftMats(gid, uid);
+        return i.update({ content: `⛔ Yetersiz malzeme!\n${fmtRecipe(def.craft, owned)}`, embeds: [], components: [backRow()] });
+      }
+      spendCraftMats(gid, uid, def.craft);
+      addCraftMat(gid, uid, def.key, 1);
+      addRpgXp(gid, uid, 60);
+      return i.update({
+        content: `✅ ${def.emoji} **${def.name}** × 1 crafted! (+60 RPG XP)\n🌀 SSS tier ekipman/relic set üretiminde ve +5 sonrası geliştirmelerde kullanılır.`,
+        embeds: [], components: [backRow()],
+      });
+    }
+
+    // ── Relic: set seçildi → parça ekranı ────────────────────
+    if (id === 'craft_relic_setsel') {
+      return i.update(buildRelicPieceView(i.values[0]));
+    }
+
+    // ── Relic: tek parça craft ────────────────────────────────
+    if (id.startsWith('craft_do_relicpiece_')) {
+      const rest = id.slice('craft_do_relicpiece_'.length);
+      const lastUnderscore = rest.lastIndexOf('_');
+      const setKey = rest.slice(0, lastUnderscore);
+      const pieceIdx = parseInt(rest.slice(lastUnderscore + 1), 10);
+      const def = RELIC_SETS[setKey];
+      if (!def || !def.pieces[pieceIdx]) return i.update({ content: '⛔ Geçersiz parça.', embeds: [], components: [backRow()] });
+      const piece = def.pieces[pieceIdx];
+
+      if (hasRelic(gid, uid, piece.key)) {
+        return i.reply({ ephemeral: true, content: `${piece.emoji} Bu parça zaten sende var.` });
+      }
+
+      const recipe = getRelicPieceCraftRecipe(def.tier);
+      if (!hasCraftMats(gid, uid, recipe)) {
+        const owned = getCraftMats(gid, uid);
+        return i.reply({ ephemeral: true, content: `⛔ Yetersiz malzeme! **${piece.emoji} ${piece.name}** için gerekli:\n${fmtRecipe(recipe, owned)}` });
+      }
+
+      spendCraftMats(gid, uid, recipe);
+      buyRelic(gid, uid, piece.key);
+      const craftXp = Math.max(5, Math.round(({ B: 60, A: 90, S: 130, SSS: 200 }[def.tier] || 60) / 6));
+      addRpgXp(gid, uid, craftXp);
+
+      const ownedKeys = getRelics(gid, uid);
+      const haveCount = def.pieces.filter(p => ownedKeys.includes(p.key)).length;
+      await i.reply({ ephemeral: true, content: `✅ ${piece.emoji} **${piece.name}** crafted! (+${craftXp} RPG XP)\n📦 **${def.emoji} ${def.name}**: ${haveCount}/6 parça${haveCount === 6 ? ' — SET TAMAMLANDI! 🎉 `/relic-set` ile kuşan.' : ''}` });
+      // Panel görünümünü de güncelle (kalıcı mesaj üstünde)
+      return i.message.edit(buildRelicPieceView(setKey)).catch(() => {});
+    }
+  });
+
+  collector.on('end', () => {
+    msg.edit({ components: [] }).catch(() => {});
+  });
 }
+
 
 // ─────────────────────────────────────────────────────────────────────────
 //  BUTON HANDLER
