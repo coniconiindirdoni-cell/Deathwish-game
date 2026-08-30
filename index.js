@@ -1990,18 +1990,15 @@ const WORKER_TIERS = [
   { price: 4000, minLevel: 20, maxPurchases: 5 },
 ];
 
-const MINING_COOLDOWNS = new Map(); // key: guildId:userId:action → timestamp
+const MINING_COOLDOWNS = new Map(); // key: guildId:userId → timestamp (yalnızca mine_dig için)
 
-// mine_dig (Madene Gönder) = 1 dakika, diğer tüm butonlar = 5 saniye
-function getMiningCooldownMs(customId) {
-  return customId === 'mine_dig' ? 60000 : 5000;
-}
-
-function miningCooldownCheck(gid, uid, action = 'default') {
-  const key = `${gid}:${uid}:${action}`;
+// Sadece "Madene Gönder" (mine_dig) butonunda bekleme süresi var — diğer
+// tüm butonlar (Enerji, Envanter, Sat, Market, Profil, Nasıl Oynanır) serbest.
+function miningCooldownCheck(gid, uid, customId) {
+  if (customId !== 'mine_dig') return 0; // gönder dışındaki butonlarda bekleme yok
+  const key = `${gid}:${uid}`;
   const last = MINING_COOLDOWNS.get(key) || 0;
-  const cdMs = getMiningCooldownMs(action);
-  const remaining = cdMs - (Date.now() - last);
+  const remaining = 30000 - (Date.now() - last);
   if (remaining > 0) return Math.ceil(remaining / 1000);
   MINING_COOLDOWNS.set(key, Date.now());
   return 0;
@@ -2120,7 +2117,7 @@ function buildMiningPanel() {
     .setDescription(
       '**Madene işçi gönder, maden çıkar, envanterini sat!**\n\n' +
       '🔒 Tüm oyun verilerin yalnızca sana görünür.\n' +
-      '⏱️ **Madene Gönder**: 1 dakikada bir | Diğer butonlar: 5 saniyede bir kullanılabilir.\n' +
+      '⏱️ **Madene Gönder**: 30 saniyede bir | Diğer butonlar: bekleme süresi yok.\n' +
       '⚡ Enerji her **2 dakikada bir** 1 adet yenilenir.\n' +
       '💸 Her gezi için işçi başına **3 coin** ücret ödenir.\n' +
       '🍽️ Madencilerin aç kalırsa verim düşer!'
@@ -2787,10 +2784,13 @@ const WOOD_ENERGY_CAP_TIERS = [
 ];
 
 const WOOD_COOLDOWNS = new Map();
-function woodCooldownCheck(gid, uid) {
+// Sadece "Ormana Gönder" (wood_chop) butonunda bekleme süresi var — diğer
+// tüm butonlar (Enerji, Envanter, Sat, Market, Profil, Nasıl Oynanır) serbest.
+function woodCooldownCheck(gid, uid, customId) {
+  if (customId !== 'wood_chop') return 0; // gönder dışındaki butonlarda bekleme yok
   const key = `${gid}:${uid}`;
   const last = WOOD_COOLDOWNS.get(key) || 0;
-  const remaining = 10000 - (Date.now() - last);
+  const remaining = 30000 - (Date.now() - last);
   if (remaining > 0) return Math.ceil(remaining / 1000);
   WOOD_COOLDOWNS.set(key, Date.now());
   return 0;
@@ -2886,7 +2886,7 @@ function buildWoodPanel() {
     .setDescription(
       '**Ormana oduncu gönder, odun kes, envanterini sat!**\n\n' +
       '🔒 Tüm oyun verilerin yalnızca sana görünür.\n' +
-      '⏱️ Her eylem için **10 saniye** bekleme süresi var.\n' +
+      '⏱️ **Ormana Gönder**: 30 saniyede bir | Diğer butonlar: bekleme süresi yok.\n' +
       '⚡ Enerji her **2 dakikada bir** 1 adet yenilenir.\n' +
       '💸 Her gezi için işçi başına **3 coin** ücret ödenir.\n' +
       '🎲 Her oduncunun **%10 ihtimalle** eli boş dönme şansı var!\n' +
@@ -2923,7 +2923,7 @@ async function handleWoodButton(interaction) {
   const uid = interaction.user.id;
   if (!gid) return interaction.reply({ ephemeral: true, content: '⛔ Bu bir sunucu içinde kullanılabilir.' });
 
-  const cd = woodCooldownCheck(gid, uid);
+  const cd = woodCooldownCheck(gid, uid, interaction.customId);
   if (cd > 0) return interaction.reply({ ephemeral: true, content: `⏳ **${cd}** saniye beklemelisin!` });
 
   if (!hasBankAccount(gid, uid))
@@ -6697,9 +6697,9 @@ client.on('interactionCreate', async interaction => {
 
       await interaction.deferReply();
 
-      const cardBuffer = await renderProfileCard(gid, member, target);
+      const card = await renderProfileCard(gid, member, target);
 
-      if (!cardBuffer) {
+      if (!card) {
         // sharp kurulu değil ya da render başarısız oldu — basit embed'e düş
         const fallback = new EmbedBuilder()
           .setTitle(`👤 ${target.username} — Profil`)
@@ -6709,7 +6709,7 @@ client.on('interactionCreate', async interaction => {
         return interaction.editReply({ embeds: [fallback] });
       }
 
-      const attachment = new AttachmentBuilder(cardBuffer, { name: 'profil.png' });
+      const attachment = new AttachmentBuilder(card.buffer, { name: card.animated ? 'profil.gif' : 'profil.png' });
       return interaction.editReply({
         files: [attachment],
         content: target.id === uid ? '-# 🏪 Arkaplan, yazı ve rozet satın almak/değiştirmek için `/market` → ✨ Profil Kozmetikleri' : undefined,
@@ -9311,8 +9311,9 @@ function hasCraftMats(gid, uid, recipe) {
 // GIF arkaplan kullanılıyorsa yalnızca İLK KARE statik görsel olarak kullanılır.
 const PROFILE_BG_PRICE  = 20000;
 const PROFILE_MSG_PRICE = 10000;
-const PROFILE_CARD_W = 900;
-const PROFILE_CARD_H = 300;
+const PROFILE_CARD_W = 1200;
+const PROFILE_CARD_H = 400;
+const PROFILE_MAX_ANIM_FRAMES = 50; // Bundan fazla kareli GIF'ler statik ilk kareye düşer (performans limiti)
 
 function getProfileCosmetics(gid, uid) {
   return db.prepare('SELECT * FROM profile_cosmetics WHERE guildId=? AND userId=?').get(gid, uid)
@@ -9415,50 +9416,17 @@ async function renderProfileCard(gid, member, targetUser) {
     const rankIdx = allLevels.findIndex(r => r.userId === uid);
     const rankStr = rankIdx === -1 ? '—' : `#${rankIdx + 1}`;
 
-    // ── Arkaplan ──────────────────────────────────────────────
-    let bgBuffer;
-    if (cosmetics.hasBackground && cosmetics.backgroundUrl) {
-      try {
-        const res = await fetch(cosmetics.backgroundUrl);
-        if (!res.ok) throw new Error('arkaplan indirilemedi');
-        const raw = Buffer.from(await res.arrayBuffer());
-        bgBuffer = await sharp(raw, { animated: false }).resize(PROFILE_CARD_W, PROFILE_CARD_H, { fit: 'cover' }).png().toBuffer();
-      } catch {
-        bgBuffer = null;
-      }
-    }
-    if (!bgBuffer) {
-      // Varsayılan gradient arkaplan (arkaplan satın alınmamışsa / linke erişilemiyorsa)
-      const gradSvg = `<svg width="${PROFILE_CARD_W}" height="${PROFILE_CARD_H}" xmlns="http://www.w3.org/2000/svg">
-        <defs><linearGradient id="g" x1="0" y1="0" x2="1" y2="1">
-          <stop offset="0%" stop-color="#1e1f26"/><stop offset="100%" stop-color="#2c2f3a"/>
-        </linearGradient></defs>
-        <rect width="100%" height="100%" fill="url(#g)"/>
-      </svg>`;
-      bgBuffer = await sharp(Buffer.from(gradSvg)).png().toBuffer();
-    }
-
-    // Okunabilirlik için üstüne koyu vinyet
-    const vignetteSvg = `<svg width="${PROFILE_CARD_W}" height="${PROFILE_CARD_H}" xmlns="http://www.w3.org/2000/svg">
-      <defs><linearGradient id="v" x1="0" y1="0" x2="0" y2="1">
-        <stop offset="0%" stop-color="#000000" stop-opacity="0.55"/>
-        <stop offset="45%" stop-color="#000000" stop-opacity="0.25"/>
-        <stop offset="100%" stop-color="#000000" stop-opacity="0.65"/>
-      </linearGradient></defs>
-      <rect width="100%" height="100%" fill="url(#v)"/>
-    </svg>`;
-
     // ── Avatar (yuvarlak + rol rengi halka) ─────────────────────
-    const AV_SIZE = 128;
-    const AV_X = 36, AV_Y = 36;
+    const AV_SIZE = 168;
+    const AV_X = 48, AV_Y = 48;
     const avatarUrl = targetUser.displayAvatarURL({ extension: 'png', size: 256 });
     const avatarRes = await fetch(avatarUrl);
     const avatarRaw = Buffer.from(await avatarRes.arrayBuffer());
     const avatarMaskSvg = `<svg width="${AV_SIZE}" height="${AV_SIZE}"><circle cx="${AV_SIZE / 2}" cy="${AV_SIZE / 2}" r="${AV_SIZE / 2}" fill="#fff"/></svg>`;
-    const avatarRounded = await sharp(avatarRaw).resize(AV_SIZE, AV_SIZE)
+    const avatarRounded = await sharp(avatarRaw).resize(AV_SIZE, AV_SIZE, { kernel: sharp.kernel.lanczos3 })
       .composite([{ input: Buffer.from(avatarMaskSvg), blend: 'dest-in' }])
       .png().toBuffer();
-    const RING_W = 6;
+    const RING_W = 7;
     const ringSvg = `<svg width="${AV_SIZE + RING_W * 2}" height="${AV_SIZE + RING_W * 2}" xmlns="http://www.w3.org/2000/svg">
       <circle cx="${AV_SIZE / 2 + RING_W}" cy="${AV_SIZE / 2 + RING_W}" r="${AV_SIZE / 2 + RING_W - 2}" fill="none" stroke="${ring}" stroke-width="${RING_W}"/>
     </svg>`;
@@ -9470,60 +9438,135 @@ async function renderProfileCard(gid, member, targetUser) {
     let badgeLayer = null;
     const iconDef = cosmetics.activeIcon ? findIcon(cosmetics.activeIcon) : null;
     if (iconDef) {
-      const BADGE_SIZE = 44;
+      const BADGE_SIZE = 56;
       const badgeSvg = `<svg width="${BADGE_SIZE}" height="${BADGE_SIZE}" xmlns="http://www.w3.org/2000/svg">
-        <circle cx="${BADGE_SIZE / 2}" cy="${BADGE_SIZE / 2}" r="${BADGE_SIZE / 2 - 2}" fill="${iconDef.bg}" stroke="#1e1f26" stroke-width="3"/>
-        <text x="${BADGE_SIZE / 2}" y="${BADGE_SIZE / 2 + 8}" font-size="22" text-anchor="middle">${iconDef.emoji}</text>
+        <circle cx="${BADGE_SIZE / 2}" cy="${BADGE_SIZE / 2}" r="${BADGE_SIZE / 2 - 2}" fill="${iconDef.bg}" stroke="#1e1f26" stroke-width="4"/>
+        <text x="${BADGE_SIZE / 2}" y="${BADGE_SIZE / 2 + 10}" font-size="28" text-anchor="middle">${iconDef.emoji}</text>
       </svg>`;
-      badgeLayer = { input: Buffer.from(badgeSvg), top: AV_Y - RING_W + AV_SIZE + RING_W * 2 - 34, left: AV_X - RING_W - 10 };
+      badgeLayer = { input: Buffer.from(badgeSvg), top: AV_Y - RING_W + AV_SIZE + RING_W * 2 - 44, left: AV_X - RING_W - 12 };
     }
 
-    // ── Metin & rozet katmanı (SVG) ─────────────────────────────
-    const nameX = AV_X + AV_SIZE + RING_W * 2 + 24;
-    const nameY = AV_Y + 46;
+    // ── Metin katmanı (SVG) ──────────────────────────────────────
+    const nameX = AV_X + AV_SIZE + RING_W * 2 + 30;
+    const nameY = AV_Y + 60;
     const displayName = (member?.displayName || targetUser.username).slice(0, 28);
     const msgText = cosmetics.hasMessage && cosmetics.messageText ? cosmetics.messageText : '';
 
     const textSvg = `<svg width="${PROFILE_CARD_W}" height="${PROFILE_CARD_H}" xmlns="http://www.w3.org/2000/svg">
       <style>
-        .name   { font: 700 34px sans-serif; fill: #ffffff; }
-        .join   { font: 400 16px sans-serif; fill: #d0d0d5; }
-        .badge  { font: 700 18px sans-serif; fill: #ffffff; }
-        .msg    { font: 400 18px sans-serif; fill: #e8e8ec; }
-        .rank   { font: 700 16px sans-serif; fill: #ffffff; }
+        .name   { font: 700 44px sans-serif; fill: #ffffff; }
+        .join   { font: 400 20px sans-serif; fill: #d0d0d5; }
+        .badge  { font: 700 22px sans-serif; fill: #ffffff; }
+        .msg    { font: 400 22px sans-serif; fill: #e8e8ec; }
+        .rank   { font: 700 20px sans-serif; fill: #ffffff; }
       </style>
       <text class="name" x="${nameX}" y="${nameY}">${escXml(displayName)}</text>
-      <text class="join" x="${nameX}" y="${nameY + 28}">${escXml(joinStr)}</text>
+      <text class="join" x="${nameX}" y="${nameY + 34}">${escXml(joinStr)}</text>
 
       <!-- Seviye rozeti (sağ üst) -->
-      <rect x="${PROFILE_CARD_W - 150}" y="30" width="114" height="38" rx="19" fill="#ffffff" fill-opacity="0.14" stroke="#ffffff" stroke-opacity="0.35"/>
-      <text class="badge" x="${PROFILE_CARD_W - 133}" y="55">⭐ Lv.${lvl.level}</text>
+      <rect x="${PROFILE_CARD_W - 190}" y="40" width="150" height="48" rx="24" fill="#ffffff" fill-opacity="0.14" stroke="#ffffff" stroke-opacity="0.35"/>
+      <text class="badge" x="${PROFILE_CARD_W - 115}" y="72" text-anchor="middle">⭐ Lv.${lvl.level}</text>
 
       <!-- Özel mesaj -->
-      ${svgWrappedText(msgText, AV_X, AV_Y + AV_SIZE + 20 + 30, 26, 60, 2, 'msg')}
+      ${svgWrappedText(msgText, AV_X, AV_Y + AV_SIZE + 20 + 40, 32, 70, 2, 'msg')}
 
-      <!-- Sunucu sıralaması (sağ alt) -->
-      <text class="rank" x="${PROFILE_CARD_W - 130}" y="${PROFILE_CARD_H - 24}">🏆 Sıralama: ${escXml(rankStr)}</text>
+      <!-- Sunucu sıralaması (sağ alt — SAĞA HİZALI, taşma önlenir) -->
+      <text class="rank" x="${PROFILE_CARD_W - 28}" y="${PROFILE_CARD_H - 30}" text-anchor="end">🏆 Sıralama: ${escXml(rankStr)}</text>
     </svg>`;
 
-    const compositeLayers = [
+    // Vinyet + avatar + rozet + metni TEK, TAM ŞEFFAF bir katmanda birleştir.
+    // Bu katman animasyonlu arkaplanlarda HER KAREYE aynen bindirilecek.
+    const vignetteSvg = `<svg width="${PROFILE_CARD_W}" height="${PROFILE_CARD_H}" xmlns="http://www.w3.org/2000/svg">
+      <defs><linearGradient id="v" x1="0" y1="0" x2="0" y2="1">
+        <stop offset="0%" stop-color="#000000" stop-opacity="0.55"/>
+        <stop offset="45%" stop-color="#000000" stop-opacity="0.25"/>
+        <stop offset="100%" stop-color="#000000" stop-opacity="0.65"/>
+      </linearGradient></defs>
+      <rect width="100%" height="100%" fill="url(#v)"/>
+    </svg>`;
+
+    const overlayLayers = [
       { input: await sharp(Buffer.from(vignetteSvg)).png().toBuffer(), top: 0, left: 0 },
       { input: avatarWithRing, top: AV_Y - RING_W, left: AV_X - RING_W },
     ];
-    if (badgeLayer) compositeLayers.push(badgeLayer);
-    compositeLayers.push({ input: Buffer.from(textSvg), top: 0, left: 0 });
+    if (badgeLayer) overlayLayers.push(badgeLayer);
+    overlayLayers.push({ input: Buffer.from(textSvg), top: 0, left: 0 });
+
+    const transparentBase = await sharp({
+      create: { width: PROFILE_CARD_W, height: PROFILE_CARD_H, channels: 4, background: { r: 0, g: 0, b: 0, alpha: 0 } },
+    }).png().toBuffer();
+    const overlayBuffer = await sharp(transparentBase).composite(overlayLayers).png().toBuffer();
+
+    // ── Arkaplan: kullanıcı satın aldıysa kendi GIF/resmi, yoksa gradyan ──
+    let bgRaw = null;
+    if (cosmetics.hasBackground && cosmetics.backgroundUrl) {
+      try {
+        const res = await fetch(cosmetics.backgroundUrl);
+        if (res.ok) bgRaw = Buffer.from(await res.arrayBuffer());
+      } catch { bgRaw = null; }
+    }
+
+    // ── ANİMASYONLU YOL: arkaplan gerçekten çok kareli bir GIF ise, overlay'i
+    // HER KAREYE ayrı ayrı bindirip animasyonlu GIF olarak dışa aktarır.
+    if (bgRaw) {
+      try {
+        const srcMeta = await sharp(bgRaw, { animated: true }).metadata();
+        if (srcMeta.pages && srcMeta.pages > 1 && srcMeta.pages <= PROFILE_MAX_ANIM_FRAMES) {
+          const resizedBuf = await sharp(bgRaw, { animated: true })
+            .resize(PROFILE_CARD_W, PROFILE_CARD_H, { fit: 'cover', kernel: sharp.kernel.lanczos3 })
+            .toBuffer();
+          const resizedMeta = await sharp(resizedBuf, { animated: true }).metadata();
+          const frameH = resizedMeta.pageHeight;
+          const frameCount = resizedMeta.pages;
+
+          const frameComposites = [];
+          for (let i = 0; i < frameCount; i++) {
+            frameComposites.push({ input: overlayBuffer, top: i * frameH, left: 0 });
+          }
+
+          const animatedCard = await sharp(resizedBuf, { animated: true, pages: frameCount })
+            .composite(frameComposites)
+            .gif({ loop: 0, effort: 6 })
+            .toBuffer();
+
+          return { buffer: animatedCard, animated: true };
+        }
+      } catch (e) {
+        console.warn('⚠️ Animasyonlu profil kartı oluşturulamadı, statik karta düşülüyor:', e.message);
+      }
+    }
+
+    // ── STATİK YOL: arkaplan yok / tek kareli / animasyon başarısız oldu ──
+    let bgBuffer;
+    if (bgRaw) {
+      try {
+        bgBuffer = await sharp(bgRaw, { animated: false })
+          .resize(PROFILE_CARD_W, PROFILE_CARD_H, { fit: 'cover', kernel: sharp.kernel.lanczos3 })
+          .png().toBuffer();
+      } catch { bgBuffer = null; }
+    }
+    if (!bgBuffer) {
+      const gradSvg = `<svg width="${PROFILE_CARD_W}" height="${PROFILE_CARD_H}" xmlns="http://www.w3.org/2000/svg">
+        <defs><linearGradient id="g" x1="0" y1="0" x2="1" y2="1">
+          <stop offset="0%" stop-color="#1e1f26"/><stop offset="100%" stop-color="#2c2f3a"/>
+        </linearGradient></defs>
+        <rect width="100%" height="100%" fill="url(#g)"/>
+      </svg>`;
+      bgBuffer = await sharp(Buffer.from(gradSvg)).png().toBuffer();
+    }
 
     const finalCard = await sharp(bgBuffer)
-      .composite(compositeLayers)
-      .png()
+      .composite([{ input: overlayBuffer, top: 0, left: 0 }])
+      .png({ compressionLevel: 6 })
       .toBuffer();
 
-    return finalCard;
+    return { buffer: finalCard, animated: false };
   } catch (e) {
     console.error('⛔ renderProfileCard hatası:', e.message);
     return null;
   }
 }
+
 // ─────────────────────────────────────────────────────────────────────────
 //  MESAJ İSTATİSTİK KARTLARI — s.top / s.me
 // ─────────────────────────────────────────────────────────────────────────
