@@ -8552,70 +8552,70 @@ const DUNGEONS = [
   {
     key: 'goblin',      name: 'Goblin Mağarası',    emoji: '👺',
     minLevel: 1,  xpReward: [30,60],   coinReward: [80,200],
-    color: 0x2ECC71, cd: 300000, requiredPower: 20,
+    color: 0x2ECC71, cd: 900000, requiredPower: 20,
     desc: 'Goblinlerin ininden coin ve malzeme topla.',
     matPool: ['demir_cevheri','bakir_cevheri'],
   },
   {
     key: 'iskelet',     name: 'İskelet Mezarlığı',  emoji: '💀',
     minLevel: 3,  xpReward: [50,90],   coinReward: [150,350],
-    color: 0x95A5A6, cd: 300000, requiredPower: 40,
+    color: 0x95A5A6, cd: 900000, requiredPower: 40,
     desc: 'Ölümsüzlerin arasında gizli hazineler var.',
     matPool: ['demir_cevheri','obsidyen'],
   },
   {
     key: 'orumcek',     name: 'Örümcek Yuvası',     emoji: '🕷️',
     minLevel: 5,  xpReward: [80,130],  coinReward: [250,500],
-    color: 0x8E44AD, cd: 300000, requiredPower: 60,
+    color: 0x8E44AD, cd: 900000, requiredPower: 60,
     desc: 'Dev örümcekler değerli iplik ve malzeme bırakır.',
     matPool: ['demir_cevheri','altin_cevheri','ruh_tozu'],
   },
   {
     key: 'hayalet',     name: 'Hayalet Şatosu',     emoji: '👻',
     minLevel: 8,  xpReward: [110,180], coinReward: [400,750],
-    color: 0x6C3483, cd: 300000, requiredPower: 90,
+    color: 0x6C3483, cd: 900000, requiredPower: 90,
     desc: 'Şatonun hayaletleri Ruh Tozu bırakır.',
     matPool: ['ruh_tozu','obsidyen','saf_kristal'],
   },
   {
     key: 'lav',         name: 'Lav Tapınağı',       emoji: '🌋',
     minLevel: 12, xpReward: [160,250], coinReward: [600,1100],
-    color: 0xFF4500, cd: 300000, requiredPower: 130,
+    color: 0xFF4500, cd: 900000, requiredPower: 130,
     desc: 'Cehennem ateşi içinde Lav Taşları bulunur.',
     matPool: ['lav_tasi','obsidyen','ejder_pulu'],
   },
   {
     key: 'buz',         name: 'Buz Sarayı',         emoji: '❄️',
     minLevel: 16, xpReward: [210,320], coinReward: [850,1500],
-    color: 0x00BFFF, cd: 300000, requiredPower: 170,
+    color: 0x00BFFF, cd: 900000, requiredPower: 170,
     desc: 'Sonsuz soğukta Buz Çekirdekleri gizlidir.',
     matPool: ['buz_cekirdegi','saf_kristal','yildirim_kristali'],
   },
   {
     key: 'orman',       name: 'Orman Mabedi',       emoji: '🌲',
     minLevel: 20, xpReward: [280,420], coinReward: [1200,2000],
-    color: 0x27AE60, cd: 300000, requiredPower: 210,
+    color: 0x27AE60, cd: 900000, requiredPower: 210,
     desc: 'Antik ormanın ruhu değerli taşlar saklar.',
     matPool: ['ay_tasi','gunes_parcasi','saf_kristal'],
   },
   {
     key: 'karanlik',    name: 'Karanlık Orman',     emoji: '🌑',
     minLevel: 25, xpReward: [370,560], coinReward: [1700,2800],
-    color: 0x2C3E50, cd: 300000, requiredPower: 260,
+    color: 0x2C3E50, cd: 900000, requiredPower: 260,
     desc: 'Karanlık öz bu ormanda kendiliğinden oluşur.',
     matPool: ['karanlik_oz','ruh_tozu','ejder_pulu'],
   },
   {
     key: 'ejder',       name: 'Ejder Zirvesi',      emoji: '🐉',
     minLevel: 35, xpReward: [550,800], coinReward: [2500,4000],
-    color: 0xFF6B00, cd: 300000, requiredPower: 360,
+    color: 0xFF6B00, cd: 900000, requiredPower: 360,
     desc: 'Ejderin yatağında Ejder Pulu ve nadirlikler var.',
     matPool: ['ejder_pulu','elmas_cevheri','karanlik_oz','ay_tasi'],
   },
   {
     key: 'cehennem',    name: 'Cehennem Kapısı',    emoji: '🔥',
     minLevel: 45, xpReward: [750,1100],coinReward: [4000,7000],
-    color: 0xC0392B, cd: 300000, requiredPower: 460,
+    color: 0xC0392B, cd: 900000, requiredPower: 460,
     desc: 'Cehennemin kapısında en değerli malzemeler bulunur.',
     matPool: ['ejder_pulu','karanlik_oz','ay_tasi','gunes_parcasi','yildirim_kristali','buz_cekirdegi'],
   },
@@ -9313,7 +9313,7 @@ const PROFILE_BG_PRICE  = 20000;
 const PROFILE_MSG_PRICE = 10000;
 const PROFILE_CARD_W = 1200;
 const PROFILE_CARD_H = 400;
-const PROFILE_MAX_ANIM_FRAMES = 50; // Bundan fazla kareli GIF'ler statik ilk kareye düşer (performans limiti)
+const PROFILE_MAX_ANIM_FRAMES = 30; // Bundan fazla kareli GIF'ler statik ilk kareye düşer (hız/performans limiti)
 
 function getProfileCosmetics(gid, uid) {
   return db.prepare('SELECT * FROM profile_cosmetics WHERE guildId=? AND userId=?').get(gid, uid)
@@ -9338,6 +9338,19 @@ function extractFirstUrl(text) {
 }
 
 // XML/SVG içine gömülecek metni güvenli hale getirir.
+// Zaman aşımlı fetch — ağ isteği takılırsa (yavaş/yanıtsız sunucu) komutun
+// sonsuza kadar "düşünüyor" durumunda kalmasını önler, belirtilen sürede
+// otomatik olarak hata fırlatır.
+async function fetchWithTimeout(url, ms = 6000) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), ms);
+  try {
+    return await fetch(url, { signal: controller.signal });
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 function escXml(str) {
   return String(str ?? '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
 }
@@ -9416,12 +9429,27 @@ async function renderProfileCard(gid, member, targetUser) {
     const rankIdx = allLevels.findIndex(r => r.userId === uid);
     const rankStr = rankIdx === -1 ? '—' : `#${rankIdx + 1}`;
 
-    // ── Avatar (yuvarlak + rol rengi halka) ─────────────────────
+    // ── Avatar + Arkaplan indirmeleri PARALEL yapılır (sıralı değil) ─
+    // Bu, tek başına toplam süreyi neredeyse yarı yarıya azaltır.
     const AV_SIZE = 168;
     const AV_X = 48, AV_Y = 48;
     const avatarUrl = targetUser.displayAvatarURL({ extension: 'png', size: 256 });
-    const avatarRes = await fetch(avatarUrl);
-    const avatarRaw = Buffer.from(await avatarRes.arrayBuffer());
+    const wantsBackground = !!(cosmetics.hasBackground && cosmetics.backgroundUrl);
+
+    async function fetchAvatarBuf() {
+      const r = await fetchWithTimeout(avatarUrl, 6000);
+      return Buffer.from(await r.arrayBuffer());
+    }
+    async function fetchBgBuf() {
+      if (!wantsBackground) return null;
+      try {
+        const r = await fetchWithTimeout(cosmetics.backgroundUrl, 6000);
+        return r.ok ? Buffer.from(await r.arrayBuffer()) : null;
+      } catch { return null; }
+    }
+
+    const [avatarRaw, bgRaw] = await Promise.all([fetchAvatarBuf(), fetchBgBuf()]);
+
     const avatarMaskSvg = `<svg width="${AV_SIZE}" height="${AV_SIZE}"><circle cx="${AV_SIZE / 2}" cy="${AV_SIZE / 2}" r="${AV_SIZE / 2}" fill="#fff"/></svg>`;
     const avatarRounded = await sharp(avatarRaw).resize(AV_SIZE, AV_SIZE, { kernel: sharp.kernel.lanczos3 })
       .composite([{ input: Buffer.from(avatarMaskSvg), blend: 'dest-in' }])
@@ -9486,25 +9514,18 @@ async function renderProfileCard(gid, member, targetUser) {
     </svg>`;
 
     const overlayLayers = [
-      { input: await sharp(Buffer.from(vignetteSvg)).png().toBuffer(), top: 0, left: 0 },
+      { input: Buffer.from(vignetteSvg), top: 0, left: 0 },
       { input: avatarWithRing, top: AV_Y - RING_W, left: AV_X - RING_W },
     ];
     if (badgeLayer) overlayLayers.push(badgeLayer);
     overlayLayers.push({ input: Buffer.from(textSvg), top: 0, left: 0 });
 
-    const transparentBase = await sharp({
+    // Şeffaf tuval üzerine tek adımda kompozisyon (gereksiz ara PNG kodlama turu atlanır)
+    const overlayBuffer = await sharp({
       create: { width: PROFILE_CARD_W, height: PROFILE_CARD_H, channels: 4, background: { r: 0, g: 0, b: 0, alpha: 0 } },
-    }).png().toBuffer();
-    const overlayBuffer = await sharp(transparentBase).composite(overlayLayers).png().toBuffer();
+    }).composite(overlayLayers).png().toBuffer();
 
-    // ── Arkaplan: kullanıcı satın aldıysa kendi GIF/resmi, yoksa gradyan ──
-    let bgRaw = null;
-    if (cosmetics.hasBackground && cosmetics.backgroundUrl) {
-      try {
-        const res = await fetch(cosmetics.backgroundUrl);
-        if (res.ok) bgRaw = Buffer.from(await res.arrayBuffer());
-      } catch { bgRaw = null; }
-    }
+    // ── Arkaplan zaten yukarıda (avatarla paralel) indirildi — bgRaw hazır ──
 
     // ── ANİMASYONLU YOL: arkaplan gerçekten çok kareli bir GIF ise, overlay'i
     // HER KAREYE ayrı ayrı bindirip animasyonlu GIF olarak dışa aktarır.
@@ -9524,9 +9545,11 @@ async function renderProfileCard(gid, member, targetUser) {
             frameComposites.push({ input: overlayBuffer, top: i * frameH, left: 0 });
           }
 
+          // effort düşürüldü (6→3): GIF kodlama hızını belirgin şekilde artırır,
+          // dosya boyutu biraz büyüyebilir ama görsel kalitede fark edilir kayıp olmaz.
           const animatedCard = await sharp(resizedBuf, { animated: true, pages: frameCount })
             .composite(frameComposites)
-            .gif({ loop: 0, effort: 6 })
+            .gif({ loop: 0, effort: 3 })
             .toBuffer();
 
           return { buffer: animatedCard, animated: true };
@@ -9663,7 +9686,7 @@ async function renderMeStatsCard(guild, member, targetUser) {
 
     const AV_SIZE = 84;
     const avatarUrl = targetUser.displayAvatarURL({ extension: 'png', size: 256 });
-    const avatarRes = await fetch(avatarUrl);
+    const avatarRes = await fetchWithTimeout(avatarUrl, 6000);
     const avatarRaw = Buffer.from(await avatarRes.arrayBuffer());
     const avatarMaskSvg = `<svg width="${AV_SIZE}" height="${AV_SIZE}"><circle cx="${AV_SIZE / 2}" cy="${AV_SIZE / 2}" r="${AV_SIZE / 2}" fill="#fff"/></svg>`;
     const avatarRounded = await sharp(avatarRaw).resize(AV_SIZE, AV_SIZE)
